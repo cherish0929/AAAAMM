@@ -1,0 +1,15 @@
+# 目录
+Dataset/
+H5set/
+Run_logs/
+
+# --- 忽略 Python 缓存 ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 数据文件
+*.vtk
+*.h5
+*.npy
+

@@ -1,0 +1,210 @@
+
+================================================================================
+[LOG START @ 2025-11-12 18:17:31]
+================================================================================
+[0 1 2 3 4 5 6 7] [8 9]
+=====Epoch 0=====
+L2 loss: T 6.7696e-01
+each time step loss: tensor([0.8563, 0.7239, 0.7560, 0.7411, 0.7878, 0.7252, 0.6716])
+time pre test epoch/s:4.10
+=====Epoch 1=====
+L2 loss: T 6.6732e-01
+each time step loss: tensor([0.8529, 0.7188, 0.7486, 0.7317, 0.7758, 0.7108, 0.6539])
+time pre test epoch/s:2.84
+=====Epoch 2=====
+L2 loss: T 6.2736e-01
+each time step loss: tensor([0.8367, 0.6963, 0.7164, 0.6917, 0.7249, 0.6511, 0.5836])
+time pre test epoch/s:2.89
+=====Epoch 3=====
+L2 loss: T 5.9238e-01
+each time step loss: tensor([0.8059, 0.6584, 0.6671, 0.6422, 0.6684, 0.6077, 0.5809])
+time pre test epoch/s:2.84
+=====Epoch 4=====
+L2 loss: T 5.8471e-01
+each time step loss: tensor([0.8044, 0.6562, 0.6636, 0.6355, 0.6596, 0.5946, 0.5619])
+time pre test epoch/s:2.84
+=====Epoch 5=====
+L2 loss: T 5.8551e-01
+each time step loss: tensor([0.8031, 0.6548, 0.6620, 0.6349, 0.6595, 0.5968, 0.5692])
+time pre test epoch/s:2.84
+=====Epoch 6=====
+L2 loss: T 5.8390e-01
+each time step loss: tensor([0.8039, 0.6553, 0.6622, 0.6344, 0.6583, 0.5936, 0.5622])
+time pre test epoch/s:2.84
+=====Epoch 7=====
+L2 loss: T 5.8423e-01
+each time step loss: tensor([0.8031, 0.6546, 0.6615, 0.6341, 0.6581, 0.5945, 0.5655])
+time pre test epoch/s:2.84
+=====Epoch 8=====
+L2 loss: T 5.8297e-01
+each time step loss: tensor([0.8045, 0.6559, 0.6628, 0.6343, 0.6577, 0.5917, 0.5572])
+time pre test epoch/s:2.85
+=====Epoch 9=====
+L2 loss: T 5.8506e-01
+each time step loss: tensor([0.8024, 0.6539, 0.6608, 0.6339, 0.6584, 0.5964, 0.5707])
+time pre test epoch/s:2.85
+=====Epoch 10=====
+L2 loss: T 5.8303e-01
+each time step loss: tensor([0.8045, 0.6559, 0.6628, 0.6343, 0.6577, 0.5918, 0.5574])
+time pre test epoch/s:2.85
+=====Epoch 11=====
+L2 loss: T 5.8337e-01
+each time step loss: tensor([0.8039, 0.6552, 0.6621, 0.6340, 0.6576, 0.5927, 0.5607])
+time pre test epoch/s:2.85
+=====Epoch 12=====
+L2 loss: T 5.8357e-01
+each time step loss: tensor([0.8037, 0.6550, 0.6619, 0.6340, 0.6577, 0.5931, 0.5619])
+time pre test epoch/s:2.85
+=====Epoch 13=====
+L2 loss: T 5.8326e-01
+each time step loss: tensor([0.8045, 0.6558, 0.6628, 0.6345, 0.6579, 0.5922, 0.5584])
+time pre test epoch/s:2.85
+=====Epoch 14=====
+L2 loss: T 5.8507e-01
+each time step loss: tensor([0.8025, 0.6540, 0.6609, 0.6340, 0.6584, 0.5964, 0.5705])
+time pre test epoch/s:2.85
+=====Epoch 15=====
+L2 loss: T 5.8320e-01
+each time step loss: tensor([0.8042, 0.6556, 0.6625, 0.6342, 0.6577, 0.5922, 0.5590])
+time pre test epoch/s:2.85
+=====Epoch 16=====
+L2 loss: T 5.8330e-01
+each time step loss: tensor([0.8039, 0.6553, 0.6622, 0.6340, 0.6576, 0.5925, 0.5602])
+time pre test epoch/s:2.85
+=====Epoch 17=====
+L2 loss: T 5.8365e-01
+each time step loss: tensor([0.8037, 0.6550, 0.6619, 0.6341, 0.6578, 0.5933, 0.5622])
+time pre test epoch/s:2.85
+=====Epoch 18=====
+L2 loss: T 5.8378e-01
+each time step loss: tensor([0.8039, 0.6552, 0.6621, 0.6342, 0.6580, 0.5935, 0.5621])
+time pre test epoch/s:2.85
+=====Epoch 19=====
+L2 loss: T 5.8456e-01
+each time step loss: tensor([0.8028, 0.6543, 0.6612, 0.6339, 0.6581, 0.5953, 0.5677])
+time pre test epoch/s:2.85
+=====Epoch 20=====
+L2 loss: T 5.8298e-01
+each time step loss: tensor([0.8044, 0.6558, 0.6627, 0.6342, 0.6576, 0.5918, 0.5576])
+time pre test epoch/s:2.86
+=====Epoch 21=====
+L2 loss: T 5.8381e-01
+each time step loss: tensor([0.8035, 0.6549, 0.6618, 0.6340, 0.6578, 0.5936, 0.5631])
+time pre test epoch/s:2.86
+=====Epoch 22=====
+L2 loss: T 5.8380e-01
+each time step loss: tensor([0.8035, 0.6549, 0.6617, 0.6340, 0.6578, 0.5937, 0.5633])
+time pre test epoch/s:2.86
+=====Epoch 23=====
+L2 loss: T 5.8404e-01
+each time step loss: tensor([0.8032, 0.6546, 0.6614, 0.6339, 0.6578, 0.5942, 0.5651])
+time pre test epoch/s:2.86
+=====Epoch 24=====
+L2 loss: T 5.8375e-01
+each time step loss: tensor([0.8037, 0.6551, 0.6620, 0.6341, 0.6578, 0.5935, 0.5625])
+time pre test epoch/s:2.86
+=====Epoch 25=====
+L2 loss: T 5.8238e-01
+each time step loss: tensor([0.8056, 0.6570, 0.6639, 0.6349, 0.6578, 0.5901, 0.5517])
+time pre test epoch/s:2.86
+=====Epoch 26=====
+L2 loss: T 5.8566e-01
+each time step loss: tensor([0.8018, 0.6534, 0.6604, 0.6339, 0.6587, 0.5977, 0.5742])
+time pre test epoch/s:2.86
+=====Epoch 27=====
+L2 loss: T 5.8282e-01
+each time step loss: tensor([0.8045, 0.6559, 0.6627, 0.6342, 0.6575, 0.5914, 0.5567])
+time pre test epoch/s:2.86
+=====Epoch 28=====
+L2 loss: T 5.8351e-01
+each time step loss: tensor([0.8037, 0.6551, 0.6619, 0.6340, 0.6577, 0.5930, 0.5615])
+time pre test epoch/s:2.86
+=====Epoch 29=====
+L2 loss: T 5.8441e-01
+each time step loss: tensor([0.8030, 0.6544, 0.6613, 0.6340, 0.6581, 0.5950, 0.5668])
+time pre test epoch/s:2.86
+=====Epoch 30=====
+L2 loss: T 5.8231e-01
+each time step loss: tensor([0.8054, 0.6567, 0.6637, 0.6347, 0.6576, 0.5901, 0.5521])
+time pre test epoch/s:2.86
+=====Epoch 31=====
+L2 loss: T 5.8580e-01
+each time step loss: tensor([0.8019, 0.6535, 0.6605, 0.6340, 0.6588, 0.5979, 0.5745])
+time pre test epoch/s:2.86
+=====Epoch 32=====
+L2 loss: T 5.8269e-01
+each time step loss: tensor([0.8054, 0.6567, 0.6637, 0.6349, 0.6579, 0.5908, 0.5537])
+time pre test epoch/s:2.86
+=====Epoch 33=====
+L2 loss: T 5.8495e-01
+each time step loss: tensor([0.8026, 0.6541, 0.6610, 0.6340, 0.6584, 0.5961, 0.5697])
+time pre test epoch/s:2.85
+=====Epoch 34=====
+L2 loss: T 5.8264e-01
+each time step loss: tensor([0.8050, 0.6564, 0.6633, 0.6345, 0.6577, 0.5908, 0.5545])
+time pre test epoch/s:2.85
+=====Epoch 35=====
+L2 loss: T 5.8394e-01
+each time step loss: tensor([0.8032, 0.6546, 0.6615, 0.6339, 0.6578, 0.5940, 0.5645])
+time pre test epoch/s:2.85
+=====Epoch 36=====
+L2 loss: T 5.8423e-01
+each time step loss: tensor([0.8031, 0.6546, 0.6615, 0.6340, 0.6580, 0.5946, 0.5657])
+time pre test epoch/s:2.85
+=====Epoch 37=====
+L2 loss: T 5.8381e-01
+each time step loss: tensor([0.8035, 0.6549, 0.6618, 0.6340, 0.6578, 0.5937, 0.5633])
+time pre test epoch/s:2.85
+=====Epoch 38=====
+L2 loss: T 5.8358e-01
+each time step loss: tensor([0.8037, 0.6550, 0.6619, 0.6340, 0.6577, 0.5932, 0.5620])
+time pre test epoch/s:2.85
+=====Epoch 39=====
+L2 loss: T 5.8337e-01
+each time step loss: tensor([0.8042, 0.6556, 0.6626, 0.6343, 0.6578, 0.5925, 0.5595])
+time pre test epoch/s:2.85
+=====Epoch 40=====
+L2 loss: T 5.8458e-01
+each time step loss: tensor([0.8026, 0.6541, 0.6610, 0.6338, 0.6581, 0.5954, 0.5684])
+time pre test epoch/s:2.86
+=====Epoch 41=====
+L2 loss: T 5.8242e-01
+each time step loss: tensor([0.8052, 0.6565, 0.6634, 0.6345, 0.6576, 0.5904, 0.5533])
+time pre test epoch/s:2.86
+=====Epoch 42=====
+L2 loss: T 5.8502e-01
+each time step loss: tensor([0.8024, 0.6539, 0.6608, 0.6339, 0.6584, 0.5963, 0.5705])
+time pre test epoch/s:2.86
+=====Epoch 43=====
+L2 loss: T 5.8290e-01
+each time step loss: tensor([0.8048, 0.6561, 0.6630, 0.6345, 0.6577, 0.5915, 0.5563])
+time pre test epoch/s:2.86
+=====Epoch 44=====
+L2 loss: T 5.8503e-01
+each time step loss: tensor([0.8028, 0.6542, 0.6612, 0.6342, 0.6585, 0.5962, 0.5695])
+time pre test epoch/s:2.86
+=====Epoch 45=====
+L2 loss: T 5.8308e-01
+each time step loss: tensor([0.8043, 0.6556, 0.6625, 0.6342, 0.6576, 0.5920, 0.5585])
+time pre test epoch/s:2.86
+=====Epoch 46=====
+L2 loss: T 5.8317e-01
+each time step loss: tensor([0.8042, 0.6556, 0.6625, 0.6342, 0.6577, 0.5922, 0.5588])
+time pre test epoch/s:2.86
+=====Epoch 47=====
+L2 loss: T 5.8435e-01
+each time step loss: tensor([0.8030, 0.6544, 0.6613, 0.6340, 0.6581, 0.5949, 0.5666])
+time pre test epoch/s:2.86
+=====Epoch 48=====
+L2 loss: T 5.8432e-01
+each time step loss: tensor([0.8034, 0.6548, 0.6618, 0.6342, 0.6582, 0.5946, 0.5653])
+time pre test epoch/s:2.86
+=====Epoch 49=====
+L2 loss: T 5.8264e-01
+each time step loss: tensor([0.8057, 0.6570, 0.6640, 0.6351, 0.6581, 0.5906, 0.5524])
+time pre test epoch/s:2.86
+
+========Test========
+L2 loss: T 5.2581e-01
+each time step loss: tensor([0.3731, 0.5184, 0.5539, 0.6022, 0.6278, 0.5592, 0.5924])
+time pre test epoch/s:2.86
