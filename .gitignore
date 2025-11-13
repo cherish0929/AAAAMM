@@ -2,6 +2,7 @@
 Dataset/
 H5set/
 Run_logs/
+Result/
 
 # --- 忽略 Python 缓存 ---
 __pycache__/
@@ -12,4 +13,5 @@ __pycache__/
 *.vtk
 *.h5
 *.npy
+*.log
 

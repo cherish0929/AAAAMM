@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 class CondAttenPool(nn.Module):
     """
     material and dump
+    注意力池化：学习一个集合的元素，输出单向量表示整个集合
     """
     def __init__(self, d_model, d_hidden: Optional[int] = None):
         super(CondAttenPool, self).__init__()
@@ -14,20 +15,23 @@ class CondAttenPool(nn.Module):
         self.proj = nn.Linear(d_model, d_hidden)
         self.v = nn.Linear(d_hidden, 1, bias=False)
         nn.init.xavier_uniform_(self.proj.weight); nn.init.zeros_(self.proj.bias)
-        nn.init.xavier_uniform_(self.v.weight)
+        nn.init.xavier_uniform_(self.v.weight) # 参数初始化，避免梯度爆炸
 
     def forward(self, H: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # H: [B, N, d] N 不确定, d 确定
+        """
+        H: [B, N, d] N 不确定, d 确定
+        有 mask 的话，用 -1e9 将权重置零 
+        """
         scores = self.v(torch.tanh(self.proj(H))).squeeze(-1) # [B, N]
         if mask is not None:
             if mask.dtype != torch.bool:
                 mask = mask > 0
             scores = scores.masked_fill(~mask, -1e9)
-            valid = (mask.sum(dim=1, keepdim=True) > 0).float()  # [B,1]
+            valid = (mask.sum(dim=1, keepdim=True) > 0).float()  # [B,1] 
         else:
             valid = torch.ones(H.size(0), 1, device=H.device, dtype=H.dtype)
-        w = torch.softmax(scores, dim=1).unsqueeze(-1)          # [B,N,1]
-        pooled = (w * H).sum(dim=1)                             # [B,d]
+        w = torch.softmax(scores, dim=1).unsqueeze(-1) # [B,N,1]
+        pooled = (w * H).sum(dim=1)   # [B,d]
         return pooled * valid                                   # 全 padding 时置零，避免 NaN
     
 class CondEncoder(nn.Module):
@@ -39,7 +43,8 @@ class CondEncoder(nn.Module):
         super(CondEncoder, self).__init__()
         # 编码
         self.phi = MLP(input_size=in_dim, output_size=hid_size,
-                       n_hidden=N_hid, hidden_size=hid_size, layer_norm=False)
+                       n_hidden=N_hid, hidden_size=hid_size, layer_norm=False) # 通过 MLP 提升非线性 [B, N, H]
+        
         self.pool = CondAttenPool(hid_size)
 
         # 投影
@@ -48,8 +53,8 @@ class CondEncoder(nn.Module):
         
     def forward(self, X: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # X: [B,N,in_dim]
-        H = self.phi(X)              # [B,N,elem_hidden]
-        z = self.pool(H, mask)       # [B,elem_hidden]
+        H = self.phi(X)         # [B,N,N_hid]
+        z = self.pool(H, mask)       # [B,N_hid]
         z = self.rho(z)              # [B,out_dim]
         return z
     
@@ -75,7 +80,7 @@ class CondBlock(nn.Module):
         self.head = MLP(input_size=enc_in_dim, output_size=out_dim,
                         n_hidden=4, hidden_size=head_hidden, layer_norm=False)
         
-        # Optional
+        # Optional 对最后一个维度做归一化
         self.norm_dump   = nn.LayerNorm(dump_dim)
         self.norm_material = nn.LayerNorm(material_dim)
         self.norm_thermal  = nn.LayerNorm(thermal_dim)
@@ -87,20 +92,21 @@ class CondBlock(nn.Module):
                 dump_mask: Optional[torch.Tensor] = None,  # [B,m]  True=有效
                 material_mask: Optional[torch.Tensor] = None # [B,n]
                 ) -> Tuple[torch.Tensor, dict]:
-        # 归一化（逐通道），避免不同量纲差异过大
+        
+        # 归一化，避免不同量纲差异过大
         dump   = self.norm_dump(dump)
         material = self.norm_material(material)
         thermal  = self.norm_thermal(thermal)
 
         # 编码
-        zp = self.dump_enc(dump, dump_mask)      # [B,enc_dim]
+        zd = self.dump_enc(dump, dump_mask)      # [B,enc_dim]
         zm = self.material_enc(material, material_mask)# [B,enc_dim]
-        ze = self.thermal_enc(thermal)                     # [B,extra_enc_dim]
+        zt = self.thermal_enc(thermal)                     # [B,extra_enc_dim]
 
-        x = torch.cat([zp, zm, ze], dim=-1)            # [B, enc_dim*2 + extra_enc_dim]
+        x = torch.cat([zt, zm, zd], dim=-1)            # [B, enc_dim*2 + extra_enc_dim]
         y = self.head(x)                                # [B,out_dim]
-        # aux = {"zp": zp, "zm": zm, "ze": ze, "fusion": x}
-        return y.unsqueeze(-1)
+        # aux = {"zt": zt, "zm": zm, "zd": zd, "fusion": x}
+        return y.unsqueeze(-1) # [B, out_dim, 1]
     
 
 

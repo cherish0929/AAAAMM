@@ -12,7 +12,6 @@ from pathlib import Path
 if __name__ == "__main__":
     # Save logs
     PATH = os.path.abspath(os.path.dirname(__file__))
-    print(PATH)
     log_path = os.path.join(PATH, "Run_Logs", "new_property.log")
     sys.stdout = Logger(filename=log_path)
 
@@ -37,11 +36,17 @@ if __name__ == "__main__":
     criterion = nn.MSELoss()
     opt = optim.Adam(model.parameters(), lr=1e-3)
 
+    L2_T_list, L2_each_list = [], []
     for epoch in range(50):
         start_time = time.time()
         train_error = train(model, train_loader, opt, 'cuda', 8)
         end_time = time.time()
 
+        # save error
+        L2_T_list.append(train_error['L2_T'])
+        L2_each_list.append(train_error['each_l2'])
+
+        # print to terminal
         print(f"=====Epoch {epoch}=====")
         print(f"L2 loss: T {train_error['L2_T']:.4e}")
         print(f"each time step loss: {train_error['each_l2']}")
@@ -56,6 +61,13 @@ if __name__ == "__main__":
     print(f"L2 loss: T {test_error['L2_T']:.4e}")
     print(f"each time step loss: {test_error['each_l2']}")
     print(f"time pre test epoch/s:{time.time() - test_time:.2f}")
+
+    # Save
+    L2_T_arr = np.array(L2_T_list)               # [epoch,]
+    L2_each_arr = np.stack(L2_each_list, axis=0) # [epoch, 7]
+    np.savez(os.path.join(PATH, "Result/data", "Test_result_2.npy"),
+             L2_T = L2_T_arr,
+             L2_each = L2_each_arr)
 
     
 
