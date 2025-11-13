@@ -45,7 +45,7 @@ class AM_Dataset(Dataset):
             self._f = h5py.File(self.h5_path, "r", swmr=True)
             self._points, self._cells, self._times = self._f['point'][:], self._f['mesh'][:], self._f['time'][:]
             self._pttype = self._f['point_type'][:]
-            self._cond = {"thermal": self._f['cond']['thermal'][:], "transport": self._f['cond']['transport'], "dump": self._f['cond']['dump']}
+            self._cond = {"thermal": self._f['cond']['thermal'][:], "material": self._f['cond']['material'][:], "dump": self._f['cond']['dump'][:]}
             # 构建 edges 
             self._edges = self.make_edges(single=True)
 
@@ -66,7 +66,7 @@ class AM_Dataset(Dataset):
                  "edge": copy.deepcopy(self._edges),
                  "time": torch.from_numpy(times),
                  "thermal": torch.from_numpy(self._cond['thermal']),
-                 "transport": torch.from_numpy(self._cond['transport']),
+                 "material": torch.from_numpy(self._cond['material']),
                  "dump": torch.from_numpy(self._cond['dump'])}
         states = []
         for key in self.fields:

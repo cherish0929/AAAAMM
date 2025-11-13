@@ -83,7 +83,7 @@ def parse_openfoam_file(path: str,
         return nested
 
 def get_all_properties(constant_path: str,
-                       want_transport: bool = True,
+                       want_material: bool = True,
                        fill_value: float = -1.0,
                        float_type = np.float32,
                       ):
@@ -91,11 +91,11 @@ def get_all_properties(constant_path: str,
     - 读取 constant/thermalProperties，提取**非 phases**的全局/激光参数（按键名排序对齐）。
     - 读取 constant/transportProperties（若存在 phases），将**各材料参数**按“列对齐”，缺失填 fill_value。
     - 返回：
-        thermal_vec, thermal_keys, transport_mat, transport_keys, material_names
-      其中 transport_* 可能为 None（当 want_transport=False 或文件不存在/无材料）。
+        thermal_vec, thermal_keys, material_mat, material_keys, material_names
+      其中 material_* 可能为 None（当 want_material=False 或文件不存在/无材料）。
     """
     thermal_path   = os.path.join(constant_path, "thermalProperties")
-    transport_path = os.path.join(constant_path, "transportProperties")
+    material_path = os.path.join(constant_path, "transportProperties")
     
     # ==== 1) thermal：只要顶层键（比如激光/全局），排除 phases.* ====
     if os.path.exists(thermal_path):
@@ -104,13 +104,13 @@ def get_all_properties(constant_path: str,
 
     thermal_vec = np.array(list(tp_full.values()), dtype=float_type) if tp_full else np.zeros((0,), dtype=float_type)
 
-    # ==== 2) transport：对齐各材料的列 ====
-    transport_mat = None
-    transport_keys = None
+    # ==== 2) material：对齐各材料的列 ====
+    material_mat = None
+    material_keys = None
     material_names = None
 
-    if want_transport and os.path.exists(transport_path):
-        trans = parse_openfoam_file(transport_path, flatten_phases=False)  # {material: {k: v}}
+    if want_material and os.path.exists(material_path):
+        trans = parse_openfoam_file(material_path, flatten_phases=False)  # {material: {k: v}}
         if isinstance(trans, dict) and trans:
             # 收集所有列（参数名）并排序，保证对齐 & 可复现
             all_keys = {k for props in trans.values() for k in props.keys()}
@@ -126,11 +126,11 @@ def get_all_properties(constant_path: str,
                         except Exception:
                             mat[i, j] = float_type(fill_value)
 
-            transport_mat = mat
-            # transport_keys = all_keys
+            material_mat = mat
+            # material_keys = all_keys
             # material_names = materials
 
-    return thermal_vec, transport_mat
+    return thermal_vec, material_mat
 
 def get_dumps(path):
     """
@@ -148,18 +148,18 @@ def get_dumps(path):
 # -------------------- 示例 --------------------
 # if __name__ == "__main__":
 #     const_dir = "/home/ubuntu/MyAI/AMGTO/Dataset/Tiny_mesh/constant"  # 改成你的路径
-#     thermal_vec, transport_mat, transport_keys, material_names = get_all_properties(
-#         const_dir, want_transport=True, fill_value=-1.0
+#     thermal_vec, material_mat, material_keys, material_names = get_all_properties(
+#         const_dir, want_material=True, fill_value=-1.0
 #     )
 
 #     print("== Thermal / Global keys ==")
 #     print(thermal_vec.shape, thermal_vec)
 
-#     print("\n== Transport / Materials ==")
-#     if transport_mat is not None:
+#     print("\n== material / Materials ==")
+#     if material_mat is not None:
 #         print("materials:", material_names)
-#         print("columns  :", transport_keys)
-#         print("matrix   :", transport_mat.shape)
-#         print(transport_mat)
+#         print("columns  :", material_keys)
+#         print("matrix   :", material_mat.shape)
+#         print(material_mat)
 #     else:
-#         print("No transport data found.")
+#         print("No material data found.")

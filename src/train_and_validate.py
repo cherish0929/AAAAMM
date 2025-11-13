@@ -107,7 +107,7 @@ def train(model: nn.modules,
     for i, input in enumerate(dataloader):
         state, point, edge = input['state'], input['point'], input['edge']
         times, mask = input['time'], input['mask']
-        conds = [input['thermal'], input['transport'], input['dump']]
+        conds = [input['thermal'], input['material'], input['dump']]
         point_type = input['point_type']
         batch_num = state.shape[0]
         predict, delta = forward(model, state, point, point_type, edge, times, conds, device, mode='train')
@@ -134,7 +134,7 @@ def validate(model: nn.modules,
         for i, input in enumerate(data_loader):
             state, point, edge = input['state'], input['point'], input['edge']
             times, mask = input['time'], input['mask']
-            conds = [input['thermal'], input['transport'], input['dump']]
+            conds = [input['thermal'], input['material'], input['dump']]
             point_type = input['point_type']
 
             batch_num = state.shape[0]

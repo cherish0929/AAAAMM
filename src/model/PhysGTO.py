@@ -1,9 +1,10 @@
 import numpy as np
 import torch
 import torch.nn as nn
-
+from typing import List
 from .block import MLP, GNN
 from .atten import GTO_Atten
+from .cond_block import CondBlock
 
 class Encoder(nn.Module): 
     def __init__(self, 
@@ -177,7 +178,8 @@ class Model(nn.Module):
     def __init__(self, 
                 space_size = 2,  # 空间维度
                 pos_enc_dim = 7, # 位置编码维度
-                cond_dim = 7,  # 条件维度
+                cond_dims: List[int] = [16, 15, 5],  # 条件维度
+                cond_enc: int = 10,
                 N_block = 4,
                 in_dim = 4, # 状态维度
                 out_dim = 4, # 预测值
@@ -186,11 +188,16 @@ class Model(nn.Module):
                 n_token = 128
                 ):
         super(Model, self).__init__()
+
+        self.cond_block = CondBlock(thermal_dim=cond_dims[0],
+                                    material_dim=cond_dims[1],
+                                    dump_dim=cond_dims[2],
+                                    out_dim=cond_enc)
                 
         self.encoder = Encoder(
             space_size = space_size,
             pos_enc_dim = pos_enc_dim,
-            cond_dim = cond_dim,
+            cond_dim = cond_enc,
             state_size = in_dim,
             enc_dim = enc_dim, # 编码维度
             )
@@ -224,6 +231,9 @@ class Model(nn.Module):
         return sampled_edges
 
     def forward(self, node_pos, node_type, edges, t_all, state_in, cond, sample_ratio=0.05):
+        thermal, material, dump = cond
+        cond = self.cond_block(thermal=thermal, material=material, dump=dump) # [B, 10, 1]
+
         N = node_pos.shape[1]
         cond, t_all = cond.transpose(-1, -2).repeat(1, N, 1), t_all.repeat(N).unsqueeze(1) # (N, 1)
 

@@ -58,7 +58,7 @@ def from_vtk_to_h5(name: str = "Tiny_mesh",
     ctypes = celltypes.astype(np.uint8)
 
     # conditions 处理（激光、金属粉末）
-    thermal_conds, transport_conds = get_all_properties(os.path.join(PATH, "constant"), float_type=float_type)
+    thermal_conds, material_conds = get_all_properties(os.path.join(PATH, "constant"), float_type=float_type)
     dump_conds = get_dumps(PATH)
     # 创建 h5 文件
     with h5py.File(OUT_H5, "w") as f:
@@ -102,9 +102,11 @@ def from_vtk_to_h5(name: str = "Tiny_mesh",
 
         # 写入条件
         conds.create_dataset("thermal", data=thermal_conds, compression="gzip", compression_opts=4, shuffle=False)
-        conds.create_dataset("transport", data=transport_conds, compression="gzip", compression_opts=4, shuffle=False)
+        conds.create_dataset("material", data=material_conds, compression="gzip", compression_opts=4, shuffle=False)
         conds.create_dataset("dump", data=dump_conds, compression="gzip", compression_opts=4, shuffle=False)
 
     print(f"✅ 转换完成：{OUT_H5}")
+
+from_vtk_to_h5()
 
 

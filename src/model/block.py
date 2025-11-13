@@ -82,19 +82,3 @@ class GNN(nn.Module):
         
         return node_embeddings, edge_embeddings
     
-class CondNN(nn.modules):
-    """
-    用于处理仿真过程中的不同参数
-    激光参数：16, 1
-    材料参数：15, 1
-    粉末床参数： m, 5, 1
-    """
-    def __init__(self,):
-        super(CondNN, self).__init__()
-
-class DumpNN(nn.modules):
-    """
-    处理 粉末床
-    """
-    def __init__(self,):
-        super(DumpNN, self).__init__()

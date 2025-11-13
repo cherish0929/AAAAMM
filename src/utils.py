@@ -55,7 +55,8 @@ def collate(X):
         
     N_max = max([x["point"].shape[-2] for x in X]) # point 数量
     E_max = max([x["edge"].shape[-2] for x in X]) # edge 数量
-    C_max = max([x["cond"].shape[-2] for x in X]) # 条件数量，均相等 (1,5)
+    M_max = max([x["material"].shape[-2] for x in X]) # 材料数量，不过暂时用不到
+    D_max = max([x["material"].shape[-2] for x in X]) # 粉末数量
     # cells_max = max([x["cells"].shape[-2] for x in X])
     for batch, x in enumerate(X):
         # This step add fantom nodes to reach N_max + 1 nodes
