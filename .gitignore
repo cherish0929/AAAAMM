@@ -1,0 +1,9 @@
+result/nn
+result/record
+result/logs
+result/*inference*
+data
+config
+*.vtk
+*.sh
+__pycache__
