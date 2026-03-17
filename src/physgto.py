@@ -3,12 +3,13 @@ import torch.nn as nn
 import numpy as np
 
 from torch_scatter import scatter_mean
+from torch.utils.checkpoint import checkpoint
 
 def get_edge_info(edges, node_pos):
     senders = torch.gather(node_pos, -2, edges[..., 0].unsqueeze(-1).expand(-1, -1, node_pos.shape[-1]))
     receivers = torch.gather(node_pos, -2, edges[..., 1].unsqueeze(-1).expand(-1, -1, node_pos.shape[-1]))
     d = receivers - senders
-    norm = torch.sqrt((d ** 2).sum(-1, keepdims=True))
+    norm = torch.sqrt((d ** 2).sum(-1, keepdims=True) + 1e-8)
     # distance_2 = -distance_1
     E = torch.cat([d, -d, norm], dim=-1)
     return E
@@ -358,7 +359,8 @@ class Model(nn.Module):
                        edges,
                        time_seq,
                        conditions,
-                       dt=None):
+                       dt=None,
+                       checkpoint=False):
 
 
         state_t = state_in
@@ -370,10 +372,19 @@ class Model(nn.Module):
             
             pos_enc = FourierEmbedding(node_pos, 0, self.pos_enc_dim)
             c_enc = FourierEmbedding(conditions, 0, self.pos_enc_dim)
-            
             time_i = time_seq[:, t]  # expect shape (bs, 1) or (bs,) depending on your caller
+
+            def custom_forward(s_t, t_i):
+                return self.forward(s_t, node_pos, edges, t_i, conditions, pos_enc, c_enc, dt)
             
-            state_t = self.forward(state_t, node_pos, edges, time_i, conditions, pos_enc, c_enc, dt)
+            if checkpoint:
+                if state_t.requires_grad == False and state_t.is_floating_point():
+                    state_t.requires_grad_()
+
+                state_t = checkpoint(custom_forward, state_t, time_i, use_reentrant=False)
+            
+            else:
+                state_t = self.forward(state_t, node_pos, edges, time_i, conditions, pos_enc, c_enc, dt)
 
             outputs.append(state_t)
 

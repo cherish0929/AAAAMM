@@ -318,13 +318,13 @@ class CutAeroGtoDataset(Dataset):
         if 'state/T' in f:
             T_data = f['state/T'][time_idx][:, indices, 0].reshape(-1, nz, ny, nx)
             active_mask |= np.any(T_data > 1200, axis=0)
-            print_current_bounds("1.叠加温度场(>1200K)", active_mask)
+            # print_current_bounds("1.叠加温度场(>1200K)", active_mask)
 
         # 嗅探液相场
         if 'state/gamma_liquid' in f:
             gamma = f['state/gamma_liquid'][time_idx][:, indices, 0].reshape(-1, nz, ny, nx)
             active_mask |= np.any(np.abs(gamma) > 1e-3, axis=0)
-            print_current_bounds("2.叠加液相(>1e-4)", active_mask)
+            # print_current_bounds("2.叠加液相(>1e-4)", active_mask)
 
         # gas_mask = None
         # if 'state/alpha.air' in f:
