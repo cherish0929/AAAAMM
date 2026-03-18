@@ -9,10 +9,25 @@ def get_edge_info(edges, node_pos):
     senders = torch.gather(node_pos, -2, edges[..., 0].unsqueeze(-1).expand(-1, -1, node_pos.shape[-1]))
     receivers = torch.gather(node_pos, -2, edges[..., 1].unsqueeze(-1).expand(-1, -1, node_pos.shape[-1]))
     d = receivers - senders
-    norm = torch.sqrt((d ** 2).sum(-1, keepdims=True) + 1e-8)
+    norm = torch.sqrt((d ** 2).sum(-1, keepdims=True))
     # distance_2 = -distance_1
     E = torch.cat([d, -d, norm], dim=-1)
     return E
+
+def broadcast_dt(dt, ref_tensor):
+    if not torch.is_tensor(dt):
+        dt = torch.tensor(dt, dtype=ref_tensor.dtype, device=ref_tensor.device)
+    else:
+        dt = dt.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+
+    if dt.dim() == 0:
+        dt = dt.view(1, 1, 1)
+    elif dt.dim() == 1:
+        dt = dt.view(-1, 1, 1)
+    elif dt.dim() == 2:
+        dt = dt.unsqueeze(-1)
+
+    return dt
 
 class MLP(nn.Module): 
     def __init__(self, 
@@ -305,7 +320,7 @@ class Model(nn.Module):
 
         self.pos_enc_dim = pos_enc_dim
         enc_s_dim = space_size + 2 * pos_enc_dim * space_size
-        enc_t_dim = 1 + 2 * pos_enc_dim
+        enc_t_dim = 2 * (1 + 2 * pos_enc_dim)
         enc_c_dim = (1 + 2 * pos_enc_dim) * cond_dim
         
         self.encoder = Encoder(
@@ -332,24 +347,39 @@ class Model(nn.Module):
             )
 
     def forward(self, state_in, node_pos, edges, time_i, conditions, pos_enc = None, c_enc = None, dt=None):
-        
         if pos_enc is None or c_enc is None:
             pos_enc = FourierEmbedding(node_pos, 0, self.pos_enc_dim)
             c_enc = FourierEmbedding(conditions, 0, self.pos_enc_dim)
         
-        t_enc = FourierEmbedding(time_i, 0, self.pos_enc_dim) # 时间编码
+        if len(time_i.shape) == 1:
+            time_i = time_i.view(-1, 1)
+        bs = time_i.shape[0]
+
+        if dt is None:
+            dt_tensor = torch.full((bs, 1), self.dt, dtype=time_i.dtype, device=time_i.device)
+        elif isinstance(dt, (float, int)):
+            dt_tensor = torch.full((bs, 1), float(dt), dtype=time_i.dtype, device=time_i.device)
+        # elif isinstance(dt, np.ndarray):
+        #     dt = torch.from_numpy(dt).float().reshape(bs, 1)
+        #     dt_tensor = dt.to(dtype=time_i.dtype, device=time_i.device)
+        elif isinstance(dt, (np.floating, np.integer)):  # 匹配 np.float32 等标量
+            dt_tensor = torch.tensor([dt], dtype=time_i.dtype, device=time_i.device).reshape(bs, 1)
+        else:
+            dt_tensor = dt.view(bs, 1).to(dtype=time_i.dtype, device=time_i.device)
+
+        time_info = torch.cat([time_i, dt_tensor], dim=-1) # 拼接得到联合特征
+
+        t_enc = FourierEmbedding(time_info, 0, self.pos_enc_dim) # 时间编码
 
         edges_long = edges.long() if edges.dtype != torch.long else edges
+
         V, E = self.encoder(node_pos, state_in, t_enc, c_enc, edges_long)
         
         V_all = self.mixer(V, E, edges_long, pos_enc)
         
         v_pred = self.decoder(V_all, pos_enc)
-        
-        # if self.stepper_scheme == "euler":
-        if dt is None: dt = self.dt  # 没有输入用默认 dt
-        elif len(dt.shape) == 1: dt = dt.view(-1, 1, 1)
-        state_pred = state_in + dt * v_pred
+
+        state_pred = state_in + v_pred # dt * v_pred；尝试直接预测增量
 
         return state_pred
 
@@ -360,7 +390,9 @@ class Model(nn.Module):
                        time_seq,
                        conditions,
                        dt=None,
-                       check_point=False):
+                       check_point=False,
+                       teacher_forcing=False,
+                       gt_states=None):
 
 
         state_t = state_in
@@ -373,7 +405,7 @@ class Model(nn.Module):
         
         for t in range(T):
             time_i = time_seq[:, t]  # expect shape (bs, 1) or (bs,) depending on your caller
-
+            
             def custom_forward(s_t, t_i):
                 return self.forward(s_t, node_pos, edges, t_i, conditions, pos_enc, c_enc, dt)
             
@@ -381,12 +413,18 @@ class Model(nn.Module):
                 if state_t.requires_grad == False and state_t.is_floating_point():
                     state_t.requires_grad_()
 
-                state_t = checkpoint(custom_forward, state_t, time_i, use_reentrant=False)
+                state_pred = checkpoint(custom_forward, state_t, time_i, use_reentrant=False)
             
             else:
-                state_t = self.forward(state_t, node_pos, edges, time_i, conditions, pos_enc, c_enc, dt)
+                state_pred = self.forward(state_t, node_pos, edges, time_i, conditions, pos_enc, c_enc, dt)
 
             outputs.append(state_t)
+
+            if t < T - 1:
+                if teacher_forcing and gt_states is not None:
+                    state_t = gt_states[:, t]
+                else:
+                    state_t = state_pred
 
             # with torch.no_grad():
             #     delta = outputs[-1][:, 0] - outputs[-2][:, 0]
@@ -398,8 +436,3 @@ class Model(nn.Module):
         outputs = torch.stack(outputs[1:], dim=1)
         
         return outputs
-
-# 均匀化
-# 二维到三维演化
-# 简单的算例
-

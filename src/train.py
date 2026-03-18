@@ -107,7 +107,7 @@ def get_val_loss(fields, predict_hat, state, normalizer):
 def train(args, model, train_dataloader, optim, device, normalizer):
     horizon = args.data.get("horizon_train", 1) if isinstance(args.data, dict) else getattr(args, "horizon_train", 1)
     fields = args.data.get("fields", ["T"])
-    use_amp = args.model.get("use_amp", False)
+    use_amp, check_point = args.model.get("use_amp", False), args.model.get("check_point", False)
     agg = {}
     for key in ["loss", "L2", "mean_l2", "RMSE"]:
         if key == "L2" or key == "RMSE":
@@ -135,20 +135,16 @@ def train(args, model, train_dataloader, optim, device, normalizer):
 
         if use_amp:
             with autocast(device_type="cuda", dtype=torch.bfloat16):   
-                predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt)
+                predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
                 costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, args.train.get("loss_flag", "L2_norm_loss"))
-            scaler.scale(costs["loss"]).backward()
-
-            # 以下两行注释用于稳住训练，避免loss 飙升
-            scaler.unscale_(optim)
+            
+            costs["loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-            scaler.step(optim)
-            scaler.update()
+            optim.step()
             optim.zero_grad()
-        
+                
         else:
-            predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt)
+            predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
 
             costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, args.train.get("loss_flag", "L2_norm_loss"))
             costs["loss"].backward()
@@ -178,7 +174,7 @@ def train(args, model, train_dataloader, optim, device, normalizer):
 def validate(args, model, val_dataloader, device, normalizer, epoch):
     horizon = args.data.get("horizon_test", 1) if isinstance(args.data, dict) else getattr(args, "horizon_test", 1)
     fields = args.data.get("fields", ["T"])
-    use_amp = args.model.get("use_amp", False)
+    use_amp, check_point = args.model.get("use_amp", False), args.model.get("check_point", False)
     agg = {}
     for key in ["L2", "mean_l2", "RMSE"]:
         if key == "L2" or key == "RMSE":
@@ -211,10 +207,10 @@ def validate(args, model, val_dataloader, device, normalizer, epoch):
 
             if use_amp:
                 with autocast("cuda", dtype=torch.bfloat16):
-                    predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt)
+                    predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
                     costs = get_val_loss(fields, predict_hat, state[:, 1:], normalizer)
             else:
-                predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt)
+                predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
                 costs = get_val_loss(fields, predict_hat, state[:, 1:], normalizer)
 
             for fname in fields:

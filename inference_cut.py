@@ -13,7 +13,7 @@ import h5py
 
 # 引入项目模块
 # from src.physgto_res import Model
-from src.physgto import Model
+# from src.physgto import Model
 from src.dataset_cut import CutAeroGtoDataset
 from src.utils import load_json_config, set_seed
 
@@ -38,6 +38,7 @@ class AeroGtoPredictor:
         print("[Init] Loading Train Dataset (for Normalizer)...")
         # 即使是 inference，通常也需要 TrainSet 的统计数据来做 Normalizer
         train_dataset = CutAeroGtoDataset(
+            data_cfg=data_cfg,
             file_list=data_cfg["train_list"],
             mode="train",
             fields=data_cfg.get("fields", ["T"]),
@@ -52,6 +53,7 @@ class AeroGtoPredictor:
 
         if mode == "test":
             self.dataset = CutAeroGtoDataset(
+                data_cfg=data_cfg,
                 file_list=self.args.data["test_list"],
                 mode="test",
                 fields=self.args.data.get("fields", ["T"]),
@@ -77,6 +79,14 @@ class AeroGtoPredictor:
         print("[Init] Building Model...")
         cond_dim = self.args.model.get("cond_dim") or self.dataset.cond_dim
         default_dt = self.args.model.get("dt", self.dataset.dt)
+        model_name = model_cfg.get("name", "PhysGTO")
+
+        if model_name == "PhysGTO":
+            from src.physgto import Model
+        elif model_name == "gto_res":
+            from src.physgto_res import Model
+        elif model_name == "gto_lnn":
+            from src.gto_lnn import Model
         
         self.model = Model(
             space_size=self.args.model.get("space_size", 3),
@@ -345,8 +355,10 @@ class AeroGtoPredictor:
         Xi, Yi = np.meshgrid(xi, yi)
 
         is_phase = self._is_phase_field(field_name)
-        interp_method = "linear" # if is_phase else "cubic"
-        sigma = 0.5 if is_phase else smooth_sigma
+        interp_method = "linear" if is_phase else "cubic"
+        
+        interp_method = "cubic"
+        sigma = 0.7 if is_phase else smooth_sigma
 
         Zi_pred_raw = self._interp_grid(pts_x, pts_y, pred_data[mask], Xi, Yi, method=interp_method)
         Zi_gt_raw = self._interp_grid(pts_x, pts_y, gt_data[mask], Xi, Yi, method=interp_method)
@@ -522,7 +534,7 @@ class AeroGtoPredictor:
                 frames.append(img)
         
         if len(frames) > 0:
-            print("Unique frame shapes:", sorted(set([f.shape for f in frames])))
+            # print("Unique frame shapes:", sorted(set([f.shape for f in frames])))
             imageio.mimsave(git_path, frames, fps=10, loop=0)
             print(f"[GIF] Saved to {git_path}")
         else:
@@ -532,7 +544,7 @@ if __name__ == "__main__":
     MODE = "test"
     NAME = "config/aerogto_HR_easypool_v0.json"
     # === 配置区域 ===
-    CONFIG_PATH = f"config/aerogto_cut_version_easypool.json" 
+    CONFIG_PATH = f"config/aerogto_cut_easypool_downsample.json" 
     
     FIELD_TO_PLOT = None   # ["T", "Ux", "Uy", "Uz", "alpha.air", "alpha.titanium", "gamma_liquid"] 
     SLICE_AXIS = "z"        # 'x', 'y', 'z'

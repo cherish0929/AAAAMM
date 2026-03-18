@@ -62,7 +62,7 @@ def _compute_downsample_indices(grid_shape: Tuple[int, int, int], stride: Tuple[
     return np.asarray(indices, dtype=np.int32), ds_shape
 
 
-def _build_grid_edges(ds_shape: Tuple[int, int, int], sample_ratio=1.0) -> torch.Tensor:
+def _build_grid_edges(ds_shape: Tuple[int, int, int], sample_ratio=0.6) -> torch.Tensor:
     """基于裁剪后的网格动态生成六向邻接边"""
     nx, ny, nz = ds_shape
     idx_grid = np.arange(nx * ny * nz).reshape(nz, ny, nx)
@@ -176,7 +176,7 @@ def _condition_vector(f: h5py.File, field_names: List[str]) -> np.ndarray:
 
 class CutAeroGtoDataset(Dataset):
     def __init__(
-        self,
+        self, data_cfg,
         file_list: Iterable[str],
         mode: str = "train",
         fields:List['str'] = ['T'],
@@ -191,6 +191,7 @@ class CutAeroGtoDataset(Dataset):
         margin: int = 4, # 控制裁剪外扩裕度
     ):
         super().__init__()
+        self.config = data_cfg
         assert mode in {"train", "test"}, "mode 只能为 train 或 test"
         self.mode = mode
         self.fields = fields
@@ -249,6 +250,19 @@ class CutAeroGtoDataset(Dataset):
             mean_list.append(m)
             std_list.append(s)
         return ChannelNormalizer(np.array(mean_list, dtype=np.float32), np.array(std_list, dtype=np.float32))
+    
+    def scale_3D_pos(self, node_pos):
+        
+        xx = node_pos[...,0]
+        yy = node_pos[...,1]
+        zz = node_pos[...,2]
+
+        x_norm = (xx - xx.min()) / (xx.max() - xx.min())
+        y_norm = (yy - yy.min()) / (yy.max() - yy.min())
+        z_norm = (zz - zz.min()) / (zz.max() - zz.min())
+        
+        node_pos_new = torch.stack((x_norm, y_norm, z_norm), dim=-1)
+        return node_pos_new
 
     def _build_meta(self, path: str):
         path = str(Path(path).expanduser().resolve())
@@ -315,10 +329,10 @@ class CutAeroGtoDataset(Dataset):
                       f"Z:[{z_i.min()}->{z_i.max()}] (深{z_i.max()-z_i.min()+1})")
 
         # 优先嗅探温度场
-        if 'state/T' in f:
-            T_data = f['state/T'][time_idx][:, indices, 0].reshape(-1, nz, ny, nx)
-            active_mask |= np.any(T_data > 1200, axis=0)
-            # print_current_bounds("1.叠加温度场(>1200K)", active_mask)
+        # if 'state/T' in f:
+        #     T_data = f['state/T'][time_idx][:, indices, 0].reshape(-1, nz, ny, nx)
+        #     active_mask |= np.any(T_data > 1200, axis=0)
+        #     # print_current_bounds("1.叠加温度场(>1200K)", active_mask)
 
         # 嗅探液相场
         if 'state/gamma_liquid' in f:
@@ -417,10 +431,13 @@ class CutAeroGtoDataset(Dataset):
         # 5. 归一化 (位置依然使用全场极值)
         if self.normalize:
             state = self.normalizer.normalize(state)
-            pos_min_t = torch.from_numpy(meta["pos_min"])
+            pos_min_t = torch.from_numpy(meta["pos_min"]) # 全场极值
             pos_max_t = torch.from_numpy(meta["pos_max"])
 
-            node_pos = (node_pos - pos_min_t) / (pos_max_t - pos_min_t + 1e-8)
+            pos_min_r = node_pos.min(dim=0).values # 相对极值
+            pos_max_r = node_pos.max(dim=0).values
+
+            node_pos = (node_pos - pos_min_r) / (pos_max_r - pos_min_r + 1e-8)
 
         # 6. 生成新图边
         edges = _build_grid_edges((nx_new, ny_new, nz_new))

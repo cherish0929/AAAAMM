@@ -230,7 +230,7 @@ class AeroGtoDataset(Dataset):
     """面向LPBF数据的自回归训练集封装。"""
 
     def __init__(
-        self,
+        self, data_cfg,
         file_list: Iterable[str],
         mode: str = "train",
         fields:List['str'] = ['T'],
@@ -245,6 +245,7 @@ class AeroGtoDataset(Dataset):
     ):
         super().__init__()
         assert mode in {"train", "test"}, "mode 只能为 train 或 test"
+        self.config = data_cfg
         self.mode = mode
         self.fields = fields
         self.input_steps = input_steps

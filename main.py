@@ -14,7 +14,7 @@ from torch.optim import AdamW
 from src.dataset import AeroGtoDataset
 from src.dataset_2d import AeroGtoDataset2D
 from src.dataset_cut import CutAeroGtoDataset
-from src.physgto import Model
+# from src.physgto import Model
 from src.train import train, validate
 from src.utils import set_seed, init_weights, parse_args, load_json_config
 
@@ -33,6 +33,7 @@ def get_dataloader(args, path_record, device_type):
         
     # 构建数据集
     train_dataset = Datasetclass(
+        data_cfg=data_cfg,
         file_list=data_cfg["train_list"],
         mode="train",
         fields=data_cfg.get("fields", ["T"]),
@@ -46,6 +47,7 @@ def get_dataloader(args, path_record, device_type):
     )
 
     test_dataset = Datasetclass(
+        data_cfg=data_cfg,
         file_list=data_cfg["test_list"],
         mode="test",
         fields=data_cfg.get("fields", ["T"]),
@@ -95,6 +97,14 @@ def get_dataloader(args, path_record, device_type):
 
 def get_model(args, device, cond_dim, default_dt):
     model_cfg = args.model
+    model_name = model_cfg.get("name", "PhysGTO")
+
+    if model_name == "PhysGTO":
+        from src.physgto import Model
+    elif model_name == "gto_res":
+        from src.physgto_res import Model
+    elif model_name == "gto_lnn":
+        from src.gto_lnn import Model
     
     model = Model(
         space_size=model_cfg.get("space_size", 3),
