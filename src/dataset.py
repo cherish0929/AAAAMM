@@ -231,6 +231,7 @@ class AeroGtoDataset(Dataset):
         self.samples_per_file = config.get("samples_per_file", 32)
         self.log_velocity = config.get("log_velocity", False)
         self.velocity_transformode = config.get("velocity_transformode", None)
+        self.edge_sample_ratio = config.get("edge_sample_ratio", 1.0)
 
         self.file_paths = _read_file_list(config[f"{self.mode}_list"])
         self.cache_path = self._generate_cache_path(config["norm_cache"])
@@ -374,7 +375,7 @@ class AeroGtoDataset(Dataset):
 
             node_pos = torch.from_numpy(point.astype(np.float32))
 
-            edges = _build_grid_edges(ds_shape)
+            edges = _build_grid_edges(ds_shape, self.edge_sample_ratio)
             node_type = _build_node_type(ds_shape)
 
             mat_conditions = f["parameter/material"][:]

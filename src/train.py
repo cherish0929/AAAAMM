@@ -136,7 +136,7 @@ def _compute_velocity_divergence(velocity, node_pos, edges, axis_info, node_mask
 
     return divergence, spacing, edge_mask
 
-def get_incompressibility_loss(args, model, predict_hat, label_gt, normalizer, fields, node_pos_phys, edges, node_type=None, mask_weight=None):
+def get_incompressibility_loss(args, model, predict_hat, label_gt, normalizer, fields, node_pos_phys, edges, node_type=None, mask_weight=None, epoch=0):
     train_args = args.train
     cfg = train_args.get("incompressibility", {}) or {}
     axis_info = _get_velocity_axis_info(model, fields)
@@ -171,7 +171,8 @@ def get_incompressibility_loss(args, model, predict_hat, label_gt, normalizer, f
         node_mask = node_mask & (node_type.squeeze(-1) == 0).unsqueeze(1)
 
     pred_div, spacing, edge_mask = _compute_velocity_divergence(pred_vel, node_pos_phys, edges, axis_info, node_mask=node_mask)
-    target_mode = cfg.get("target", "zero")
+    target_mode = cfg.get("target", "zero") # 散度目标
+
     if target_mode == "gt":
         div_target, _, _ = _compute_velocity_divergence(gt_vel, node_pos_phys, edges, axis_info, node_mask=node_mask)
     else:
@@ -192,8 +193,17 @@ def get_incompressibility_loss(args, model, predict_hat, label_gt, normalizer, f
 
     div_scaled = div_residual * (length_scale / speed_scale)
     div_loss = torch.sum((div_scaled ** 2) * node_weight) / node_count
-    weight = float(cfg.get("weight", 5e-2))
+
+    # warm-up 调度：前 warmup_epochs 个 epoch 线性增长权重
+    base_weight = float(cfg.get("weight", 5e-2))
+    warmup_epochs = int(cfg.get("warmup_epochs", 0))
+    if warmup_epochs > 0 and epoch < warmup_epochs:
+        ramp = (epoch + 1) / warmup_epochs
+        weight = base_weight * ramp
+    else:
+        weight = base_weight
     weighted_div_loss = div_loss * weight
+    # weighted_div_loss = div_loss
 
     div_rms = torch.sqrt(torch.sum((div_residual ** 2) * node_weight) / node_count)
     div_scaled_rms = torch.sqrt(torch.sum((div_scaled ** 2) * node_weight) / node_count)
@@ -285,7 +295,7 @@ def get_weighted_mse_loss(predict_hat, label_gt, normalizer, fields, train_args,
         loss = torch.mean(weighted_sq_error)
     return loss
 
-def get_train_loss(args, model, predict_hat, label_gt, normalizer, node_pos_phys=None, edges=None, node_type=None, loss_weights=None, mask_weight=None):
+def get_train_loss(args, model, predict_hat, label_gt, normalizer, node_pos_phys=None, edges=None, node_type=None, loss_weights=None, mask_weight=None, epoch=0):
     """返回loss张量及监控指标（其余转为float）。"""
     train_args = args.train
     fields = args.data.get("fields", ["T"])
@@ -303,6 +313,7 @@ def get_train_loss(args, model, predict_hat, label_gt, normalizer, node_pos_phys
         edges=edges,
         node_type=node_type,
         mask_weight=mask_weight,
+        epoch=epoch,
     ) if node_pos_phys is not None and edges is not None else {
         "loss": predict_hat.new_zeros(()),
         "weighted_loss": predict_hat.new_zeros(()),
@@ -398,7 +409,7 @@ def get_val_loss(args, model, fields, predict_hat, state, normalizer, node_pos_p
     return losses
 
 
-def train(args, model, train_dataloader, optim, device, normalizer):
+def train(args, model, train_dataloader, optim, device, normalizer, epoch=0):
     horizon = args.data.get("horizon_train", 1) if isinstance(args.data, dict) else getattr(args, "horizon_train", 1)
     fields, data_mask = args.data.get("fields", ["T"]), args.data.get("mask", False)
     teacher = args.train.get("teacher", False) # 开启 teacher forcing
@@ -465,6 +476,7 @@ def train(args, model, train_dataloader, optim, device, normalizer):
             edges=edges,
             node_type=node_type,
             mask_weight=valid_mask,
+            epoch=epoch,
         )
 
         optim.zero_grad(set_to_none=True)

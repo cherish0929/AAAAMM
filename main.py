@@ -194,7 +194,8 @@ def main(args, path_logs, path_nn, path_record):
             train_dataloader,
             optimizer,
             device,
-            normalizer
+            normalizer,
+            epoch=epoch
         )
         end_time = time.time()
 

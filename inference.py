@@ -205,9 +205,14 @@ class AeroGtoPredictor:
             return 0.0, 1.0, True
 
         if self._is_velocity_field(field_name):
-            all_pred = result_dict["pred"][..., field_idx]
-            all_gt = result_dict["gt"][..., field_idx]
-            combined = np.concatenate([all_pred.reshape(-1), all_gt.reshape(-1)])
+            if interface and result_dict.get("gt_interface") is not None:
+                gas_mask_all = result_dict["gt_interface"] > 0.5
+                valid_pred = np.where(gas_mask_all, np.nan, result_dict["pred"][..., field_idx])
+                valid_gt = np.where(gas_mask_all, np.nan, result_dict["gt"][..., field_idx])
+            else:
+                valid_pred = result_dict["pred"][..., field_idx]
+                valid_gt = result_dict["gt"][..., field_idx]
+            combined = np.concatenate([valid_pred.reshape(-1), valid_gt.reshape(-1)])
             active_combined = combined[np.abs(combined) > 1e-4]
             if len(active_combined) < 10 or np.all(np.isnan(active_combined)):
                 return -1.0, 1.0, False
