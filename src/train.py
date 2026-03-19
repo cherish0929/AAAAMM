@@ -295,13 +295,14 @@ def get_weighted_mse_loss(predict_hat, label_gt, normalizer, fields, train_args,
         loss = torch.mean(weighted_sq_error)
     return loss
 
-def get_train_loss(args, model, predict_hat, label_gt, normalizer, node_pos_phys=None, edges=None, node_type=None, loss_weights=None, mask_weight=None, epoch=0):
+def get_train_loss(args, model, predict_hat, label_gt, normalizer, node_pos_phys=None, edges=None, node_type=None, mask_weight=None, epoch=0):
     """返回loss张量及监控指标（其余转为float）。"""
     train_args = args.train
     fields = args.data.get("fields", ["T"])
-    loss_flag = train_args.get("loss_flag", "L2_norm_loss")
 
-    data_loss = get_weighted_mse_loss(predict_hat, label_gt, normalizer, fields, train_args, device=predict_hat.device, mask_weight=mask_weight)
+    # data_loss = get_weighted_mse_loss(predict_hat, label_gt, normalizer, fields, train_args, device=predict_hat.device, mask_weight=mask_weight)
+    data_loss = F.mse_loss(predict_hat, label_gt, reduction='mean')
+
     incompressibility = get_incompressibility_loss(
         args,
         model,

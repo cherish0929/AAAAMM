@@ -510,11 +510,11 @@ class AeroGtoDataset(Dataset):
             total_vel_abs = sum([state[..., i].abs() for i in vel_indices])
             dead_zone_mask = (total_vel_abs < velocity_dead_zone).view_as(gas_mask)
             gas_mask = gas_mask | dead_zone_mask
-
-        for i, field in enumerate(self.fields):
-            if field in ["Ux", "Uy", "Uz"]:
-                vel = state[..., i]
-                state[..., i] = torch.where(vel.abs() < velocity_dead_zone, torch.zeros_like(vel), vel)
+            
+        # for i, field in enumerate(self.fields):
+        #     if field in ["Ux", "Uy", "Uz"]:
+        #         vel = state[..., i]
+        #         state[..., i] = torch.where(vel.abs() < velocity_dead_zone, torch.zeros_like(vel), vel)
 
         # roi_mask = (gamma_t > 1e-4) & (alpha_t < 0.99)
 
