@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-from torch_scatter import scatter_mean
+from torch_scatter import scatter_mean, scatter_softmax
 
 VELOCITY_FIELD_NAMES = ("Ux", "Uy", "Uz")
 
@@ -30,13 +30,13 @@ def broadcast_dt(dt, ref_tensor):
 
     return dt
 
-class MLP(nn.Module): 
-    def __init__(self, 
-                input_size = 128, 
-                output_size = 128, 
-                layer_norm = True, 
-                n_hidden=1, 
-                hidden_size = 128, 
+class MLP(nn.Module):
+    def __init__(self,
+                input_size = 128,
+                output_size = 128,
+                layer_norm = True,
+                n_hidden=1,
+                hidden_size = 128,
                 act = 'SiLU',
                 ):
         super(MLP, self).__init__()
@@ -46,7 +46,7 @@ class MLP(nn.Module):
             self.act = nn.SiLU()
         elif act == 'PReLU':
             self.act = nn.PReLU()
-            
+
         if hidden_size == 0:
             f = [nn.Linear(input_size, output_size)]
         else:
@@ -63,18 +63,18 @@ class MLP(nn.Module):
 
     def forward(self, x):
         return self.f(x)
-    
-class Atten(nn.Module): 
-    def __init__(self, 
+
+class Atten(nn.Module):
+    def __init__(self,
                 n_token=128,
-                c_dim=128, 
+                c_dim=128,
                 n_heads=4):
         super(Atten, self).__init__()
-        
+
         self.c_dim = c_dim
         self.n_token = n_token
         self.n_heads = n_heads
-        
+
         # Learnable query
         self.Q = nn.Parameter(torch.randn(self.n_token, self.c_dim), requires_grad=True)
 
@@ -83,23 +83,23 @@ class Atten(nn.Module):
         self.attention2 = nn.MultiheadAttention(embed_dim=self.c_dim, num_heads=self.n_heads, batch_first=True)
         self.attention3 = nn.MultiheadAttention(embed_dim=self.c_dim, num_heads=self.n_heads, batch_first=True)
 
-    def forward(self, W0):   
+    def forward(self, W0):
         # Step 1: Initial attention with learned query
         batch = W0.shape[0]
         learned_Q = self.Q.unsqueeze(0).repeat(batch, 1, 1)
         W, _ = self.attention1(learned_Q, W0, W0)
-    
+
         # Step 2: Self-attention on the transformed result
         W, _ = self.attention2(W, W, W)
-        
+
         # Step 3: Position-aware attention
         W, _ = self.attention3(W0, W, W)
-    
+
         return W
-    
+
 def FourierEmbedding(pos, pos_start, pos_length):
     # F(x) = [cos(2^i * pi * x), sin(2^i * pi * x)]
-    
+
     original_shape = pos.shape
     new_pos = pos.reshape(-1, original_shape[-1])
     index = torch.arange(pos_start, pos_start + pos_length, device=pos.device)
@@ -110,15 +110,21 @@ def FourierEmbedding(pos, pos_start, pos_length):
     embedding = torch.cat([cos_feat, sin_feat], dim=-1)
     embedding = embedding.view(*original_shape[:-1], -1)
     all_embeddings = torch.cat([embedding, pos], dim=-1)
-    
+
     return all_embeddings
 
 # ---------------------------
 # Core modules
 # ---------------------------
-class GNN(nn.Module):
+class GatedGNN(nn.Module):
+    """
+    GNN with edge-gated attention aggregation.
+    Replaces scatter_mean with scatter_softmax + scatter_add,
+    so the network learns per-edge importance weights and preserves
+    sharp velocity gradients at melt pool boundaries.
+    """
     def __init__(self, n_hidden=1, node_size=128, edge_size=128, output_size=None, layer_norm=False):
-        super(GNN, self).__init__()
+        super(GatedGNN, self).__init__()
 
         self.node_size = node_size
         self.output_size = output_size
@@ -132,6 +138,14 @@ class GNN(nn.Module):
             act='SiLU',
             output_size=edge_size
         )
+
+        # Edge attention scorer: learns which neighbors matter for aggregation
+        self.f_attn = nn.Sequential(
+            nn.Linear(edge_size, edge_size // 2),
+            nn.SiLU(),
+            nn.Linear(edge_size // 2, 1),
+        )
+
         self.f_node = MLP(
             input_size=edge_size + node_size,
             n_hidden=n_hidden,
@@ -140,46 +154,60 @@ class GNN(nn.Module):
             output_size=output_size
         )
 
-    def get_edges_info(self, V, E, edges):
-        # edges: (bs, ne, 2)
-        # gather indices shape: (bs, ne, feat)
-        senders = torch.gather(V, -2, edges[..., 0].unsqueeze(-1).expand(-1, -1, V.shape[-1]))
-        receivers = torch.gather(V, -2, edges[..., 1].unsqueeze(-1).expand(-1, -1, V.shape[-1]))
-        edge_inpt = torch.cat([senders, receivers, E], dim=-1)
-        return edge_inpt
-
     def forward(self, V, E, edges):
         """
         V: (bs, N, node_size)
         E: (bs, ne, edge_size)
         edges: (bs, ne, 2) long
-        idx0/idx1: (bs, ne) flattened indices (optional, fast path)
         """
         bs, N, _ = V.shape
-        edge_inpt = self.get_edges_info(V, E, edges)
+
+        # Gather sender/receiver features
+        senders = torch.gather(V, -2, edges[..., 0].unsqueeze(-1).expand(-1, -1, V.shape[-1]))
+        receivers = torch.gather(V, -2, edges[..., 1].unsqueeze(-1).expand(-1, -1, V.shape[-1]))
+        edge_inpt = torch.cat([senders, receivers, E], dim=-1)
         edge_embeddings = self.f_edge(edge_inpt)
 
-        # keep your original semantics: split into two directed parts
-        edge_embeddings_0, edge_embeddings_1 = edge_embeddings.chunk(2, dim=-1)
+        # Split into two directed halves
+        edge_emb_0, edge_emb_1 = edge_embeddings.chunk(2, dim=-1)
+        feat_dim = edge_emb_0.shape[-1]
 
-        feat0 = edge_embeddings_0.shape[-1]
-        feat1 = edge_embeddings_1.shape[-1]
+        # Compute edge attention logits
+        attn_logits_0 = self.f_attn(edge_emb_0).squeeze(-1)  # [bs, ne]
+        attn_logits_1 = self.f_attn(edge_emb_1).squeeze(-1)  # [bs, ne]
 
-        # IMPORTANT: expand instead of repeat (no real copy)
-        col_0 = edges[..., 0].unsqueeze(-1).expand(-1, -1, feat0)
-        col_1 = edges[..., 1].unsqueeze(-1).expand(-1, -1, feat1)
+        recv_idx_0 = edges[..., 0]  # messages aggregated to sender node
+        recv_idx_1 = edges[..., 1]  # messages aggregated to receiver node
 
-        # nodes axis is dim=1 (same as your -2)
-        edge_mean_0 = scatter_mean(edge_embeddings_0, col_0, dim=1, dim_size=N)
-        edge_mean_1 = scatter_mean(edge_embeddings_1, col_1, dim=1, dim_size=N)
+        # scatter_softmax: softmax over all incoming edges per node
+        attn_weights_0 = scatter_softmax(attn_logits_0, recv_idx_0, dim=1, dim_size=N)
+        attn_weights_1 = scatter_softmax(attn_logits_1, recv_idx_1, dim=1, dim_size=N)
 
-        edge_mean = torch.cat([edge_mean_0, edge_mean_1], dim=-1)
+        # Weighted aggregation via scatter_add
+        weighted_msg_0 = edge_emb_0 * attn_weights_0.unsqueeze(-1)
+        weighted_msg_1 = edge_emb_1 * attn_weights_1.unsqueeze(-1)
+
+        col_0 = recv_idx_0.unsqueeze(-1).expand(-1, -1, feat_dim)
+        col_1 = recv_idx_1.unsqueeze(-1).expand(-1, -1, feat_dim)
+
+        agg_0 = torch.zeros(bs, N, feat_dim, device=V.device, dtype=V.dtype)
+        agg_1 = torch.zeros(bs, N, feat_dim, device=V.device, dtype=V.dtype)
+        agg_0.scatter_add_(1, col_0, weighted_msg_0)
+        agg_1.scatter_add_(1, col_1, weighted_msg_1)
+
+        edge_mean = torch.cat([agg_0, agg_1], dim=-1)
         node_inpt = torch.cat([V, edge_mean], dim=-1)
         node_embeddings = self.f_node(node_inpt)
 
         return node_embeddings, edge_embeddings
 
+
 class Decoder(nn.Module):
+    """
+    Per-component decoder with shared backbone and separate Ux/Uy/Uz heads.
+    Includes spatially-adaptive residual gating so the network learns where
+    to apply large updates (melt pool) vs near-zero updates (background).
+    """
     def __init__(self,
                  N = 4,
                  enc_dim=128,
@@ -187,9 +215,10 @@ class Decoder(nn.Module):
                  state_size=1):
         super().__init__()
 
+        self.state_size = state_size
         in_dim = N * enc_dim + enc_s_dim
 
-        # Deeper decoder with residual connection and gating
+        # Shared backbone
         self.proj = nn.Linear(in_dim, enc_dim)
         self.res_block = nn.Sequential(
             nn.LayerNorm(enc_dim),
@@ -201,9 +230,24 @@ class Decoder(nn.Module):
             nn.Linear(enc_dim, enc_dim),
             nn.Sigmoid(),
         )
-        self.out = nn.Sequential(
-            nn.LayerNorm(enc_dim),
-            nn.Linear(enc_dim, state_size),
+        self.backbone_norm = nn.LayerNorm(enc_dim)
+
+        # Per-component output heads (Ux, Uy, Uz each get their own head)
+        self.heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(enc_dim, enc_dim // 2),
+                nn.SiLU(),
+                nn.Linear(enc_dim // 2, 1),
+            )
+            for _ in range(state_size)
+        ])
+
+        # Spatially-adaptive residual gate: learns per-node scaling of delta
+        self.spatial_gate = nn.Sequential(
+            nn.Linear(enc_dim, enc_dim // 2),
+            nn.SiLU(),
+            nn.Linear(enc_dim // 2, state_size),
+            nn.Tanh(),  # output in [-1, 1]
         )
 
     def forward(self, V_all, pos_enc):
@@ -216,9 +260,17 @@ class Decoder(nn.Module):
         r = self.res_block(h)
         g = self.gate(h)
         h = h + g * r   # gated residual
-        V = self.out(h)
+        h = self.backbone_norm(h)
 
-        return V
+        # Per-component prediction
+        components = [head(h) for head in self.heads]  # list of [b, N, 1]
+        raw_delta = torch.cat(components, dim=-1)       # [b, N, state_size]
+
+        # Spatially-adaptive scaling
+        scale = self.spatial_gate(h)  # [b, N, state_size], range [-1, 1]
+        delta = raw_delta * (1.0 + scale)
+
+        return delta
 
 
 
@@ -227,13 +279,14 @@ class MixerBlock(nn.Module):
         super().__init__()
         node_size = enc_dim + enc_s_dim
 
-        self.gnn = GNN(
+        self.gnn = GatedGNN(
             node_size=node_size,
             edge_size=enc_dim,
             output_size=enc_dim,
             layer_norm=True
         )
 
+        self.ln0 = nn.LayerNorm(enc_dim)
         self.ln1 = nn.LayerNorm(enc_dim)
         self.ln2 = nn.LayerNorm(enc_dim)
         self.mha = Atten(n_token=n_token, c_dim=enc_dim, n_heads=n_head)
@@ -244,18 +297,23 @@ class MixerBlock(nn.Module):
             nn.Linear(2 * enc_dim, enc_dim)
         )
 
+        # Learnable residual scaling (helps stabilize deep blocks)
+        self.alpha_gnn = nn.Parameter(torch.ones(1) * 0.5)
+        self.alpha_attn = nn.Parameter(torch.ones(1) * 0.5)
+        self.alpha_ffn = nn.Parameter(torch.ones(1) * 0.5)
+
     def forward(self, V, E, edges, s_enc):
-        # 1) GNN
-        V_in = torch.cat([V, s_enc], dim=-1)
+        # 1) GNN with pre-norm on V
+        V_in = torch.cat([self.ln0(V), s_enc], dim=-1)
         v, e = self.gnn(V_in, E, edges)
         E = E + e
-        V = V + v
+        V = V + self.alpha_gnn * v
 
         # 2) Attention (PreNorm)
-        V = V + self.mha(self.ln1(V))
+        V = V + self.alpha_attn * self.mha(self.ln1(V))
 
         # 3) FFN (PreNorm)
-        V = V + self.ffn(self.ln2(V))
+        V = V + self.alpha_ffn * self.ffn(self.ln2(V))
 
         return V, E
 
@@ -270,27 +328,37 @@ class Encoder(nn.Module):
                  ):
         super(Encoder, self).__init__()
 
-        # node embedding
-        self.fv1 = MLP(input_size=state_size + space_size, output_size=enc_dim, act='SiLU', layer_norm=False)
+        # +1 for velocity magnitude as auxiliary input
+        self.fv1 = MLP(input_size=state_size + space_size + 1, output_size=enc_dim, act='SiLU', layer_norm=False)
         self.fv_time = MLP(input_size=enc_t_dim, output_size=enc_dim, act='SiLU', layer_norm=False)
         self.fv_cond = MLP(input_size=enc_c_dim, output_size=enc_dim, act='SiLU', layer_norm=False)
 
-        # edge embedding
-        self.fe = MLP(input_size=2 * space_size + 1, output_size=enc_dim, n_hidden=1, act='SiLU', layer_norm=False)
-        
+        # Edge embedding: spatial info (7) + velocity difference (state_size)
+        self.fe = MLP(input_size=2 * space_size + 1 + state_size, output_size=enc_dim, n_hidden=1, act='SiLU', layer_norm=False)
+
     def forward(self, node_pos, state_in, time_i, conditions, edges):
         # state_in: (bs,N,in_dim), node_pos: (bs,N,space)
-        
-        # node embedding
-        state_in = torch.cat((state_in, node_pos), dim=-1)
+
+        # Compute velocity magnitude as auxiliary feature
+        vel_mag = torch.norm(state_in, dim=-1, keepdim=True)  # [bs, N, 1]
+
+        # node embedding: state + position + velocity magnitude
+        state_aug = torch.cat((state_in, node_pos, vel_mag), dim=-1)
         time_enc = self.fv_time(time_i)         # (bs, enc_dim)
         cond_enc = self.fv_cond(conditions)     # (bs, enc_dim)
-    
-        V = self.fv1(state_in) + time_enc.unsqueeze(-2) + cond_enc.unsqueeze(-2)
-        
-        # edge embedding
-        E = self.fe(get_edge_info(edges, node_pos))
-        
+
+        V = self.fv1(state_aug) + time_enc.unsqueeze(-2) + cond_enc.unsqueeze(-2)
+
+        # Edge embedding: spatial info + velocity difference along each edge
+        spatial_edge = get_edge_info(edges, node_pos)  # [bs, ne, 7]
+
+        send_vel = torch.gather(state_in, -2, edges[..., 0].unsqueeze(-1).expand(-1, -1, state_in.shape[-1]))
+        recv_vel = torch.gather(state_in, -2, edges[..., 1].unsqueeze(-1).expand(-1, -1, state_in.shape[-1]))
+        vel_diff = recv_vel - send_vel  # [bs, ne, state_size]
+
+        edge_input = torch.cat([spatial_edge, vel_diff], dim=-1)  # [bs, ne, 7 + state_size]
+        E = self.fe(edge_input)
+
         return V, E
 
 class Mixer(nn.Module):
@@ -305,11 +373,11 @@ class Mixer(nn.Module):
     def forward(self, V, E, edges_long, pos_enc):
 
         V_all = []
-        
+
         for block in self.blocks:
             V, E = block(V, E, edges_long, pos_enc)
             V_all.append(V)
-        
+
         V_all = torch.stack(V_all, dim=1) # [bs, N_block, N, enc_dim]
 
         return V_all
@@ -332,31 +400,32 @@ class Model(nn.Module):
 
         self.dt = dt
         self.stepper_scheme = stepper_scheme
+        self.out_dim = out_dim
 
         self.pos_enc_dim = pos_enc_dim
         enc_s_dim = space_size + 2 * pos_enc_dim * space_size
         enc_t_dim = 2 * (1 + 2 * pos_enc_dim)
         enc_c_dim = (1 + 2 * pos_enc_dim) * cond_dim
-        
+
         self.encoder = Encoder(
-            space_size = space_size, 
-            state_size = in_dim, 
+            space_size = space_size,
+            state_size = in_dim,
             enc_dim = enc_dim,
-            enc_t_dim = enc_t_dim, 
+            enc_t_dim = enc_t_dim,
             enc_c_dim = enc_c_dim
             )
-        
+
         self.mixer = Mixer(
-            N=N_block, 
-            enc_dim=enc_dim, 
-            n_head=n_head, 
-            n_token=n_token, 
+            N=N_block,
+            enc_dim=enc_dim,
+            n_head=n_head,
+            n_token=n_token,
             enc_s_dim=enc_s_dim
             )
-        
+
         self.decoder = Decoder(
-            N=N_block, 
-            enc_dim=enc_dim, 
+            N=N_block,
+            enc_dim=enc_dim,
             enc_s_dim=enc_s_dim,
             state_size=out_dim
             )
@@ -373,7 +442,7 @@ class Model(nn.Module):
         if pos_enc is None or c_enc is None:
             pos_enc = FourierEmbedding(node_pos, 0, self.pos_enc_dim)
             c_enc = FourierEmbedding(conditions, 0, self.pos_enc_dim)
-        
+
         if len(time_i.shape) == 1:
             time_i = time_i.view(-1, 1)
         bs = time_i.shape[0]
@@ -382,9 +451,6 @@ class Model(nn.Module):
             dt_tensor = torch.full((bs, 1), self.dt, dtype=time_i.dtype, device=time_i.device)
         elif isinstance(dt, (float, int)):
             dt_tensor = torch.full((bs, 1), float(dt), dtype=time_i.dtype, device=time_i.device)
-        # elif isinstance(dt, np.ndarray):
-        #     dt = torch.from_numpy(dt).float().reshape(bs, 1)
-        #     dt_tensor = dt.to(dtype=time_i.dtype, device=time_i.device)
         elif isinstance(dt, (np.floating, np.integer)):  # 匹配 np.float32 等标量
             dt_tensor = torch.tensor([dt], dtype=time_i.dtype, device=time_i.device).reshape(bs, 1)
         else:
@@ -397,12 +463,12 @@ class Model(nn.Module):
         edges_long = edges.long() if edges.dtype != torch.long else edges
 
         V, E = self.encoder(node_pos, state_in, t_enc, c_enc, edges_long)
-        
+
         V_all = self.mixer(V, E, edges_long, pos_enc)
-        
+
         v_pred = self.decoder(V_all, pos_enc)
 
-        state_pred = state_in + v_pred # dt * v_pred；尝试直接预测增量
+        state_pred = state_in + v_pred # 直接预测增量
 
         return state_pred
 
@@ -424,9 +490,18 @@ class Model(nn.Module):
 
         T = time_seq.shape[1]
         for t in range(T):
-            time_i = time_seq[:, t]  # expect shape (bs, 1) or (bs,) depending on your caller
-            
-            state_pred = self.forward(state_t, node_pos, edges, time_i, conditions, pos_enc, c_enc, dt)
+            time_i = time_seq[:, t]
+
+            # Pushforward trick: inject small noise during training to combat
+            # autoregressive error accumulation over 20-step rollouts
+            if self.training and t > 0:
+                noise_scale = 0.02
+                noise = torch.randn_like(state_t) * noise_scale
+                state_t_input = state_t + noise
+            else:
+                state_t_input = state_t
+
+            state_pred = self.forward(state_t_input, node_pos, edges, time_i, conditions, pos_enc, c_enc, dt)
 
             outputs.append(state_pred)
 
@@ -436,13 +511,6 @@ class Model(nn.Module):
                 else:
                     state_t = state_pred
 
-            # with torch.no_grad():
-            #     delta = outputs[-1][:, 0] - outputs[-2][:, 0]
-            #     mean_delta = delta.abs().mean().item() # 平均变化量
-            #     max_delta = delta.abs().max().item()   # 最大变化量 (关注局部剧烈变化)
-            #     l2_norm = torch.norm(delta).item()     # 整体变化的能量
-            #     print(f"Step {t:03d} Delta -> Mean: {mean_delta:.2e} | Max: {max_delta:.2e} | L2: {l2_norm:.2e}")
-        
         outputs = torch.stack(outputs[1:], dim=1)
-        
+
         return outputs
