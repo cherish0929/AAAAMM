@@ -314,7 +314,9 @@ class AeroGtoDataset(Dataset):
 
         for field_name in ["Ux", "Uy", "Uz"]:
             if field_name in self.fields:
-                config[field_name] = (0.0, 2.0)
+                # Use data-driven statistics; center at 0 (velocities are symmetric)
+                _, s = config.get(field_name, (0.0, 1.0))
+                config[field_name] = (0.0, max(s, 0.01))
 
         field_stats_config.update(config)
 

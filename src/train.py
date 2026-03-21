@@ -6,6 +6,92 @@ from pathlib import Path
 
 VELOCITY_FIELD_NAMES = ("Ux", "Uy", "Uz")
 
+
+def _magnitude_aware_loss(pred, target, mask=None, base_weight=1.0, mag_scale=5.0):
+    """
+    Loss that weights each node by the velocity magnitude of the ground truth.
+    Nodes with higher velocity get proportionally higher weight, ensuring
+    the model focuses on the active melt pool region.
+
+    L = mean( w_i * huber(pred_i, target_i) )
+    where w_i = base_weight + mag_scale * |target_i|_2 / (max(|target|_2) + eps)
+    """
+    # Per-node velocity magnitude of ground truth: [B, T, N]
+    gt_mag = torch.norm(target, dim=-1, keepdim=True)  # [B,T,N,1]
+    max_mag = gt_mag.amax(dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
+    # Normalized magnitude weight: ranges from base_weight to base_weight+mag_scale
+    w = base_weight + mag_scale * (gt_mag / max_mag)
+
+    # Huber loss (smooth L1) is more robust to outliers than MSE
+    pointwise_loss = F.smooth_l1_loss(pred, target, reduction='none', beta=0.1)
+
+    weighted = pointwise_loss * w
+    if mask is not None:
+        weighted = weighted * mask
+        return weighted.sum() / mask.sum().clamp_min(1.0)
+    return weighted.mean()
+
+
+def _spatial_gradient_loss(pred, target, edges, mask=None):
+    """
+    Penalizes differences in spatial gradients between prediction and ground truth.
+    This forces the model to learn sharp velocity transitions correctly.
+
+    For each edge (i, j): loss += ||(pred_j - pred_i) - (gt_j - gt_i)||^2
+    """
+    # pred, target: [B, T, N, C]
+    B, T, N, C = pred.shape
+
+    send_idx = edges[..., 0].long()  # [B, E]
+    recv_idx = edges[..., 1].long()  # [B, E]
+    E_edges = send_idx.shape[1]
+
+    # Expand indices for gathering: [B, T, E, C]
+    send_exp = send_idx[:, None, :, None].expand(B, T, E_edges, C)
+    recv_exp = recv_idx[:, None, :, None].expand(B, T, E_edges, C)
+
+    pred_send = torch.gather(pred, 2, send_exp)
+    pred_recv = torch.gather(pred, 2, recv_exp)
+    gt_send = torch.gather(target, 2, send_exp)
+    gt_recv = torch.gather(target, 2, recv_exp)
+
+    pred_grad = pred_recv - pred_send   # [B, T, E, C]
+    gt_grad = gt_recv - gt_send
+
+    grad_err = (pred_grad - gt_grad) ** 2  # [B, T, E, C]
+
+    if mask is not None:
+        # Build edge-level mask from node-level mask
+        mask_send = torch.gather(mask, 2, send_exp)
+        mask_recv = torch.gather(mask, 2, recv_exp)
+        edge_mask = mask_send * mask_recv
+        grad_err = grad_err * edge_mask
+        return grad_err.sum() / edge_mask.sum().clamp_min(1.0)
+
+    return grad_err.mean()
+
+
+def _temporal_consistency_loss(pred, target, mask=None):
+    """
+    Penalizes temporal inconsistency: the predicted temporal difference
+    should match the ground truth temporal difference.
+    pred, target: [B, T, N, C]
+    """
+    if pred.shape[1] < 2:
+        return pred.new_zeros(())
+
+    pred_dt = pred[:, 1:] - pred[:, :-1]    # [B, T-1, N, C]
+    gt_dt = target[:, 1:] - target[:, :-1]
+
+    err = F.smooth_l1_loss(pred_dt, gt_dt, reduction='none', beta=0.05)
+
+    if mask is not None:
+        mask_t = mask[:, 1:]  # [B, T-1, N, C]
+        err = err * mask_t
+        return err.sum() / mask_t.sum().clamp_min(1.0)
+    return err.mean()
+
+
 # l2 误差计算需要反归一化数据
 def _relative_l2(pred, target, mask=None):
     """相对L2误差，返回 [batch] 张量。"""
@@ -300,9 +386,35 @@ def get_train_loss(args, model, predict_hat, label_gt, normalizer, node_pos_phys
     train_args = args.train
     fields = args.data.get("fields", ["T"])
 
-    # data_loss = get_weighted_mse_loss(predict_hat, label_gt, normalizer, fields, train_args, device=predict_hat.device, mask_weight=mask_weight)
-    data_loss = F.mse_loss(predict_hat, label_gt, reduction='mean')
+    # === Primary loss: magnitude-aware Huber ===
+    mag_scale = float(train_args.get("mag_scale", 5.0))
+    data_loss = _magnitude_aware_loss(predict_hat, label_gt, mask=mask_weight, mag_scale=mag_scale)
 
+    # === Spatial gradient loss ===
+    grad_weight = float(train_args.get("grad_loss_weight", 0.1))
+    grad_warmup = int(train_args.get("grad_loss_warmup", 5))
+    if grad_weight > 0 and edges is not None:
+        grad_loss = _spatial_gradient_loss(predict_hat, label_gt, edges, mask=mask_weight)
+        # Warm up the gradient loss
+        if grad_warmup > 0 and epoch < grad_warmup:
+            grad_ramp = (epoch + 1) / grad_warmup
+        else:
+            grad_ramp = 1.0
+        grad_loss_weighted = grad_weight * grad_ramp * grad_loss
+    else:
+        grad_loss = predict_hat.new_zeros(())
+        grad_loss_weighted = predict_hat.new_zeros(())
+
+    # === Temporal consistency loss ===
+    temp_weight = float(train_args.get("temporal_loss_weight", 0.05))
+    if temp_weight > 0 and predict_hat.shape[1] >= 2:
+        temp_loss = _temporal_consistency_loss(predict_hat, label_gt, mask=mask_weight)
+        temp_loss_weighted = temp_weight * temp_loss
+    else:
+        temp_loss = predict_hat.new_zeros(())
+        temp_loss_weighted = predict_hat.new_zeros(())
+
+    # === Incompressibility loss ===
     incompressibility = get_incompressibility_loss(
         args,
         model,
@@ -321,26 +433,23 @@ def get_train_loss(args, model, predict_hat, label_gt, normalizer, node_pos_phys
         "rms": predict_hat.new_zeros(()),
         "scaled_rms": predict_hat.new_zeros(()),
     }
-    loss_val = data_loss + incompressibility["weighted_loss"]
+
+    loss_val = data_loss + grad_loss_weighted + temp_loss_weighted + incompressibility["weighted_loss"]
 
     num_channels = float(len(fields))
-
-    # if loss_flag == "L2_norm_loss":
-    #     base_pred, base_label = predict_hat, label_gt
-    # else:
-    #     base_pred = normalizer.denormalize(predict_hat)
-    #     base_label = normalizer.denormalize(label_gt)
 
     losses = {
         "loss": loss_val,
         "data_loss": data_loss.detach(),
+        "grad_loss": grad_loss.detach(),
+        "temp_loss": temp_loss.detach(),
         "div_loss": incompressibility["weighted_loss"].detach(),
         "div_raw_loss": incompressibility["loss"].detach(),
         "div_rms": incompressibility["rms"],
         "div_scaled_rms": incompressibility["scaled_rms"],
         'mean_l2': 0
         }
-    
+
     with torch.no_grad():
         pred_real = normalizer.denormalize(predict_hat)
         label_real = normalizer.denormalize(label_gt)
@@ -352,7 +461,7 @@ def get_train_loss(args, model, predict_hat, label_gt, normalizer, node_pos_phys
             field_mask = mask_weight[..., i:i+1] if mask_weight is not None else None
 
             rel_l2_val = _relative_l2(pred_ch_real, gt_ch_real, mask=field_mask)
-            
+
             losses[f"L2_{fname}"] = rel_l2_val
             losses['mean_l2'] += rel_l2_val / num_channels
             losses[f"RMSE_{fname}"] = rmse[i].item()
@@ -413,9 +522,23 @@ def get_val_loss(args, model, fields, predict_hat, state, normalizer, node_pos_p
 def train(args, model, train_dataloader, optim, device, normalizer, epoch=0):
     horizon = args.data.get("horizon_train", 1) if isinstance(args.data, dict) else getattr(args, "horizon_train", 1)
     fields, data_mask = args.data.get("fields", ["T"]), args.data.get("mask", False)
-    teacher = args.train.get("teacher", False) # 开启 teacher forcing
+
+    # Teacher forcing with curriculum decay
+    teacher_cfg = args.train.get("teacher", False)
+    decay_start = int(args.train.get("teacher_decay_start", 30))
+    decay_end = int(args.train.get("teacher_decay_end", 100))
+    if teacher_cfg:
+        if epoch < decay_start:
+            teacher_prob = 1.0
+        elif epoch < decay_end:
+            teacher_prob = 1.0 - (epoch - decay_start) / (decay_end - decay_start)
+        else:
+            teacher_prob = 0.0
+        teacher = random.random() < teacher_prob
+    else:
+        teacher = False
     agg = {}
-    for key in ["loss", "data_loss", "div_loss", "div_raw_loss", "div_rms", "div_scaled_rms", "L2", "mean_l2", "RMSE"]:
+    for key in ["loss", "data_loss", "grad_loss", "temp_loss", "div_loss", "div_raw_loss", "div_rms", "div_scaled_rms", "L2", "mean_l2", "RMSE"]:
         if key == "L2" or key == "RMSE":
             for fname in fields:
                 agg[f"{key}_{fname}"] = 0.0
@@ -492,6 +615,8 @@ def train(args, model, train_dataloader, optim, device, normalizer, epoch=0):
 
         agg["loss"] += costs["loss"].item() * batch_num
         agg["data_loss"] += costs["data_loss"].item() * batch_num
+        agg["grad_loss"] += costs["grad_loss"].item() * batch_num
+        agg["temp_loss"] += costs["temp_loss"].item() * batch_num
         agg["div_loss"] += costs["div_loss"].item() * batch_num
         agg["div_raw_loss"] += costs["div_raw_loss"].item() * batch_num
         agg["div_rms"] += costs["div_rms"].item() * batch_num

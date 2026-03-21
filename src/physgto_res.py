@@ -180,30 +180,44 @@ class GNN(nn.Module):
         return node_embeddings, edge_embeddings
 
 class Decoder(nn.Module):
-    def __init__(self, 
-                 N = 4,   
-                 enc_dim=128, 
+    def __init__(self,
+                 N = 4,
+                 enc_dim=128,
                  enc_s_dim = 10,
                  state_size=1):
         super().__init__()
-        
 
-        self.delta_net = nn.Sequential(
-            nn.Linear(N * enc_dim + enc_s_dim, enc_dim),
+        in_dim = N * enc_dim + enc_s_dim
+
+        # Deeper decoder with residual connection and gating
+        self.proj = nn.Linear(in_dim, enc_dim)
+        self.res_block = nn.Sequential(
+            nn.LayerNorm(enc_dim),
+            nn.Linear(enc_dim, enc_dim * 2),
             nn.SiLU(),
+            nn.Linear(enc_dim * 2, enc_dim),
+        )
+        self.gate = nn.Sequential(
             nn.Linear(enc_dim, enc_dim),
-            nn.SiLU(),
-            nn.Linear(enc_dim, state_size)
+            nn.Sigmoid(),
+        )
+        self.out = nn.Sequential(
+            nn.LayerNorm(enc_dim),
+            nn.Linear(enc_dim, state_size),
         )
 
     def forward(self, V_all, pos_enc):
-        
+
         # V_all.dim = [bs, n_block, N, enc_dim]
         # pos_enc.dim = [bs, N, enc_s_dim]
         b, n_block, N, enc_dim = V_all.shape
         V_all = V_all.permute(0, 2, 1, 3).reshape(b, N, -1)
-        V = self.delta_net(torch.cat([V_all, pos_enc], dim=-1))
-        
+        h = self.proj(torch.cat([V_all, pos_enc], dim=-1))
+        r = self.res_block(h)
+        g = self.gate(h)
+        h = h + g * r   # gated residual
+        V = self.out(h)
+
         return V
 
 

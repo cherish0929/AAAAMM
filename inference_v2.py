@@ -12,7 +12,7 @@ from pathlib import Path
 import h5py
 
 # 引入项目模块
-from src.physgto_res import Model
+from src.physgto import Model
 from src.dataset import AeroGtoDataset
 from src.utils import load_json_config, set_seed
 
@@ -521,7 +521,7 @@ class AeroGtoPredictor:
 if __name__ == "__main__":
     MODE = "test"
     # === 配置区域 ===
-    CONFIG_PATH = f"config/EasyPool_2D_solid_mask_0316/aerogto_easypool_soild_mask.json" 
+    CONFIG_PATH = f"config/velocity_v3.json" 
     
     FIELD_TO_PLOT = None   
     SLICE_AXIS = "z"        # 'x', 'y', 'z'
@@ -542,7 +542,7 @@ if __name__ == "__main__":
         sys.exit(1)
     
     print(len(predictor.dataset))
-    SAMPLE_IDX = 27
+    SAMPLE_IDX = 24
 
     results = predictor.predict_rollout(sample_idx=SAMPLE_IDX, interface_field=INTERFACE_FIELD)
     

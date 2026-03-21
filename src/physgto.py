@@ -165,30 +165,44 @@ class GNN(nn.Module):
         return node_embeddings, edge_embeddings
 
 class Decoder(nn.Module):
-    def __init__(self, 
-                 N = 4,   
-                 enc_dim=128, 
+    def __init__(self,
+                 N = 4,
+                 enc_dim=128,
                  enc_s_dim = 10,
                  state_size=1):
         super().__init__()
-        
 
-        self.delta_net = nn.Sequential(
-            nn.Linear(N * enc_dim + enc_s_dim, enc_dim),
+        in_dim = N * enc_dim + enc_s_dim
+
+        # Deeper decoder with residual connection and gating
+        self.proj = nn.Linear(in_dim, enc_dim)
+        self.res_block = nn.Sequential(
+            nn.LayerNorm(enc_dim),
+            nn.Linear(enc_dim, enc_dim * 2),
             nn.SiLU(),
+            nn.Linear(enc_dim * 2, enc_dim),
+        )
+        self.gate = nn.Sequential(
             nn.Linear(enc_dim, enc_dim),
-            nn.SiLU(),
-            nn.Linear(enc_dim, state_size)
+            nn.Sigmoid(),
+        )
+        self.out = nn.Sequential(
+            nn.LayerNorm(enc_dim),
+            nn.Linear(enc_dim, state_size),
         )
 
     def forward(self, V_all, pos_enc):
-        
+
         # V_all.dim = [bs, n_block, N, enc_dim]
         # pos_enc.dim = [bs, N, enc_s_dim]
         b, n_block, N, enc_dim = V_all.shape
         V_all = V_all.permute(0, 2, 1, 3).reshape(b, N, -1)
-        V = self.delta_net(torch.cat([V_all, pos_enc], dim=-1))
-        
+        h = self.proj(torch.cat([V_all, pos_enc], dim=-1))
+        r = self.res_block(h)
+        g = self.gate(h)
+        h = h + g * r   # gated residual
+        V = self.out(h)
+
         return V
 
 
@@ -205,6 +219,7 @@ class MixerBlock(nn.Module):
             layer_norm=True
         )
 
+        self.ln0 = nn.LayerNorm(enc_dim)
         self.ln1 = nn.LayerNorm(enc_dim)
         self.ln2 = nn.LayerNorm(enc_dim)
         self.mha = Atten(n_token=n_token, c_dim=enc_dim, n_heads=n_head)
@@ -215,18 +230,23 @@ class MixerBlock(nn.Module):
             nn.Linear(2 * enc_dim, enc_dim)
         )
 
+        # Learnable residual scaling (helps stabilize deep blocks)
+        self.alpha_gnn = nn.Parameter(torch.ones(1) * 0.5)
+        self.alpha_attn = nn.Parameter(torch.ones(1) * 0.5)
+        self.alpha_ffn = nn.Parameter(torch.ones(1) * 0.5)
+
     def forward(self, V, E, edges, s_enc):
-        # 1) GNN
-        V_in = torch.cat([V, s_enc], dim=-1)
+        # 1) GNN with pre-norm on V
+        V_in = torch.cat([self.ln0(V), s_enc], dim=-1)
         v, e = self.gnn(V_in, E, edges)
         E = E + e
-        V = V + v
+        V = V + self.alpha_gnn * v
 
         # 2) Attention (PreNorm)
-        V = V + self.mha(self.ln1(V))
+        V = V + self.alpha_attn * self.mha(self.ln1(V))
 
         # 3) FFN (PreNorm)
-        V = V + self.ffn(self.ln2(V))
+        V = V + self.alpha_ffn * self.ffn(self.ln2(V))
 
         return V, E
 
@@ -241,27 +261,30 @@ class Encoder(nn.Module):
                  ):
         super(Encoder, self).__init__()
 
-        # node embedding
-        self.fv1 = MLP(input_size=state_size + space_size, output_size=enc_dim, act='SiLU', layer_norm=False)
+        # +1 for velocity magnitude as auxiliary input
+        self.fv1 = MLP(input_size=state_size + space_size + 1, output_size=enc_dim, act='SiLU', layer_norm=False)
         self.fv_time = MLP(input_size=enc_t_dim, output_size=enc_dim, act='SiLU', layer_norm=False)
         self.fv_cond = MLP(input_size=enc_c_dim, output_size=enc_dim, act='SiLU', layer_norm=False)
 
         # edge embedding
         self.fe = MLP(input_size=2 * space_size + 1, output_size=enc_dim, n_hidden=1, act='SiLU', layer_norm=False)
-        
+
     def forward(self, node_pos, state_in, time_i, conditions, edges):
         # state_in: (bs,N,in_dim), node_pos: (bs,N,space)
-        
-        # node embedding
-        state_in = torch.cat((state_in, node_pos), dim=-1)
+
+        # Compute velocity magnitude as auxiliary feature
+        vel_mag = torch.norm(state_in, dim=-1, keepdim=True)  # [bs, N, 1]
+
+        # node embedding: state + position + velocity magnitude
+        state_aug = torch.cat((state_in, node_pos, vel_mag), dim=-1)
         time_enc = self.fv_time(time_i)         # (bs, enc_dim)
         cond_enc = self.fv_cond(conditions)     # (bs, enc_dim)
-    
-        V = self.fv1(state_in) + time_enc.unsqueeze(-2) + cond_enc.unsqueeze(-2)
-        
+
+        V = self.fv1(state_aug) + time_enc.unsqueeze(-2) + cond_enc.unsqueeze(-2)
+
         # edge embedding
         E = self.fe(get_edge_info(edges, node_pos))
-        
+
         return V, E
 
 class Mixer(nn.Module):
@@ -341,25 +364,22 @@ class Model(nn.Module):
         return axis_info
 
     def forward(self, state_in, node_pos, edges, time_i, conditions, pos_enc = None, c_enc = None, dt=None):
-        
+
         if pos_enc is None or c_enc is None:
             pos_enc = FourierEmbedding(node_pos, 0, self.pos_enc_dim)
             c_enc = FourierEmbedding(conditions, 0, self.pos_enc_dim)
-        
+
         t_enc = FourierEmbedding(time_i, 0, self.pos_enc_dim) # 时间编码
 
         edges_long = edges.long() if edges.dtype != torch.long else edges
         V, E = self.encoder(node_pos, state_in, t_enc, c_enc, edges_long)
-        
-        V_all = self.mixer(V, E, edges_long, pos_enc)
-        
-        v_pred = self.decoder(V_all, pos_enc)
-        
-        # if self.stepper_scheme == "euler":
-        if dt is None: dt = self.dt  # 没有输入用默认 dt
-        elif len(dt.shape) == 1: dt = dt.view(-1, 1, 1)
 
-        state_pred = state_in + dt * v_pred
+        V_all = self.mixer(V, E, edges_long, pos_enc)
+
+        delta_pred = self.decoder(V_all, pos_enc)
+
+        # Direct delta prediction (no dt scaling) — more stable for velocity
+        state_pred = state_in + delta_pred
 
         return state_pred
 

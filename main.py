@@ -207,6 +207,8 @@ def main(args, path_logs, path_nn, path_record):
         # 提取 Metrics
         train_loss = train_error['loss']
         train_data_loss = train_error['data_loss']
+        train_grad_loss = train_error.get('grad_loss', 0.0)
+        train_temp_loss = train_error.get('temp_loss', 0.0)
         train_div_loss = train_error['div_loss']
         train_div_raw_loss = train_error['div_raw_loss']
         train_div_rms = train_error['div_rms']
@@ -219,6 +221,8 @@ def main(args, path_logs, path_nn, path_record):
         writer.add_scalar('lr/lr', current_lr, epoch)
         writer.add_scalar('Loss/train', train_loss, epoch)
         writer.add_scalar('Loss/train_data', train_data_loss, epoch)
+        writer.add_scalar('Loss/train_grad', train_grad_loss, epoch)
+        writer.add_scalar('Loss/train_temporal', train_temp_loss, epoch)
         writer.add_scalar('Loss/train_div_weighted', train_div_loss, epoch)
         writer.add_scalar('Physics/train_div_raw', train_div_raw_loss, epoch)
         writer.add_scalar('Physics/train_div_rms', train_div_rms, epoch)
@@ -239,7 +243,7 @@ def main(args, path_logs, path_nn, path_record):
             writer.add_scalar(f'RMSE/train_RMSE_{fname}', rmse_val, epoch)
 
         print(log_str)
-        print(f"Physics: data_loss={train_data_loss:.4e}, div_weighted={train_div_loss:.4e}, div_raw={train_div_raw_loss:.4e}, div_rms={train_div_rms:.4e}, div_scaled_rms={train_div_scaled_rms:.4e}")
+        print(f"Physics: data={train_data_loss:.4e}, grad={train_grad_loss:.4e}, temp={train_temp_loss:.4e}, div_w={train_div_loss:.4e}, div_raw={train_div_raw_loss:.4e}, div_rms={train_div_rms:.4e}")
         print(f"L2 details: {', '.join(l2_details)}")
         print(f"RMSE details: {', '.join(rmse_details)}")
         print(f"each time step loss: {each_t_l2.tolist()}")
@@ -250,7 +254,7 @@ def main(args, path_logs, path_nn, path_record):
         with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
             file.write(f"Training, epoch: {epoch + 1}/{EPOCH}\n")
             file.write(f"Train Loss: {train_loss:.4e}, mean_l2: {train_mean_l2:.4e}\n")
-            file.write(f"Physics: data_loss={train_data_loss:.4e}, div_weighted={train_div_loss:.4e}, div_raw={train_div_raw_loss:.4e}, div_rms={train_div_rms:.4e}, div_scaled_rms={train_div_scaled_rms:.4e}\n")
+            file.write(f"Physics: data={train_data_loss:.4e}, grad={train_grad_loss:.4e}, temp={train_temp_loss:.4e}, div_w={train_div_loss:.4e}, div_raw={train_div_raw_loss:.4e}\n")
             file.write(f"L2 details: {', '.join(l2_details)}\n")
             file.write(f"RMSE details: {', '.join(rmse_details)}\n")
             file.write(f"each time step loss: {each_t_l2.tolist()}\n")
