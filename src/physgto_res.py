@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 
 from torch_scatter import scatter_mean, scatter_softmax
@@ -38,6 +39,7 @@ class MLP(nn.Module):
                 n_hidden=1,
                 hidden_size = 128,
                 act = 'SiLU',
+                dropout=0.0,
                 ):
         super(MLP, self).__init__()
         if act == 'GELU':
@@ -51,10 +53,14 @@ class MLP(nn.Module):
             f = [nn.Linear(input_size, output_size)]
         else:
             f = [nn.Linear(input_size, hidden_size), self.act]
+            if dropout > 0:
+                f.append(nn.Dropout(dropout))
             h = 1
             for i in range(h, n_hidden):
                 f.append(nn.Linear(hidden_size, hidden_size))
                 f.append(self.act)
+                if dropout > 0:
+                    f.append(nn.Dropout(dropout))
             f.append(nn.Linear(hidden_size, output_size))
             if layer_norm:
                 f.append(nn.LayerNorm(output_size))
@@ -65,6 +71,10 @@ class MLP(nn.Module):
         return self.f(x)
 
 class Atten(nn.Module):
+    """
+    Multi-scale Perceiver-style attention.
+    Uses coarse tokens (global flow patterns) + fine tokens (local gradients).
+    """
     def __init__(self,
                 n_token=128,
                 c_dim=128,
@@ -75,27 +85,58 @@ class Atten(nn.Module):
         self.n_token = n_token
         self.n_heads = n_heads
 
-        # Learnable query
-        self.Q = nn.Parameter(torch.randn(self.n_token, self.c_dim), requires_grad=True)
+        # Multi-scale: coarse queries capture global recirculation, fine queries capture local gradients
+        n_coarse = max(n_token // 4, 4)
+        n_fine = n_token
 
-        # Multihead attention layers
-        self.attention1 = nn.MultiheadAttention(embed_dim=self.c_dim, num_heads=self.n_heads, batch_first=True)
-        self.attention2 = nn.MultiheadAttention(embed_dim=self.c_dim, num_heads=self.n_heads, batch_first=True)
-        self.attention3 = nn.MultiheadAttention(embed_dim=self.c_dim, num_heads=self.n_heads, batch_first=True)
+        self.Q_coarse = nn.Parameter(torch.randn(n_coarse, c_dim) * 0.02, requires_grad=True)
+        self.Q_fine = nn.Parameter(torch.randn(n_fine, c_dim) * 0.02, requires_grad=True)
+
+        # Cross-attention: nodes -> latent tokens (coarse and fine)
+        self.attn_compress_coarse = nn.MultiheadAttention(embed_dim=c_dim, num_heads=n_heads, batch_first=True)
+        self.attn_compress_fine = nn.MultiheadAttention(embed_dim=c_dim, num_heads=n_heads, batch_first=True)
+
+        # Self-attention in latent space
+        self.attn_self = nn.MultiheadAttention(embed_dim=c_dim, num_heads=n_heads, batch_first=True)
+
+        # Cross-attention: latent tokens -> nodes (decompression)
+        self.attn_decompress = nn.MultiheadAttention(embed_dim=c_dim, num_heads=n_heads, batch_first=True)
+
+        # Merge coarse + fine
+        self.merge = nn.Sequential(
+            nn.Linear(c_dim * 2, c_dim),
+            nn.SiLU(),
+            nn.Linear(c_dim, c_dim),
+        )
 
     def forward(self, W0):
-        # Step 1: Initial attention with learned query
         batch = W0.shape[0]
-        learned_Q = self.Q.unsqueeze(0).repeat(batch, 1, 1)
-        W, _ = self.attention1(learned_Q, W0, W0)
 
-        # Step 2: Self-attention on the transformed result
-        W, _ = self.attention2(W, W, W)
+        # Coarse compression: captures global flow patterns
+        Q_c = self.Q_coarse.unsqueeze(0).expand(batch, -1, -1)
+        W_coarse, _ = self.attn_compress_coarse(Q_c, W0, W0)
 
-        # Step 3: Position-aware attention
-        W, _ = self.attention3(W0, W, W)
+        # Fine compression: captures local gradient details
+        Q_f = self.Q_fine.unsqueeze(0).expand(batch, -1, -1)
+        W_fine, _ = self.attn_compress_fine(Q_f, W0, W0)
 
-        return W
+        # Concatenate for self-attention (coarse and fine interact)
+        W_cat = torch.cat([W_coarse, W_fine], dim=1)
+        W_cat, _ = self.attn_self(W_cat, W_cat, W_cat)
+
+        # Split back and decompress to node space
+        n_c = W_coarse.shape[1]
+        W_coarse_out = W_cat[:, :n_c]
+        W_fine_out = W_cat[:, n_c:]
+
+        # Decompress: both scales contribute back to nodes
+        out_coarse, _ = self.attn_decompress(W0, W_coarse_out, W_coarse_out)
+        out_fine, _ = self.attn_decompress(W0, W_fine_out, W_fine_out)
+
+        # Merge multi-scale outputs
+        out = self.merge(torch.cat([out_coarse, out_fine], dim=-1))
+
+        return out
 
 def FourierEmbedding(pos, pos_start, pos_length):
     # F(x) = [cos(2^i * pi * x), sin(2^i * pi * x)]
@@ -118,10 +159,9 @@ def FourierEmbedding(pos, pos_start, pos_length):
 # ---------------------------
 class GatedGNN(nn.Module):
     """
-    GNN with edge-gated attention aggregation.
-    Replaces scatter_mean with scatter_softmax + scatter_add,
-    so the network learns per-edge importance weights and preserves
-    sharp velocity gradients at melt pool boundaries.
+    GNN with edge-gated attention aggregation and multi-head edge scoring.
+    Uses separate attention heads for each aggregation direction to capture
+    asymmetric velocity gradients.
     """
     def __init__(self, n_hidden=1, node_size=128, edge_size=128, output_size=None, layer_norm=False):
         super(GatedGNN, self).__init__()
@@ -139,11 +179,16 @@ class GatedGNN(nn.Module):
             output_size=edge_size
         )
 
-        # Edge attention scorer: learns which neighbors matter for aggregation
-        self.f_attn = nn.Sequential(
-            nn.Linear(edge_size, edge_size // 2),
+        # Separate attention scorers for each direction (asymmetric flow)
+        self.f_attn_0 = nn.Sequential(
+            nn.Linear(edge_size // 2, edge_size // 4),
             nn.SiLU(),
-            nn.Linear(edge_size // 2, 1),
+            nn.Linear(edge_size // 4, 1),
+        )
+        self.f_attn_1 = nn.Sequential(
+            nn.Linear(edge_size // 2, edge_size // 4),
+            nn.SiLU(),
+            nn.Linear(edge_size // 4, 1),
         )
 
         self.f_node = MLP(
@@ -172,12 +217,12 @@ class GatedGNN(nn.Module):
         edge_emb_0, edge_emb_1 = edge_embeddings.chunk(2, dim=-1)
         feat_dim = edge_emb_0.shape[-1]
 
-        # Compute edge attention logits
-        attn_logits_0 = self.f_attn(edge_emb_0).squeeze(-1)  # [bs, ne]
-        attn_logits_1 = self.f_attn(edge_emb_1).squeeze(-1)  # [bs, ne]
+        # Direction-specific attention scoring (asymmetric)
+        attn_logits_0 = self.f_attn_0(edge_emb_0).squeeze(-1)
+        attn_logits_1 = self.f_attn_1(edge_emb_1).squeeze(-1)
 
-        recv_idx_0 = edges[..., 0]  # messages aggregated to sender node
-        recv_idx_1 = edges[..., 1]  # messages aggregated to receiver node
+        recv_idx_0 = edges[..., 0]
+        recv_idx_1 = edges[..., 1]
 
         # scatter_softmax: softmax over all incoming edges per node
         attn_weights_0 = scatter_softmax(attn_logits_0, recv_idx_0, dim=1, dim_size=N)
@@ -204,9 +249,8 @@ class GatedGNN(nn.Module):
 
 class Decoder(nn.Module):
     """
-    Per-component decoder with shared backbone and separate Ux/Uy/Uz heads.
-    Includes spatially-adaptive residual gating so the network learns where
-    to apply large updates (melt pool) vs near-zero updates (background).
+    Deep per-component decoder with 2-layer gated residual backbone and
+    separate Ux/Uy/Uz heads.
     """
     def __init__(self,
                  N = 4,
@@ -218,23 +262,38 @@ class Decoder(nn.Module):
         self.state_size = state_size
         in_dim = N * enc_dim + enc_s_dim
 
-        # Shared backbone
+        # Shared backbone with 2-layer gated residual
         self.proj = nn.Linear(in_dim, enc_dim)
-        self.res_block = nn.Sequential(
+
+        self.res_block1 = nn.Sequential(
             nn.LayerNorm(enc_dim),
             nn.Linear(enc_dim, enc_dim * 2),
             nn.SiLU(),
             nn.Linear(enc_dim * 2, enc_dim),
         )
-        self.gate = nn.Sequential(
+        self.gate1 = nn.Sequential(
             nn.Linear(enc_dim, enc_dim),
             nn.Sigmoid(),
         )
+
+        self.res_block2 = nn.Sequential(
+            nn.LayerNorm(enc_dim),
+            nn.Linear(enc_dim, enc_dim * 2),
+            nn.SiLU(),
+            nn.Linear(enc_dim * 2, enc_dim),
+        )
+        self.gate2 = nn.Sequential(
+            nn.Linear(enc_dim, enc_dim),
+            nn.Sigmoid(),
+        )
+
         self.backbone_norm = nn.LayerNorm(enc_dim)
 
-        # Per-component output heads (Ux, Uy, Uz each get their own head)
+        # Per-component output heads with deeper architecture
         self.heads = nn.ModuleList([
             nn.Sequential(
+                nn.Linear(enc_dim, enc_dim),
+                nn.SiLU(),
                 nn.Linear(enc_dim, enc_dim // 2),
                 nn.SiLU(),
                 nn.Linear(enc_dim // 2, 1),
@@ -242,12 +301,12 @@ class Decoder(nn.Module):
             for _ in range(state_size)
         ])
 
-        # Spatially-adaptive residual gate: learns per-node scaling of delta
+        # Spatially-adaptive residual gate
         self.spatial_gate = nn.Sequential(
             nn.Linear(enc_dim, enc_dim // 2),
             nn.SiLU(),
             nn.Linear(enc_dim // 2, state_size),
-            nn.Tanh(),  # output in [-1, 1]
+            nn.Tanh(),
         )
 
     def forward(self, V_all, pos_enc):
@@ -257,17 +316,24 @@ class Decoder(nn.Module):
         b, n_block, N, enc_dim = V_all.shape
         V_all = V_all.permute(0, 2, 1, 3).reshape(b, N, -1)
         h = self.proj(torch.cat([V_all, pos_enc], dim=-1))
-        r = self.res_block(h)
-        g = self.gate(h)
-        h = h + g * r   # gated residual
+
+        # 2-layer gated residual
+        r1 = self.res_block1(h)
+        g1 = self.gate1(h)
+        h = h + g1 * r1
+
+        r2 = self.res_block2(h)
+        g2 = self.gate2(h)
+        h = h + g2 * r2
+
         h = self.backbone_norm(h)
 
         # Per-component prediction
-        components = [head(h) for head in self.heads]  # list of [b, N, 1]
-        raw_delta = torch.cat(components, dim=-1)       # [b, N, state_size]
+        components = [head(h) for head in self.heads]
+        raw_delta = torch.cat(components, dim=-1)
 
         # Spatially-adaptive scaling
-        scale = self.spatial_gate(h)  # [b, N, state_size], range [-1, 1]
+        scale = self.spatial_gate(h)
         delta = raw_delta * (1.0 + scale)
 
         return delta
@@ -319,6 +385,9 @@ class MixerBlock(nn.Module):
 
 
 class Encoder(nn.Module):
+    """
+    Enhanced encoder with FiLM conditioning (Feature-wise Linear Modulation).
+    """
     def __init__(self,
                  space_size=2,
                  state_size=4,
@@ -328,35 +397,56 @@ class Encoder(nn.Module):
                  ):
         super(Encoder, self).__init__()
 
-        # +1 for velocity magnitude as auxiliary input
-        self.fv1 = MLP(input_size=state_size + space_size + 1, output_size=enc_dim, act='SiLU', layer_norm=False)
-        self.fv_time = MLP(input_size=enc_t_dim, output_size=enc_dim, act='SiLU', layer_norm=False)
-        self.fv_cond = MLP(input_size=enc_c_dim, output_size=enc_dim, act='SiLU', layer_norm=False)
+        # +1 for velocity magnitude, +state_size for per-component sign indicators
+        self.fv1 = MLP(input_size=state_size + space_size + 1 + state_size, output_size=enc_dim, act='SiLU', layer_norm=False)
 
-        # Edge embedding: spatial info (7) + velocity difference (state_size)
-        self.fe = MLP(input_size=2 * space_size + 1 + state_size, output_size=enc_dim, n_hidden=1, act='SiLU', layer_norm=False)
+        # FiLM conditioning
+        self.film_time = nn.Sequential(
+            nn.Linear(enc_t_dim, enc_dim),
+            nn.SiLU(),
+            nn.Linear(enc_dim, enc_dim * 2),
+        )
+        self.film_cond = nn.Sequential(
+            nn.Linear(enc_c_dim, enc_dim),
+            nn.SiLU(),
+            nn.Linear(enc_dim, enc_dim * 2),
+        )
+
+        # Edge embedding: spatial info (7) + velocity difference (state_size) + vel magnitude diff (1)
+        self.fe = MLP(input_size=2 * space_size + 1 + state_size + 1, output_size=enc_dim, n_hidden=1, act='SiLU', layer_norm=False)
 
     def forward(self, node_pos, state_in, time_i, conditions, edges):
         # state_in: (bs,N,in_dim), node_pos: (bs,N,space)
 
-        # Compute velocity magnitude as auxiliary feature
-        vel_mag = torch.norm(state_in, dim=-1, keepdim=True)  # [bs, N, 1]
+        # Compute velocity magnitude and per-component sign
+        vel_mag = torch.norm(state_in, dim=-1, keepdim=True)
+        vel_sign = torch.sign(state_in)
 
-        # node embedding: state + position + velocity magnitude
-        state_aug = torch.cat((state_in, node_pos, vel_mag), dim=-1)
-        time_enc = self.fv_time(time_i)         # (bs, enc_dim)
-        cond_enc = self.fv_cond(conditions)     # (bs, enc_dim)
+        # node embedding
+        state_aug = torch.cat((state_in, node_pos, vel_mag, vel_sign), dim=-1)
+        V = self.fv1(state_aug)
 
-        V = self.fv1(state_aug) + time_enc.unsqueeze(-2) + cond_enc.unsqueeze(-2)
+        # FiLM conditioning
+        time_film = self.film_time(time_i)
+        t_gamma, t_beta = time_film.chunk(2, dim=-1)
+        V = V * (1.0 + t_gamma.unsqueeze(-2)) + t_beta.unsqueeze(-2)
 
-        # Edge embedding: spatial info + velocity difference along each edge
-        spatial_edge = get_edge_info(edges, node_pos)  # [bs, ne, 7]
+        cond_film = self.film_cond(conditions)
+        c_gamma, c_beta = cond_film.chunk(2, dim=-1)
+        V = V * (1.0 + c_gamma.unsqueeze(-2)) + c_beta.unsqueeze(-2)
+
+        # Edge embedding
+        spatial_edge = get_edge_info(edges, node_pos)
 
         send_vel = torch.gather(state_in, -2, edges[..., 0].unsqueeze(-1).expand(-1, -1, state_in.shape[-1]))
         recv_vel = torch.gather(state_in, -2, edges[..., 1].unsqueeze(-1).expand(-1, -1, state_in.shape[-1]))
-        vel_diff = recv_vel - send_vel  # [bs, ne, state_size]
+        vel_diff = recv_vel - send_vel
 
-        edge_input = torch.cat([spatial_edge, vel_diff], dim=-1)  # [bs, ne, 7 + state_size]
+        send_mag = torch.norm(send_vel, dim=-1, keepdim=True)
+        recv_mag = torch.norm(recv_vel, dim=-1, keepdim=True)
+        mag_diff = recv_mag - send_mag
+
+        edge_input = torch.cat([spatial_edge, vel_diff, mag_diff], dim=-1)
         E = self.fe(edge_input)
 
         return V, E
@@ -451,12 +541,12 @@ class Model(nn.Module):
             dt_tensor = torch.full((bs, 1), self.dt, dtype=time_i.dtype, device=time_i.device)
         elif isinstance(dt, (float, int)):
             dt_tensor = torch.full((bs, 1), float(dt), dtype=time_i.dtype, device=time_i.device)
-        elif isinstance(dt, (np.floating, np.integer)):  # 匹配 np.float32 等标量
+        elif isinstance(dt, (np.floating, np.integer)):
             dt_tensor = torch.tensor([dt], dtype=time_i.dtype, device=time_i.device).reshape(bs, 1)
         else:
             dt_tensor = dt.view(bs, 1).to(dtype=time_i.dtype, device=time_i.device)
 
-        time_info = torch.cat([time_i, dt_tensor], dim=-1) # 拼接得到联合特征
+        time_info = torch.cat([time_i, dt_tensor], dim=-1)
 
         t_enc = FourierEmbedding(time_info, 0, self.pos_enc_dim) # 时间编码
 
@@ -492,11 +582,11 @@ class Model(nn.Module):
         for t in range(T):
             time_i = time_seq[:, t]
 
-            # Pushforward trick: inject small noise during training to combat
-            # autoregressive error accumulation over 20-step rollouts
+            # Adaptive pushforward noise: proportional to local velocity magnitude
             if self.training and t > 0:
-                noise_scale = 0.02
-                noise = torch.randn_like(state_t) * noise_scale
+                vel_mag = state_t.abs().clamp_min(1e-3)
+                noise_scale = 0.005
+                noise = torch.randn_like(state_t) * noise_scale * vel_mag
                 state_t_input = state_t + noise
             else:
                 state_t_input = state_t

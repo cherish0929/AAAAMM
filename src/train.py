@@ -10,20 +10,23 @@ VELOCITY_FIELD_NAMES = ("Ux", "Uy", "Uz")
 def _magnitude_aware_loss(pred, target, mask=None, base_weight=1.0, mag_scale=5.0):
     """
     Loss that weights each node by the velocity magnitude of the ground truth.
-    Nodes with higher velocity get proportionally higher weight, ensuring
-    the model focuses on the active melt pool region.
-
-    L = mean( w_i * huber(pred_i, target_i) )
-    where w_i = base_weight + mag_scale * |target_i|_2 / (max(|target|_2) + eps)
+    Uses a FIXED reference scale (99th percentile per-sample) instead of batch max,
+    which stabilizes training by avoiding batch-dependent loss scaling.
     """
-    # Per-node velocity magnitude of ground truth: [B, T, N]
-    gt_mag = torch.norm(target, dim=-1, keepdim=True)  # [B,T,N,1]
-    max_mag = gt_mag.amax(dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
-    # Normalized magnitude weight: ranges from base_weight to base_weight+mag_scale
-    w = base_weight + mag_scale * (gt_mag / max_mag)
+    # Per-node velocity magnitude of ground truth: [B,T,N,1]
+    gt_mag = torch.norm(target, dim=-1, keepdim=True)
+    # Use 99th percentile per sample (more robust than max, avoids outlier sensitivity)
+    # Flatten spatial+time dims, compute quantile per batch element
+    B = gt_mag.shape[0]
+    flat_mag = gt_mag.reshape(B, -1)
+    ref_scale = torch.quantile(flat_mag, 0.99, dim=1, keepdim=True).clamp_min(1e-6)
+    ref_scale = ref_scale.view(B, 1, 1, 1)
 
-    # Huber loss (smooth L1) is more robust to outliers than MSE
-    pointwise_loss = F.smooth_l1_loss(pred, target, reduction='none', beta=0.1)
+    # Normalized magnitude weight
+    w = base_weight + mag_scale * (gt_mag / ref_scale).clamp_max(1.0)
+
+    # Huber loss with smaller beta for better gradient signal on small errors
+    pointwise_loss = F.smooth_l1_loss(pred, target, reduction='none', beta=0.05)
 
     weighted = pointwise_loss * w
     if mask is not None:
@@ -35,9 +38,7 @@ def _magnitude_aware_loss(pred, target, mask=None, base_weight=1.0, mag_scale=5.
 def _spatial_gradient_loss(pred, target, edges, mask=None):
     """
     Penalizes differences in spatial gradients between prediction and ground truth.
-    This forces the model to learn sharp velocity transitions correctly.
-
-    For each edge (i, j): loss += ||(pred_j - pred_i) - (gt_j - gt_i)||^2
+    Uses Huber loss instead of MSE for robustness to sharp gradient outliers.
     """
     # pred, target: [B, T, N, C]
     B, T, N, C = pred.shape
@@ -58,7 +59,8 @@ def _spatial_gradient_loss(pred, target, edges, mask=None):
     pred_grad = pred_recv - pred_send   # [B, T, E, C]
     gt_grad = gt_recv - gt_send
 
-    grad_err = (pred_grad - gt_grad) ** 2  # [B, T, E, C]
+    # Use Huber loss for robustness at sharp interfaces
+    grad_err = F.smooth_l1_loss(pred_grad, gt_grad, reduction='none', beta=0.1)
 
     if mask is not None:
         # Build edge-level mask from node-level mask
@@ -90,6 +92,35 @@ def _temporal_consistency_loss(pred, target, mask=None):
         err = err * mask_t
         return err.sum() / mask_t.sum().clamp_min(1.0)
     return err.mean()
+
+
+def _velocity_direction_loss(pred, target, mask=None, mag_threshold=0.01):
+    """
+    Cosine similarity loss for velocity direction.
+    Only applies where velocity magnitude is significant (inside melt pool).
+    Ensures the model gets flow DIRECTION right, not just magnitude.
+    """
+    # pred, target: [B, T, N, C] where C = 3 (Ux, Uy, Uz)
+    gt_mag = torch.norm(target, dim=-1, keepdim=True)  # [B, T, N, 1]
+
+    # Only penalize direction where velocity is significant
+    active = (gt_mag > mag_threshold).squeeze(-1)  # [B, T, N]
+
+    if mask is not None:
+        # Combine with existing mask (all channels must be active)
+        mask_all = mask.min(dim=-1).values > 0.5  # [B, T, N]
+        active = active & mask_all
+
+    if active.sum() < 10:
+        return pred.new_zeros(())
+
+    # Cosine similarity on active nodes
+    pred_active = pred[active]   # [K, C]
+    target_active = target[active]  # [K, C]
+
+    cos_sim = F.cosine_similarity(pred_active, target_active, dim=-1)  # [K]
+    # Loss = 1 - cos_sim (0 when perfect, 2 when opposite direction)
+    return (1.0 - cos_sim).mean()
 
 
 # l2 误差计算需要反归一化数据
@@ -289,7 +320,6 @@ def get_incompressibility_loss(args, model, predict_hat, label_gt, normalizer, f
     else:
         weight = base_weight
     weighted_div_loss = div_loss * weight
-    # weighted_div_loss = div_loss
 
     div_rms = torch.sqrt(torch.sum((div_residual ** 2) * node_weight) / node_count)
     div_scaled_rms = torch.sqrt(torch.sum((div_scaled ** 2) * node_weight) / node_count)
@@ -326,7 +356,7 @@ def get_weighted_mse_loss(predict_hat, label_gt, normalizer, fields, train_args,
 
                 error_list.append(err)
             return torch.mean(torch.cat(error_list, dim=-1))
-    
+
     if calc_mode == "mse_norm":
         pred_val, gt_val = predict_hat, label_gt
         base_error_map = (pred_val - gt_val) ** 2
@@ -356,14 +386,13 @@ def get_weighted_mse_loss(predict_hat, label_gt, normalizer, fields, train_args,
     if target_field in fields:
         f_idx = fields.index(target_field)
 
-        # gt_target_norm = label_gt[..., f_idx:f_idx+1]
         gt_target_phys = gt_denorm[..., f_idx:f_idx+1]
 
         threshold_val = weight_cfg.get("threshold_val", 500.0)
         mask = gt_target_phys > threshold_val
-    
+
         weights[mask] = weight_cfg.get("high_weight", 10.0)
-        
+
     weighted_sq_error = base_error_map * weights
 
     if mask_weight is not None:
@@ -414,6 +443,25 @@ def get_train_loss(args, model, predict_hat, label_gt, normalizer, node_pos_phys
         temp_loss = predict_hat.new_zeros(())
         temp_loss_weighted = predict_hat.new_zeros(())
 
+    # === Velocity direction (cosine) loss ===
+    dir_weight = float(train_args.get("direction_loss_weight", 0.1))
+    dir_warmup = int(train_args.get("direction_loss_warmup", 5))
+    vel_fields = [f for f in fields if f in VELOCITY_FIELD_NAMES]
+    if dir_weight > 0 and len(vel_fields) == 3:
+        vel_indices = [fields.index(f) for f in vel_fields]
+        pred_vel = torch.cat([predict_hat[..., i:i+1] for i in vel_indices], dim=-1)
+        gt_vel = torch.cat([label_gt[..., i:i+1] for i in vel_indices], dim=-1)
+        vel_mask = torch.cat([mask_weight[..., i:i+1] for i in vel_indices], dim=-1) if mask_weight is not None else None
+        dir_loss = _velocity_direction_loss(pred_vel, gt_vel, mask=vel_mask)
+        if dir_warmup > 0 and epoch < dir_warmup:
+            dir_ramp = (epoch + 1) / dir_warmup
+        else:
+            dir_ramp = 1.0
+        dir_loss_weighted = dir_weight * dir_ramp * dir_loss
+    else:
+        dir_loss = predict_hat.new_zeros(())
+        dir_loss_weighted = predict_hat.new_zeros(())
+
     # === Incompressibility loss ===
     incompressibility = get_incompressibility_loss(
         args,
@@ -434,7 +482,7 @@ def get_train_loss(args, model, predict_hat, label_gt, normalizer, node_pos_phys
         "scaled_rms": predict_hat.new_zeros(()),
     }
 
-    loss_val = data_loss + grad_loss_weighted + temp_loss_weighted + incompressibility["weighted_loss"]
+    loss_val = data_loss + grad_loss_weighted + temp_loss_weighted + dir_loss_weighted + incompressibility["weighted_loss"]
 
     num_channels = float(len(fields))
 
@@ -443,6 +491,7 @@ def get_train_loss(args, model, predict_hat, label_gt, normalizer, node_pos_phys
         "data_loss": data_loss.detach(),
         "grad_loss": grad_loss.detach(),
         "temp_loss": temp_loss.detach(),
+        "dir_loss": dir_loss.detach(),
         "div_loss": incompressibility["weighted_loss"].detach(),
         "div_raw_loss": incompressibility["loss"].detach(),
         "div_rms": incompressibility["rms"],
@@ -479,16 +528,16 @@ def get_val_loss(args, model, fields, predict_hat, state, normalizer, node_pos_p
     losses = {
         'mean_l2': 0
         }
-    
+
     rmse = _rmse(pred_real, state_real, mask=mask_weight)
 
     for i, fname in enumerate(fields):
         pred_ch_real = pred_real[..., i:i+1]
         gt_ch_real = state_real[..., i:i+1]
         field_mask = mask_weight[..., i:i+1] if mask_weight is not None else None
-        
+
         rel_l2_val = _relative_l2(pred_ch_real, gt_ch_real, mask=field_mask)
-        
+
         losses[f"L2_{fname}"] = rel_l2_val
         losses['mean_l2'] += rel_l2_val / num_channels
         losses[f"RMSE_{fname}"] = rmse[i].item()
@@ -515,7 +564,7 @@ def get_val_loss(args, model, fields, predict_hat, state, normalizer, node_pos_p
     losses["div_raw_loss"] = incompressibility["loss"].detach()
     losses["div_rms"] = incompressibility["rms"]
     losses["div_scaled_rms"] = incompressibility["scaled_rms"]
-    
+
     return losses
 
 
@@ -538,7 +587,7 @@ def train(args, model, train_dataloader, optim, device, normalizer, epoch=0):
     else:
         teacher = False
     agg = {}
-    for key in ["loss", "data_loss", "grad_loss", "temp_loss", "div_loss", "div_raw_loss", "div_rms", "div_scaled_rms", "L2", "mean_l2", "RMSE"]:
+    for key in ["loss", "data_loss", "grad_loss", "temp_loss", "dir_loss", "div_loss", "div_raw_loss", "div_rms", "div_scaled_rms", "L2", "mean_l2", "RMSE"]:
         if key == "L2" or key == "RMSE":
             for fname in fields:
                 agg[f"{key}_{fname}"] = 0.0
@@ -560,13 +609,10 @@ def train(args, model, train_dataloader, optim, device, normalizer, epoch=0):
         node_type = batch["node_type"].to(device)
         time_seq = batch["time_seq"].to(device)
         conditions = batch["conditions"].to(device).float()
-        # raw_weights = batch["loss_weight"].to(device)
-        # step_weights = raw_weights[:, 1:, :, :] # [B, T, N, 1]
 
         batch_num = state.shape[0]
-        
+
         predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, teacher, state[:, 1:])
-        # predict_hat = torch.stack(pred_list, dim=1)
 
         valid_mask = torch.ones_like(predict_hat)
 
@@ -579,7 +625,7 @@ def train(args, model, train_dataloader, optim, device, normalizer, epoch=0):
                 y_mask_bool = y_cutoff_mask.squeeze(-1).unsqueeze(1).expand(-1, T, -1)
             else:
                 y_mask_bool = y_cutoff_mask.unsqueeze(1).expand(-1, T, -1)
-            
+
             for i, field in enumerate(fields):
                 if field in ["Ux", "Uy", "Uz"]:
                     state[:, 1:, :, i][vel_inactive_mask] = 0.0
@@ -617,6 +663,7 @@ def train(args, model, train_dataloader, optim, device, normalizer, epoch=0):
         agg["data_loss"] += costs["data_loss"].item() * batch_num
         agg["grad_loss"] += costs["grad_loss"].item() * batch_num
         agg["temp_loss"] += costs["temp_loss"].item() * batch_num
+        agg["dir_loss"] += costs["dir_loss"].item() * batch_num
         agg["div_loss"] += costs["div_loss"].item() * batch_num
         agg["div_raw_loss"] += costs["div_raw_loss"].item() * batch_num
         agg["div_rms"] += costs["div_rms"].item() * batch_num
@@ -675,8 +722,7 @@ def validate(args, model, val_dataloader, device, normalizer, epoch):
 
             batch_num = state.shape[0]
             predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt)
-            # predict_hat = torch.stack(pred_list, dim=1)
-            
+
             valid_mask = torch.ones_like(predict_hat)
 
             if data_mask:
@@ -688,7 +734,7 @@ def validate(args, model, val_dataloader, device, normalizer, epoch):
                     y_mask_bool = y_cutoff_mask.squeeze(-1).unsqueeze(1).expand(-1, T, -1)
                 else:
                     y_mask_bool = y_cutoff_mask.unsqueeze(1).expand(-1, T, -1)
-                
+
                 for i, field in enumerate(fields):
                     if field in ["Ux", "Uy", "Uz"]:
                         state[:, 1:, :, i][vel_inactive_mask] = 0.0
@@ -721,17 +767,6 @@ def validate(args, model, val_dataloader, device, normalizer, epoch):
             agg["div_scaled_rms"] += costs["div_scaled_rms"].item() * batch_num
             agg["each_l2"] += costs["each_l2"] * batch_num
             agg["num"] += batch_num
-            # 只保存 batch 中的第一个（任意一个）样本
-            # if i in viz_batch_indices:
-            #     # 随机选择一个样本进行可视化
-            #     sample_idx = random.randint(0, batch_num - 1)
-            #     pred_real = normalizer.denormalize(predict_hat)
-            #     gt_real = normalizer.denormalize(state[:, 1:])
-
-            #     from src.utils import save_vtk_result
-            #     save_vtk_result(save_dir=args.save_path, epoch=epoch, file_id=f"batch{i}_sample{sample_idx}",
-            #                     predictions=pred_real[sample_idx], ground_truths=gt_real[sample_idx], node_pos=node_pos[0], field_names=fields)
-
 
     for key, value in agg.items():
         if key != "each_l2" and key != "num":
