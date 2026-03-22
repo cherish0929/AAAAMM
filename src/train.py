@@ -32,31 +32,102 @@ def _rmse(pred, target):
     mse = torch.mean(diff**2, dim=[0, 1, 2])
     return torch.sqrt(mse)
 
+def compute_spatial_gradient_3d(tensor_field, grid_shape):
+    """
+    计算 3D 空间梯度 (一阶有限差分)
+    :param tensor_field: 形状为 [B, T, N, 1] 的展平张量
+    :param grid_shape: (Nx, Ny, Nz) 三维网格尺寸
+    :return: 沿 x, y, z 三个维度的梯度张量
+    """
+    B, T, N, C = tensor_field.shape
 
-def get_train_loss(fields, predict_hat, label_gt, normalizer, loss_flag="L2_norm_loss"):
+    Nx, Ny, Nz = int(grid_shape[0][0]), int(grid_shape[0][1]), int(grid_shape[0][2])
+    
+    # 确保网格尺寸和展平尺寸匹配
+    assert Nx * Ny * Nz == N, f"网格尺寸 {grid_shape} 与节点数 {N} 不匹配！"
+    
+    # 1. 还原为 3D 网格形状: [B, Nx, Ny, Nz, C]
+    grid_field = tensor_field.view(B, T, Nz, Ny, Nx, C)
+    
+    # 2. 沿三个空间维度计算一阶差分
+    grad_x = grid_field[:, :, :, :, 1:, :] - grid_field[:, :, :, :, :-1, :]
+    grad_y = grid_field[:, :, :, 1:, :, :] - grid_field[:, :, :, :-1, :, :]
+    grad_z = grid_field[:, :, 1:, :, :, :] - grid_field[:, :, :-1, :, :, :]
+    
+    return grad_x, grad_y, grad_z
+
+def get_train_loss(fields, predict_hat, label_gt, normalizer, weight_cfg: dict):
     """返回loss张量及监控指标（其余转为float）。"""
     num_channels = float(len(fields))
 
-    loss_val = F.mse_loss(predict_hat, label_gt, reduction='mean')
-
-    # if loss_flag == "L2_norm_loss":
-    #     base_pred, base_label = predict_hat, label_gt
-    # else:
-    #     base_pred = normalizer.denormalize(predict_hat)
-    #     base_label = normalizer.denormalize(label_gt)
-
     losses = {
-        "loss": loss_val,
+        "value_loss": torch.tensor(0),
+        "grad_loss": torch.tensor(0),
+        "loss": 0,
         'mean_l2': 0
         }
     
+    pred_fp32 = predict_hat.float()
+    label_fp32 = label_gt.float()
     with torch.no_grad():
-        pred_fp32 = predict_hat.detach().float()
-        label_fp32 = label_gt.detach().float()
-
         pred_real = normalizer.denormalize(pred_fp32)
         label_real = normalizer.denormalize(label_fp32)
 
+    if weight_cfg.get("enable", False):
+        error_list = []
+        weight_field = weight_cfg.get("field")
+        thresholds = weight_cfg.get("threshold", [])
+        bws = weight_cfg.get("base_weight", [])
+        fws = weight_cfg.get("focus_weight", [])
+        for idx, fld in enumerate(fields):
+            fld_pred, fld_gt = pred_fp32[..., idx:idx+1], label_fp32[..., idx:idx+1]
+            squared_error = (fld_pred - fld_gt) ** 2
+
+            if fld in weight_field:
+                i = weight_field.index(fld)
+                thresh, bw, fw = thresholds[i], float(bws[i]), float(fws[i])
+                fld_gt_real = label_real[..., idx:idx+1] # [B, T, N, 1]
+                with torch.no_grad():
+                    if isinstance(thresh, list):
+                        condition = (fld_gt_real > thresh[0]) & (fld_gt_real < thresh[1])
+                        weight_mask = torch.where(condition, fw, bw)
+                    else:
+                        weight_mask = torch.where(fld_gt_real > thresh, fw, bw)
+                    
+                    weight_mask = weight_mask / torch.mean(weight_mask)
+                
+                weighted_squared_error = squared_error * weight_mask
+                error_list.append(weighted_squared_error)
+            else:
+                error_list.append(squared_error)
+            
+        error_map = torch.cat(error_list, dim=-1)
+        losses["value_loss"] = torch.mean(error_map)
+        
+    else:
+        losses["value_loss"] = F.mse_loss(pred_fp32, label_fp32,)
+
+    if weight_cfg.get("gradient", False):
+        grad_loss_total = 0
+        grad_weights = weight_cfg.get("grad_weight", {})
+        grid_shape = weight_cfg.get("grid_shape", None)
+        for idx, fld in enumerate(fields):
+            if fld in grad_weights:
+                gw = float(grad_weights[fld])
+                pred_gx, pred_gy, pred_gz = compute_spatial_gradient_3d(fld_pred, grid_shape)
+                gt_gx, gt_gy, gt_gz       = compute_spatial_gradient_3d(fld_gt, grid_shape)
+                # 梯度的纯 MSE
+                loss_gx = F.mse_loss(pred_gx, gt_gx, reduction='mean')
+                loss_gy = F.mse_loss(pred_gy, gt_gy, reduction='mean')
+                loss_gz = F.mse_loss(pred_gz, gt_gz, reduction='mean')
+
+                loss_g = loss_gx + loss_gy + loss_gz
+                grad_loss_total += loss_g * gw
+        losses["grad_loss"] = grad_loss_total
+        
+    losses["loss"] = losses["value_loss"] + 8.0 * losses["grad_loss"]
+
+    with torch.no_grad():
         rmse = _rmse(pred_real, label_real)
 
         for i, fname in enumerate(fields):
@@ -107,7 +178,9 @@ def get_val_loss(fields, predict_hat, state, normalizer):
 def train(args, model, train_dataloader, optim, device, normalizer):
     horizon = args.data.get("horizon_train", 1) if isinstance(args.data, dict) else getattr(args, "horizon_train", 1)
     fields = args.data.get("fields", ["T"])
-    use_amp, check_point = args.model.get("use_amp", False), args.model.get("check_point", False)
+    use_amp, check_point = args.train.get("use_amp", False), args.train.get("check_point", False)
+    weight_loss = args.train.get("weight_loss", {"enable": False})
+
     agg = {}
     for key in ["loss", "L2", "mean_l2", "RMSE"]:
         if key == "L2" or key == "RMSE":
@@ -117,6 +190,8 @@ def train(args, model, train_dataloader, optim, device, normalizer):
             agg[key] = 0.0
     agg["each_l2"] = torch.zeros(horizon, device=device)
     agg["num"] = 0
+    agg["value_loss"] = 0.0
+    agg["grad_loss"] = 0.0
 
     model.train()
     normalizer.to(device)
@@ -130,13 +205,15 @@ def train(args, model, train_dataloader, optim, device, normalizer):
         edges = batch["edges"].to(device)
         time_seq = batch["time_seq"].to(device)
         conditions = batch["conditions"].to(device).float()
+        if weight_loss.get("gradient", False):
+            weight_loss["grid_shape"] = batch['grid_shape'].numpy() # 针对一个 batch 生效
 
         batch_num = state.shape[0]
 
         if use_amp:
             with autocast(device_type="cuda", dtype=torch.bfloat16):   
                 predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
-                costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, args.train.get("loss_flag", "L2_norm_loss"))
+                costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss)
             
             costs["loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -146,12 +223,15 @@ def train(args, model, train_dataloader, optim, device, normalizer):
         else:
             predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
 
-            costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, args.train.get("loss_flag", "L2_norm_loss"))
+            costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss)
             costs["loss"].backward()
             optim.step()
             optim.zero_grad()
             
         agg["loss"] += costs["loss"].item() * batch_num
+        agg["value_loss"] += costs["value_loss"].item() * batch_num
+        agg["grad_loss"] += costs["grad_loss"].item() * batch_num
+
         for fname in fields:
             agg[f"L2_{fname}"] += costs[f"L2_{fname}"].mean().item() * batch_num
             agg[f"RMSE_{fname}"] += costs[f"RMSE_{fname}"] * batch_num
@@ -167,6 +247,7 @@ def train(args, model, train_dataloader, optim, device, normalizer):
     for key, value in agg.items():
         if key != "each_l2" and key != "num":
             agg[key] = value / agg["num"]
+
     agg["each_l2"] = (agg["each_l2"] / agg["num"]).cpu()
     return agg
 

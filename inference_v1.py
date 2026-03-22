@@ -10,6 +10,7 @@ import imageio
 from tqdm import tqdm
 from pathlib import Path
 import h5py
+from torch.amp import GradScaler, autocast # 引入 AMP 模块
 
 # 引入项目模块
 # from src.physgto_res import Model
@@ -38,6 +39,7 @@ class AeroGtoPredictor:
         print("[Init] Loading Train Dataset (for Normalizer)...")
         # 即使是 inference，通常也需要 TrainSet 的统计数据来做 Normalizer
         train_dataset = AeroGtoDataset(
+            data_cfg=data_cfg,
             file_list=data_cfg["train_list"],
             mode="train",
             fields=data_cfg.get("fields", ["T"]),
@@ -52,6 +54,7 @@ class AeroGtoPredictor:
 
         if mode == "test":
             self.dataset = AeroGtoDataset(
+                data_cfg=data_cfg,
                 file_list=self.args.data["test_list"],
                 mode="test",
                 fields=self.args.data.get("fields", ["T"]),
@@ -145,6 +148,7 @@ class AeroGtoPredictor:
         """
         sample = self.dataset[sample_idx]
         
+        use_amp, check_point = self.args.train.get("use_amp", False), self.args.train.get("check_point", False)
         # 增加 Batch 维度并移至 GPU
         state_seq = sample["state"].unsqueeze(0).to(self.device)
         node_pos = sample["node_pos"].unsqueeze(0).to(self.device)
@@ -163,9 +167,13 @@ class AeroGtoPredictor:
 
         print(f"[Predict] Running autoregressive inference...")
         with torch.no_grad():
-            pred_seq = self.model.autoregressive(
-                state_0, node_pos, edges, time_seq, conditions, dt
-            )
+            if use_amp:
+                with autocast("cuda", dtype=torch.bfloat16):
+                    pred_seq = self.model.autoregressive(
+                        state_0, node_pos, edges, time_seq, conditions, dt, check_point=check_point)
+            else:
+                pred_seq = self.model.autoregressive(
+                        state_0, node_pos, edges, time_seq, conditions, dt, check_point=check_point)
 
             pred_real = self.normalizer.denormalize(pred_seq)
             gt_real = self.normalizer.denormalize(gt_seq)
@@ -529,7 +537,7 @@ if __name__ == "__main__":
     MODE = "test"
     NAME = "config/aerogto_HR_easypool_v0.json"
     # === 配置区域 ===
-    CONFIG_PATH = f"config/aerogto_large_patch_version_velocity.json" 
+    CONFIG_PATH = f"config/aerogto_large_patch_version.json" 
     
     FIELD_TO_PLOT = None   # ["T", "Ux", "Uy", "Uz", "alpha.air", "alpha.titanium", "gamma_liquid"] 
     SLICE_AXIS = "z"        # 'x', 'y', 'z'
@@ -551,7 +559,7 @@ if __name__ == "__main__":
     
     # SAMPLE_IDX = random.randint(0, len(predictor.dataset)-1)    
     print(len(predictor.dataset))
-    SAMPLE_IDX = 27
+    SAMPLE_IDX = 35
     # print(predictor.dataset[50]["conditions"])
     # print(predictor.dataset[55]["conditions"])
     # exit()

@@ -105,8 +105,10 @@ def get_model(args, device, cond_dim, default_dt):
         from src.physgto_res import Model
     elif model_name == "gto_lnn":
         from src.gto_lnn import Model
-    
-    model = Model(
+    elif model_name == "gto_attnres_multi":
+        from src.physgto_attnres_multi import Model
+
+    common_kwargs = dict(
         space_size=model_cfg.get("space_size", 3),
         pos_enc_dim=model_cfg.get("pos_enc_dim", 5),
         cond_dim=cond_dim,
@@ -117,7 +119,13 @@ def get_model(args, device, cond_dim, default_dt):
         n_head=model_cfg.get("n_head", 4),
         n_token=model_cfg.get("n_token", 64),
         dt=model_cfg.get("dt", default_dt),
-    ).to(device)
+    )
+
+    if model_name == "gto_attnres_multi":
+        common_kwargs["n_fields"] = model_cfg.get("n_fields", model_cfg.get("in_dim", 2))
+        common_kwargs["cross_attn_heads"] = model_cfg.get("cross_attn_heads", 4)
+
+    model = Model(**common_kwargs).to(device)
 
     load_path = model_cfg.get("load_path")
     checkpoint = None
@@ -242,6 +250,8 @@ def main(args, path_logs, path_nn, path_record):
             writer.add_scalar(f'RMSE/train_RMSE_{fname}', rmse_val, epoch)
 
         print(log_str)
+        value_loss, grad_loss = train_error.get("value_loss", 0), train_error.get("grad_loss", 0)
+        print(f"value_loss:{value_loss} | grad_loss:{grad_loss}")
         print(f"L2 details: {', '.join(l2_details)}")
         print(f"RMSE details: {', '.join(rmse_details)}")
         print(f"each time step loss: {each_t_l2.tolist()}")

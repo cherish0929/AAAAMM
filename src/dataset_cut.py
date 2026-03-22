@@ -209,6 +209,8 @@ class CutAeroGtoDataset(Dataset):
         self.meta_cache = {}
         self.sample_keys = []
         self.max_start_per_file = []
+        self.edge_sample_ratio = self.config.get("edge_sample_ratio", 1.0)
+
 
         for file_id, path in enumerate(self.file_paths):
             meta = self._build_meta(path)
@@ -440,13 +442,13 @@ class CutAeroGtoDataset(Dataset):
             node_pos = (node_pos - pos_min_r) / (pos_max_r - pos_min_r + 1e-8)
 
         # 6. 生成新图边
-        edges = _build_grid_edges((nx_new, ny_new, nz_new))
+        edges = _build_grid_edges((nx_new, ny_new, nz_new), sample_ratio=self.edge_sample_ratio)
 
         rel_time = time_seq[1:] - time_seq[0]
         time_tensor = torch.from_numpy(rel_time.astype(np.float32)).unsqueeze(-1)
         
         sample = {
-            "dt": meta['dt'],
+            "dt": meta['dt'] * self.time_stride,
             "state": state,          
             "time_seq": time_tensor,  
             "node_pos": node_pos, 
@@ -454,7 +456,7 @@ class CutAeroGtoDataset(Dataset):
             "node_type": node_type,  
             "conditions": meta["conditions"],
             "ds_shape": [nx, ny, nz],
-            "cut_shape": [nx_new, ny_new, nz_new]
+            "grid_shape": torch.Tensor([nx_new, ny_new, nz_new])
         }
         return sample
 

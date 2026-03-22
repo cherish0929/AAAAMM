@@ -261,6 +261,7 @@ class AeroGtoDataset(Dataset):
         self.meta_cache = {}
         self.sample_keys = []
         self.max_start_per_file = []
+        self.edge_sample_ratio = self.config.get("edge_sample_ratio", 1.0)
 
         for file_id, path in enumerate(self.file_paths):
             meta = self._build_meta(path)
@@ -367,7 +368,7 @@ class AeroGtoDataset(Dataset):
 
             node_pos = torch.from_numpy(point.astype(np.float32))
 
-            edges = _build_grid_edges(ds_shape)
+            edges = _build_grid_edges(ds_shape, self.edge_sample_ratio)
             node_type = _build_node_type(ds_shape)
 
             if self.normalize:
@@ -436,12 +437,13 @@ class AeroGtoDataset(Dataset):
         rel_time = time_seq[1:] - time_seq[0]
         time_tensor = torch.from_numpy(rel_time.astype(np.float32)).unsqueeze(-1)
         sample = {
-            "dt": meta['dt'],
+            "dt": meta['dt'] * self.time_stride,
             "state": state,  # [1 + horizon, N, 4]
             "time_seq": time_tensor,  # [horizon, 1]
             "node_pos": node_pos,
             "edges": meta["edges"],
             "node_type": meta["node_type"],
             "conditions": meta["conditions"],
+            "grid_shape": torch.tensor(list(meta["ds_shape"]))
         }
         return sample
