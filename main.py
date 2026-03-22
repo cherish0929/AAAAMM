@@ -242,6 +242,8 @@ def main(args, path_logs, path_nn, path_record):
             writer.add_scalar(f'RMSE/train_RMSE_{fname}', rmse_val, epoch)
 
         print(log_str)
+        value_loss, grad_loss = train_error.get("value_loss", 0), train_error.get("grad_loss", 0)
+        print(f"value_loss:{value_loss} | grad_loss:{grad_loss}")
         print(f"L2 details: {', '.join(l2_details)}")
         print(f"RMSE details: {', '.join(rmse_details)}")
         print(f"each time step loss: {each_t_l2.tolist()}")

@@ -6,4 +6,5 @@ data
 config
 *.vtk
 *.sh
+*.json
 __pycache__
