@@ -272,8 +272,12 @@ def get_incompressibility_loss(args, model, predict_hat, label_gt, normalizer, f
             "scaled_rms": zero,
         }
 
-    pred_phys = normalizer.denormalize(predict_hat)
-    gt_phys = normalizer.denormalize(label_gt)
+    # Force fp32 for physical-space divergence computation (denormalize uses exp/sinh)
+    with torch.amp.autocast("cuda", enabled=False):
+        pred_fp32 = predict_hat.float()
+        gt_fp32 = label_gt.float()
+        pred_phys = normalizer.denormalize(pred_fp32)
+        gt_phys = normalizer.denormalize(gt_fp32)
     vel_indices = [field_idx for _, _, field_idx in axis_info]
     pred_vel = torch.cat([pred_phys[..., idx:idx+1] for idx in vel_indices], dim=-1)
     gt_vel = torch.cat([gt_phys[..., idx:idx+1] for idx in vel_indices], dim=-1)
@@ -500,14 +504,18 @@ def get_train_loss(args, model, predict_hat, label_gt, normalizer, node_pos_phys
         }
 
     with torch.no_grad():
-        pred_real = normalizer.denormalize(predict_hat)
-        label_real = normalizer.denormalize(label_gt)
-        rmse = _rmse(pred_real, label_real, mask=mask_weight)
+        # Force fp32 for denormalize (exp/sinh can overflow in fp16)
+        pred_fp32 = predict_hat.float()
+        gt_fp32 = label_gt.float()
+        pred_real = normalizer.denormalize(pred_fp32)
+        label_real = normalizer.denormalize(gt_fp32)
+        mask_fp32 = mask_weight.float() if mask_weight is not None else None
+        rmse = _rmse(pred_real, label_real, mask=mask_fp32)
 
         for i, fname in enumerate(fields):
             pred_ch_real = pred_real[..., i:i+1]
             gt_ch_real = label_real[..., i:i+1]
-            field_mask = mask_weight[..., i:i+1] if mask_weight is not None else None
+            field_mask = mask_fp32[..., i:i+1] if mask_fp32 is not None else None
 
             rel_l2_val = _relative_l2(pred_ch_real, gt_ch_real, mask=field_mask)
 
@@ -515,7 +523,7 @@ def get_train_loss(args, model, predict_hat, label_gt, normalizer, node_pos_phys
             losses['mean_l2'] += rel_l2_val / num_channels
             losses[f"RMSE_{fname}"] = rmse[i].item()
 
-    losses["each_l2"] = _each_l2(pred_real, label_real, mask=mask_weight)
+    losses["each_l2"] = _each_l2(pred_real, label_real, mask=mask_fp32)
 
     return losses
 
@@ -568,7 +576,7 @@ def get_val_loss(args, model, fields, predict_hat, state, normalizer, node_pos_p
     return losses
 
 
-def train(args, model, train_dataloader, optim, device, normalizer, epoch=0):
+def train(args, model, train_dataloader, optim, device, normalizer, epoch=0, scaler=None, use_amp=False):
     horizon = args.data.get("horizon_train", 1) if isinstance(args.data, dict) else getattr(args, "horizon_train", 1)
     fields, data_mask = args.data.get("fields", ["T"]), args.data.get("mask", False)
 
@@ -612,51 +620,61 @@ def train(args, model, train_dataloader, optim, device, normalizer, epoch=0):
 
         batch_num = state.shape[0]
 
-        predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, teacher, state[:, 1:])
+        # AMP: wrap forward + loss in autocast; metrics computed in fp32
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, teacher, state[:, 1:])
 
-        valid_mask = torch.ones_like(predict_hat)
+            valid_mask = torch.ones_like(predict_hat)
 
-        if data_mask:
-            T = predict_hat.shape[1]
-            gas_mask, y_cutoff_mask, solid_mask = batch["gas_mask"].to(device), batch["y_cutoff_mask"].to(device), batch["solid_mask"].to(device)
-            gas_mask_bool, solid_mask_bool = gas_mask[:, 1:, :], solid_mask[:, 1:, :]
-            vel_inactive_mask = gas_mask_bool | solid_mask_bool
-            if len(y_cutoff_mask.shape) == 3:# [B, N, 1]
-                y_mask_bool = y_cutoff_mask.squeeze(-1).unsqueeze(1).expand(-1, T, -1)
-            else:
-                y_mask_bool = y_cutoff_mask.unsqueeze(1).expand(-1, T, -1)
+            if data_mask:
+                T = predict_hat.shape[1]
+                gas_mask, y_cutoff_mask, solid_mask = batch["gas_mask"].to(device), batch["y_cutoff_mask"].to(device), batch["solid_mask"].to(device)
+                gas_mask_bool, solid_mask_bool = gas_mask[:, 1:, :], solid_mask[:, 1:, :]
+                vel_inactive_mask = gas_mask_bool | solid_mask_bool
+                if len(y_cutoff_mask.shape) == 3:# [B, N, 1]
+                    y_mask_bool = y_cutoff_mask.squeeze(-1).unsqueeze(1).expand(-1, T, -1)
+                else:
+                    y_mask_bool = y_cutoff_mask.unsqueeze(1).expand(-1, T, -1)
 
-            for i, field in enumerate(fields):
-                if field in ["Ux", "Uy", "Uz"]:
-                    state[:, 1:, :, i][vel_inactive_mask] = 0.0
-                    predict_hat[..., i][vel_inactive_mask] = 0.0
-                    valid_mask[..., i][vel_inactive_mask] = 0.0 # 计算 loss 的时候忽略这些区域
-                elif field in ["gamma_liquid"]:
-                    state[:, 1:, :, i][y_mask_bool] = 0.0
-                    predict_hat[..., i][y_mask_bool] = 0.0
-                    valid_mask[..., i][y_mask_bool] = 0.0
+                for i, field in enumerate(fields):
+                    if field in ["Ux", "Uy", "Uz"]:
+                        state[:, 1:, :, i][vel_inactive_mask] = 0.0
+                        predict_hat[..., i][vel_inactive_mask] = 0.0
+                        valid_mask[..., i][vel_inactive_mask] = 0.0 # 计算 loss 的时候忽略这些区域
+                    elif field in ["gamma_liquid"]:
+                        state[:, 1:, :, i][y_mask_bool] = 0.0
+                        predict_hat[..., i][y_mask_bool] = 0.0
+                        valid_mask[..., i][y_mask_bool] = 0.0
 
-        costs = get_train_loss(
-            args,
-            model,
-            predict_hat,
-            state[:, 1:],
-            normalizer,
-            node_pos_phys=node_pos_phys,
-            edges=edges,
-            node_type=node_type,
-            mask_weight=valid_mask,
-            epoch=epoch,
-        )
+            costs = get_train_loss(
+                args,
+                model,
+                predict_hat,
+                state[:, 1:],
+                normalizer,
+                node_pos_phys=node_pos_phys,
+                edges=edges,
+                node_type=node_type,
+                mask_weight=valid_mask,
+                epoch=epoch,
+            )
 
         optim.zero_grad(set_to_none=True)
-        costs["loss"].backward()
 
-        grad_clip = args.train.get("grad_clip", None)
-        if grad_clip is not None:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
-
-        optim.step()
+        if scaler is not None and use_amp:
+            scaler.scale(costs["loss"]).backward()
+            grad_clip = args.train.get("grad_clip", None)
+            if grad_clip is not None:
+                scaler.unscale_(optim)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
+            scaler.step(optim)
+            scaler.update()
+        else:
+            costs["loss"].backward()
+            grad_clip = args.train.get("grad_clip", None)
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
+            optim.step()
 
 
         agg["loss"] += costs["loss"].item() * batch_num

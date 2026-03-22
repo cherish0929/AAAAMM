@@ -97,6 +97,7 @@ def get_model(args, device, cond_dim, default_dt):
         n_head=model_cfg.get("n_head", 4),
         n_token=model_cfg.get("n_token", 64),
         dt=model_cfg.get("dt", default_dt),
+        use_checkpoint=model_cfg.get("use_checkpoint", False),
     ).to(device)
 
     load_path = model_cfg.get("load_path")
@@ -154,10 +155,16 @@ def main(args, path_logs, path_nn, path_record):
     # optimizer & scheduler
     optimizer = AdamW(model.parameters(), lr=real_lr, weight_decay=real_lr/50.0)
     if EPOCH < 100:
-        scheduler = CosineAnnealingLR(optimizer, T_max=EPOCH, eta_min=real_lr)  
+        scheduler = CosineAnnealingLR(optimizer, T_max=EPOCH, eta_min=real_lr)
     else:
         scheduler = CosineAnnealingLR(optimizer, T_max=EPOCH, eta_min=real_lr/50.0)
-   
+
+    # AMP (mixed precision) setup
+    use_amp = args.train.get("use_amp", False) and "cuda" in device_str
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    if use_amp:
+        print("[AMP] Mixed precision training enabled")
+
     start_epoch, best_val_error = 0, float("inf")
 
     if checkpoint is not None:
@@ -195,7 +202,9 @@ def main(args, path_logs, path_nn, path_record):
             optimizer,
             device,
             normalizer,
-            epoch=epoch
+            epoch=epoch,
+            scaler=scaler,
+            use_amp=use_amp,
         )
         end_time = time.time()
 

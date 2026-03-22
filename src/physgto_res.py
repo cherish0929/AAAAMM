@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from torch_scatter import scatter_mean, scatter_softmax
 
@@ -452,9 +453,10 @@ class Encoder(nn.Module):
         return V, E
 
 class Mixer(nn.Module):
-    def __init__(self, N, enc_dim, n_head, n_token, enc_s_dim):
+    def __init__(self, N, enc_dim, n_head, n_token, enc_s_dim, use_checkpoint=False):
         super(Mixer, self).__init__()
 
+        self.use_checkpoint = use_checkpoint
         self.blocks = nn.ModuleList([
             MixerBlock(enc_dim=enc_dim, n_head=n_head, n_token=n_token, enc_s_dim=enc_s_dim)
             for _ in range(N)
@@ -465,7 +467,10 @@ class Mixer(nn.Module):
         V_all = []
 
         for block in self.blocks:
-            V, E = block(V, E, edges_long, pos_enc)
+            if self.use_checkpoint and self.training:
+                V, E = grad_checkpoint(block, V, E, edges_long, pos_enc, use_reentrant=False)
+            else:
+                V, E = block(V, E, edges_long, pos_enc)
             V_all.append(V)
 
         V_all = torch.stack(V_all, dim=1) # [bs, N_block, N, enc_dim]
@@ -484,7 +489,8 @@ class Model(nn.Module):
                  n_head=4,
                  n_token=128,
                  dt:float =0.05,
-                 stepper_scheme="euler"
+                 stepper_scheme="euler",
+                 use_checkpoint=False,
                  ):
         super(Model, self).__init__()
 
@@ -510,7 +516,8 @@ class Model(nn.Module):
             enc_dim=enc_dim,
             n_head=n_head,
             n_token=n_token,
-            enc_s_dim=enc_s_dim
+            enc_s_dim=enc_s_dim,
+            use_checkpoint=use_checkpoint,
             )
 
         self.decoder = Decoder(
