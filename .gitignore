@@ -1,7 +1,4 @@
-result/nn
-result/record
-result/logs
-result/*inference*
+result
 data
 config
 *.vtk

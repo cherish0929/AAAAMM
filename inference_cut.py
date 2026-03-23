@@ -12,10 +12,51 @@ from pathlib import Path
 import h5py
 from torch.amp import GradScaler, autocast # 引入 AMP 模块
 # 引入项目模块
-# from src.physgto_res import Model
-# from src.physgto import Model
 from src.dataset_cut import CutAeroGtoDataset
 from src.utils import load_json_config, set_seed
+
+
+def _build_model(model_cfg, cond_dim, default_dt, device):
+    """根据 config 中的 model.name 动态构建对应模型（兼容所有变体）"""
+    model_name = model_cfg.get("name", "PhysGTO")
+
+    if model_name == "PhysGTO":
+        from src.physgto import Model
+    elif model_name == "gto_res":
+        from src.physgto_res import Model
+    elif model_name == "gto_lnn":
+        from src.gto_lnn import Model
+    elif model_name == "gto_attnres_multi":
+        from src.physgto_attnres_multi import Model
+    elif model_name == "gto_attnres_multi_v2":
+        from src.physgto_attnres_multi_v2 import Model
+    elif model_name == "gto_res_attnres":
+        from src.physgto_res_attnres import Model
+    else:
+        raise ValueError(f"Unknown model name: {model_name}")
+
+    kwargs = dict(
+        space_size=model_cfg.get("space_size", 3),
+        pos_enc_dim=model_cfg.get("pos_enc_dim", 5),
+        cond_dim=cond_dim,
+        N_block=model_cfg.get("N_block", 4),
+        in_dim=model_cfg.get("in_dim", 4),
+        out_dim=model_cfg.get("out_dim", 4),
+        enc_dim=model_cfg.get("enc_dim", 128),
+        n_head=model_cfg.get("n_head", 4),
+        n_token=model_cfg.get("n_token", 64),
+        dt=model_cfg.get("dt", default_dt),
+    )
+
+    # AttnRes 系列需要额外参数
+    if model_name in ("gto_attnres_multi", "gto_attnres_multi_v2", "gto_res_attnres"):
+        kwargs["n_fields"] = model_cfg.get("n_fields", model_cfg.get("in_dim", 2))
+        kwargs["cross_attn_heads"] = model_cfg.get("cross_attn_heads", 4)
+
+    if model_name in ("gto_attnres_multi_v2", "gto_res_attnres"):
+        kwargs["attn_res_mode"] = model_cfg.get("attn_res_mode", "block_inter")
+
+    return Model(**kwargs).to(device)
 
 class AeroGtoPredictor:
     def __init__(self, config_path, mode="test", model_path=None, device_str="cuda"):
@@ -79,40 +120,33 @@ class AeroGtoPredictor:
         print("[Init] Building Model...")
         cond_dim = self.args.model.get("cond_dim") or self.dataset.cond_dim
         default_dt = self.args.model.get("dt", self.dataset.dt)
-        model_name = model_cfg.get("name", "PhysGTO")
 
-        if model_name == "PhysGTO":
-            from src.physgto import Model
-        elif model_name == "gto_res":
-            from src.physgto_res import Model
-        elif model_name == "gto_lnn":
-            from src.gto_lnn import Model
-        
-        self.model = Model(
-            space_size=self.args.model.get("space_size", 3),
-            pos_enc_dim=self.args.model.get("pos_enc_dim", 5),
-            cond_dim=cond_dim,
-            N_block=self.args.model.get("N_block", 4),
-            in_dim=self.args.model.get("in_dim", 4),
-            out_dim=self.args.model.get("out_dim", 4),
-            enc_dim=self.args.model.get("enc_dim", 128),
-            n_head=self.args.model.get("n_head", 4),
-            n_token=self.args.model.get("n_token", 64),
-            dt=self.args.model.get("dt", default_dt),
-        ).to(self.device)
+        self.model = _build_model(model_cfg, cond_dim, default_dt, self.device)
 
-        # 3. 加载权重
+        # 3. 加载权重（支持 EMA）
         if model_path is None:
             save_root = Path(self.args.save_path)
             model_path = save_root / "nn" / f"{self.args.name}_best.pt"
-        
+
         print(f"[Init] Loading weights from: {model_path}")
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Weight file not found: {model_path}")
-            
+
         checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
-        state_dict = checkpoint.get("state_dict", checkpoint)
-        self.model.load_state_dict(state_dict, strict=False)
+
+        # 优先使用 EMA 权重（main_v2 保存的 checkpoint 包含 ema_shadow）
+        if "ema_shadow" in checkpoint:
+            print("[Init] Loading EMA shadow weights.")
+            ema_shadow = checkpoint["ema_shadow"]
+            state_dict = self.model.state_dict()
+            for name in ema_shadow:
+                if name in state_dict:
+                    state_dict[name] = ema_shadow[name]
+            self.model.load_state_dict(state_dict, strict=False)
+        else:
+            state_dict = checkpoint.get("state_dict", checkpoint)
+            self.model.load_state_dict(state_dict, strict=False)
+
         self.model.eval()
         
         self.normalizer = self.dataset.normalizer

@@ -213,7 +213,7 @@ class FieldCrossAttention(nn.Module):
         other = self.ln_other(V_other)                       # [bs, N, D]
         self_normed = self.ln_self(V_self)                   # [bs, N, D]
 
-        W, _ = self.attn1(Q, other, other)                   # [bs, n_token, D]
+        W, _ = self.attn1(Q, other, other)                   # [bs, n_token, D]，另一项是注意力权重
         W, _ = self.attn2(W, W, W)                           # [bs, n_token, D]
         out, _ = self.attn3(self_normed, W, W)               # [bs, N, D]
         return out
@@ -289,8 +289,9 @@ class MultiFieldEncoder(nn.Module):
         V_list = []
         for i in range(self.n_fields):
             field_i = state_in[..., i:i+1]        # [bs, N, 1]
-            inp = torch.cat([field_i, node_pos], dim=-1)  # [bs, N, 1+space]
-            V_i = self.fv_fields[i](inp) + time_enc.unsqueeze(-2) + cond_enc.unsqueeze(-2)
+            # inp = torch.cat([field_i, node_pos], dim=-1)  # [bs, N, 1+space]
+            inp = torch.cat([node_pos, field_i], dim=-1)
+            V_i = self.fv_fields[i](inp) + time_enc.unsqueeze(-2) + cond_enc.unsqueeze(-2) # 考虑 合起来 再经过 MLP
             V_list.append(V_i)
 
         E = self.fe(get_edge_info(edges, node_pos))

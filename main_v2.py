@@ -1,0 +1,734 @@
+"""
+main_v2.py — 改进训练流程
+============================================================
+相比 main.py 的改进：
+1. Warmup + CosineAnnealingWarmRestarts 调度器
+   - 前 warmup_epochs 线性增长 LR，避免初期震荡
+   - 多周期余弦退火 (T_0, T_mult) 帮助逃出局部最优
+2. 更合理的 weight_decay (1e-4 vs 1e-5)
+3. 可配置的 gradient loss 权重 (默认 5.0 vs 硬编码 8.0)
+4. Pushforward training: 训练中后期逐步增加 rollout 步数
+   - 缓解 autoregressive error accumulation
+5. EMA (Exponential Moving Average) 模型，验证时使用 EMA 权重
+6. 更频繁的 eval (每 10 epoch)
+7. 支持从上一个 best checkpoint 继续训练
+============================================================
+"""
+
+import torch
+import numpy as np
+import os
+import time
+import copy
+import math
+from pathlib import Path
+from datetime import datetime
+
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, CosineAnnealingLR
+from torch.utils.tensorboard import SummaryWriter
+from torch.optim import AdamW
+
+from src.dataset import AeroGtoDataset
+from src.dataset_2d import AeroGtoDataset2D
+from src.dataset_cut import CutAeroGtoDataset
+from src.train import train, validate, get_train_loss
+from src.utils import set_seed, init_weights, parse_args, load_json_config
+
+
+# =============================================================================
+# EMA (Exponential Moving Average)
+# =============================================================================
+
+class EMA:
+    """Maintains an exponential moving average of model parameters."""
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    def update(self, model):
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                new_avg = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
+                self.shadow[name] = new_avg.clone()
+
+    def apply_shadow(self, model):
+        """Replace model params with EMA shadow (for evaluation)."""
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data.clone()
+                param.data = self.shadow[name]
+
+    def restore(self, model):
+        """Restore original model params after evaluation."""
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data = self.backup[name]
+        self.backup = {}
+
+
+# =============================================================================
+# Warmup + CosineRestart Scheduler
+# =============================================================================
+
+class WarmupCosineRestartScheduler:
+    """
+    Linear warmup followed by CosineAnnealingWarmRestarts.
+    """
+    def __init__(self, optimizer, warmup_epochs, T_0, T_mult=1, eta_min=1e-6):
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.base_lr = optimizer.param_groups[0]['lr']
+        self.eta_min = eta_min
+        self.current_epoch = 0
+
+        # Cosine scheduler (will be stepped after warmup)
+        self.cosine_scheduler = CosineAnnealingWarmRestarts(
+            optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min
+        )
+
+    def step(self):
+        self.current_epoch += 1
+        if self.current_epoch <= self.warmup_epochs:
+            # Linear warmup
+            lr = self.base_lr * (self.current_epoch / self.warmup_epochs)
+            for pg in self.optimizer.param_groups:
+                pg['lr'] = lr
+        else:
+            self.cosine_scheduler.step(self.current_epoch - self.warmup_epochs)
+
+    def get_last_lr(self):
+        return [pg['lr'] for pg in self.optimizer.param_groups]
+
+
+# =============================================================================
+# Pushforward Training
+# =============================================================================
+
+def train_pushforward(args, model, train_dataloader, optim, device, normalizer, extra_steps):
+    """
+    Pushforward training: extend rollout beyond horizon_train by extra_steps.
+    Only backpropagate through the extra steps (the model is already good at the original horizon).
+    This forces the model to learn to correct its own errors.
+    """
+    from torch.amp import GradScaler, autocast
+
+    base_horizon = args.data.get("horizon_train", 1)
+    fields = args.data.get("fields", ["T"])
+    use_amp = args.train.get("use_amp", False)
+    check_point = args.train.get("check_point", False)
+    weight_loss = args.train.get("weight_loss", {"enable": False})
+    grad_loss_weight = args.train.get("grad_loss_weight", 8.0)
+
+    agg = {}
+    for key in ["loss", "L2", "mean_l2", "RMSE"]:
+        if key == "L2" or key == "RMSE":
+            for fname in fields:
+                agg[f"{key}_{fname}"] = 0.0
+        else:
+            agg[key] = 0.0
+    agg["each_l2"] = torch.zeros(base_horizon, device=device)
+    agg["num"] = 0
+    agg["value_loss"] = 0.0
+    agg["grad_loss"] = 0.0
+
+    model.train()
+    normalizer.to(device)
+
+    from tqdm import tqdm
+    pbar = tqdm(train_dataloader, desc="  Train(PF)", unit="bt", leave=True, ncols=120, colour='cyan')
+
+    for batch in pbar:
+        dt = batch['dt'].to(device)
+        state = batch["state"].to(device)
+        node_pos = batch["node_pos"].to(device)
+        edges = batch["edges"].to(device)
+        time_seq = batch["time_seq"].to(device)
+        conditions = batch["conditions"].to(device).float()
+        if weight_loss.get("gradient", False):
+            weight_loss["grid_shape"] = batch['grid_shape'].numpy()
+
+        batch_num = state.shape[0]
+        T_total = time_seq.shape[1]
+        T_pf = min(base_horizon + extra_steps, T_total)
+
+        if use_amp:
+            with autocast(device_type="cuda", dtype=torch.bfloat16):
+                predict_hat = model.autoregressive(
+                    state[:, 0], node_pos, edges, time_seq[:, :T_pf], conditions, dt, check_point
+                )
+                # Loss on original horizon
+                costs = get_train_loss(fields, predict_hat[:, :base_horizon], state[:, 1:base_horizon+1], normalizer, weight_loss)
+                loss_base = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
+
+                # Loss on extra steps (pushforward)
+                if T_pf > base_horizon and state.shape[1] > base_horizon + 1:
+                    T_extra = min(T_pf, state.shape[1] - 1)
+                    costs_pf = get_train_loss(
+                        fields, predict_hat[:, base_horizon:T_extra],
+                        state[:, base_horizon+1:T_extra+1], normalizer, weight_loss
+                    )
+                    loss_pf = costs_pf["value_loss"] + grad_loss_weight * costs_pf["grad_loss"]
+                    total_loss = loss_base + 0.5 * loss_pf  # pushforward weighted less
+                else:
+                    total_loss = loss_base
+
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
+            optim.step()
+            optim.zero_grad()
+        else:
+            predict_hat = model.autoregressive(
+                state[:, 0], node_pos, edges, time_seq[:, :T_pf], conditions, dt, check_point
+            )
+            costs = get_train_loss(fields, predict_hat[:, :base_horizon], state[:, 1:base_horizon+1], normalizer, weight_loss)
+            loss_base = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
+
+            if T_pf > base_horizon and state.shape[1] > base_horizon + 1:
+                T_extra = min(T_pf, state.shape[1] - 1)
+                costs_pf = get_train_loss(
+                    fields, predict_hat[:, base_horizon:T_extra],
+                    state[:, base_horizon+1:T_extra+1], normalizer, weight_loss
+                )
+                loss_pf = costs_pf["value_loss"] + grad_loss_weight * costs_pf["grad_loss"]
+                total_loss = loss_base + 0.5 * loss_pf
+            else:
+                total_loss = loss_base
+
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
+            optim.step()
+            optim.zero_grad()
+
+        agg["loss"] += costs["loss"].item() * batch_num
+        agg["value_loss"] += costs["value_loss"].item() * batch_num
+        agg["grad_loss"] += costs["grad_loss"].item() * batch_num
+
+        for fname in fields:
+            agg[f"L2_{fname}"] += costs[f"L2_{fname}"].mean().item() * batch_num
+            agg[f"RMSE_{fname}"] += costs[f"RMSE_{fname}"] * batch_num
+        agg["mean_l2"] += costs["mean_l2"].mean().item() * batch_num
+        agg["each_l2"] += costs["each_l2"] * batch_num
+        agg["num"] += batch_num
+
+        avg_loss = agg["loss"] / agg["num"]
+        pbar.set_postfix({"Loss": f"{avg_loss:.4e}"})
+
+    for key, value in agg.items():
+        if key != "each_l2" and key != "num":
+            agg[key] = value / agg["num"]
+    agg["each_l2"] = (agg["each_l2"] / agg["num"]).cpu()
+    return agg
+
+
+# =============================================================================
+# Patched train function with configurable grad_loss_weight
+# =============================================================================
+
+def train_v2(args, model, train_dataloader, optim, device, normalizer):
+    """train() with configurable grad_loss_weight instead of hardcoded 8.0"""
+    from torch.amp import GradScaler, autocast
+    from tqdm import tqdm
+
+    horizon = args.data.get("horizon_train", 1) if isinstance(args.data, dict) else getattr(args, "horizon_train", 1)
+    fields = args.data.get("fields", ["T"])
+    use_amp = args.train.get("use_amp", False)
+    check_point = args.train.get("check_point", False)
+    weight_loss = args.train.get("weight_loss", {"enable": False})
+    grad_loss_weight = args.train.get("grad_loss_weight", 8.0)
+
+    agg = {}
+    for key in ["loss", "L2", "mean_l2", "RMSE"]:
+        if key == "L2" or key == "RMSE":
+            for fname in fields:
+                agg[f"{key}_{fname}"] = 0.0
+        else:
+            agg[key] = 0.0
+    agg["each_l2"] = torch.zeros(horizon, device=device)
+    agg["num"] = 0
+    agg["value_loss"] = 0.0
+    agg["grad_loss"] = 0.0
+
+    model.train()
+    normalizer.to(device)
+
+    pbar = tqdm(train_dataloader, desc="  Train", unit="bt", leave=True, ncols=120, colour='green')
+    for batch in pbar:
+        dt = batch['dt'].to(device)
+        state = batch["state"].to(device)
+        node_pos = batch["node_pos"].to(device)
+        edges = batch["edges"].to(device)
+        time_seq = batch["time_seq"].to(device)
+        conditions = batch["conditions"].to(device).float()
+        if weight_loss.get("gradient", False):
+            weight_loss["grid_shape"] = batch['grid_shape'].numpy()
+
+        batch_num = state.shape[0]
+
+        if use_amp:
+            with autocast(device_type="cuda", dtype=torch.bfloat16):
+                predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
+                costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss)
+
+            # Use configurable grad_loss_weight
+            loss = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
+            optim.step()
+            optim.zero_grad()
+        else:
+            predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
+            costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss)
+
+            loss = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
+            optim.step()
+            optim.zero_grad()
+
+        # For logging, store the combined loss into costs
+        costs["loss"] = loss
+
+        agg["loss"] += costs["loss"].item() * batch_num
+        agg["value_loss"] += costs["value_loss"].item() * batch_num
+        agg["grad_loss"] += costs["grad_loss"].item() * batch_num
+
+        for fname in fields:
+            agg[f"L2_{fname}"] += costs[f"L2_{fname}"].mean().item() * batch_num
+            agg[f"RMSE_{fname}"] += costs[f"RMSE_{fname}"] * batch_num
+        agg["mean_l2"] += costs["mean_l2"].mean().item() * batch_num
+        agg["each_l2"] += costs["each_l2"] * batch_num
+        agg["num"] += batch_num
+
+        avg_loss = agg["loss"] / agg["num"]
+        pbar.set_postfix({"Loss": f"{avg_loss:.4e}"})
+
+    for key, value in agg.items():
+        if key != "each_l2" and key != "num":
+            agg[key] = value / agg["num"]
+    agg["each_l2"] = (agg["each_l2"] / agg["num"]).cpu()
+    return agg
+
+
+# =============================================================================
+# DataLoader (same as main.py)
+# =============================================================================
+
+def get_dataloader(args, path_record, device_type):
+    data_cfg = args.data
+    model_cfg = args.model
+    space_dim = model_cfg.get("space_size", 3)
+
+    if space_dim == 3:
+        if data_cfg.get("cut", False):
+            Datasetclass = CutAeroGtoDataset
+        else:
+            Datasetclass = AeroGtoDataset
+    elif space_dim == 2:
+        Datasetclass = AeroGtoDataset2D
+
+    train_dataset = Datasetclass(
+        data_cfg=data_cfg,
+        file_list=data_cfg["train_list"],
+        mode="train",
+        fields=data_cfg.get("fields", ["T"]),
+        input_steps=data_cfg.get("input_steps", 1),
+        horizon=data_cfg.get("horizon_train", 1),
+        time_stride=data_cfg.get("time_stride", 1),
+        spatial_stride=data_cfg.get("spatial_stride", 1),
+        normalize=data_cfg.get("normalize", True),
+        samples_per_file=data_cfg.get("samples_per_file", 32),
+        norm_cache=data_cfg.get("norm_cache"),
+    )
+
+    test_dataset = Datasetclass(
+        data_cfg=data_cfg,
+        file_list=data_cfg["test_list"],
+        mode="test",
+        fields=data_cfg.get("fields", ["T"]),
+        input_steps=data_cfg.get("input_steps", 1),
+        horizon=data_cfg.get("horizon_test", 1),
+        time_stride=data_cfg.get("time_stride", 1),
+        spatial_stride=data_cfg.get("spatial_stride", 1),
+        normalize=data_cfg.get("normalize", True),
+        samples_per_file=data_cfg.get("samples_per_file", 32),
+        norm_cache=data_cfg.get("norm_cache"),
+        mat_data=train_dataset.mat_mean_and_std if train_dataset.normalize else None
+    )
+
+    test_dataset.normalizer = train_dataset.normalizer
+
+    pin_memory = True if "cuda" in device_type else False
+
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=data_cfg['train'].get("batchsize", 1),
+        shuffle=True,
+        num_workers=data_cfg['train'].get("num_workers", 0),
+        pin_memory=pin_memory,
+    )
+
+    test_dataloader = DataLoader(
+        test_dataset,
+        batch_size=data_cfg['test'].get("batchsize", 1),
+        shuffle=False,
+        num_workers=data_cfg['test'].get("num_workers", 0),
+        pin_memory=pin_memory,
+    )
+
+    cond_dim = args.model.get("cond_dim") or train_dataset.cond_dim
+    edge_num = train_dataset.meta_cache[train_dataset.file_paths[0]]["edges"].shape[0]
+
+    with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
+        file.write(f"No. of train samples: {len(train_dataset)}, No. of test samples: {len(test_dataset)}\n")
+        file.write(f"No. of train batches: {len(train_dataloader)}, No. of test batches: {len(test_dataloader)}\n")
+        file.write(f"Node num: {train_dataset.node_num}, Edge num: {edge_num}, Cond dim: {cond_dim}\n")
+        file.write(f"Mean dt: {train_dataset.dt:.4e}\n")
+
+    return train_dataloader, test_dataloader, train_dataset.normalizer, cond_dim, train_dataset.dt
+
+
+def get_model(args, device, cond_dim, default_dt):
+    model_cfg = args.model
+    model_name = model_cfg.get("name", "PhysGTO")
+
+    if model_name == "PhysGTO":
+        from src.physgto import Model
+    elif model_name == "gto_res":
+        from src.physgto_res import Model
+    elif model_name == "gto_lnn":
+        from src.gto_lnn import Model
+    elif model_name == "gto_attnres_multi":
+        from src.physgto_attnres_multi import Model
+    elif model_name == "gto_attnres_multi_v2":
+        from src.physgto_attnres_multi_v2 import Model
+    elif model_name == "gto_res_attnres":
+        from src.physgto_res_attnres import Model
+
+    common_kwargs = dict(
+        space_size=model_cfg.get("space_size", 3),
+        pos_enc_dim=model_cfg.get("pos_enc_dim", 5),
+        cond_dim=cond_dim,
+        N_block=model_cfg.get("N_block", 4),
+        in_dim=model_cfg.get("in_dim", 4),
+        out_dim=model_cfg.get("out_dim", 4),
+        enc_dim=model_cfg.get("enc_dim", 128),
+        n_head=model_cfg.get("n_head", 4),
+        n_token=model_cfg.get("n_token", 64),
+        dt=model_cfg.get("dt", default_dt),
+    )
+
+    if model_name in ("gto_attnres_multi", "gto_attnres_multi_v2", "gto_res_attnres"):
+        common_kwargs["n_fields"] = model_cfg.get("n_fields", model_cfg.get("in_dim", 2))
+        common_kwargs["cross_attn_heads"] = model_cfg.get("cross_attn_heads", 4)
+
+    if model_name in ("gto_attnres_multi_v2", "gto_res_attnres"):
+        common_kwargs["attn_res_mode"] = model_cfg.get("attn_res_mode", "block_inter")
+
+    model = Model(**common_kwargs).to(device)
+
+    load_path = model_cfg.get("load_path")
+    checkpoint = None
+
+    if load_path:
+        model_path = os.path.join(load_path, f"{args.name}_best.pt")
+        if os.path.exists(model_path):
+            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+            state_dict = checkpoint.get("state_dict", checkpoint)
+            model.load_state_dict(state_dict, strict=False)
+            print(f"Loaded model from {model_path}")
+    elif model_cfg.get("if_init", True):
+        model.apply(init_weights)
+
+    return model, checkpoint
+
+
+# =============================================================================
+# Main training loop
+# =============================================================================
+
+def main(args, path_logs, path_nn, path_record):
+
+    device_str = args.device
+    if "cuda" in device_str and not torch.cuda.is_available():
+        print("! Warning: CUDA not available, using CPU")
+        device_str = "cpu"
+    device = torch.device(device_str)
+
+    EPOCH = int(args.train["epoch"])
+    real_lr = float(args.train["lr"])
+    fields = args.data.get("fields", ["T"])
+
+    # Dataloader & normalizer
+    train_dataloader, test_dataloader, normalizer, cond_dim, default_dt = get_dataloader(args, path_record, device_str)
+
+    # Model
+    model, checkpoint = get_model(args, device, cond_dim, default_dt)
+    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+    params = int(sum([np.prod(p.size()) for p in model_parameters]))
+
+    print(f"EPOCH: {EPOCH}, #params: {params/1e6:.2f}M")
+
+    with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
+        file.write(f"Using device: {device}\n")
+        file.write(f"{args.name}, #params: {params/1e6:.2f}M\n")
+        file.write(f"EPOCH: {EPOCH}\n")
+        file.write(f"Fields: {fields}\n")
+
+    current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_dir = f"{path_logs}/{args.name}_{current_time}"
+    os.makedirs(log_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=log_dir)
+
+    # ---- Optimizer ----
+    weight_decay = args.train.get("weight_decay", real_lr / 50.0)
+    optimizer = AdamW(model.parameters(), lr=real_lr, weight_decay=weight_decay)
+
+    # ---- Scheduler ----
+    sched_cfg = args.train.get("scheduler", {})
+    sched_type = sched_cfg.get("type", "cosine")
+
+    if sched_type == "cosine_warmrestart":
+        warmup_epochs = sched_cfg.get("warmup_epochs", 10)
+        T_0 = sched_cfg.get("T_0", 50)
+        T_mult = sched_cfg.get("T_mult", 2)
+        eta_min_ratio = sched_cfg.get("eta_min_ratio", 0.002)
+        eta_min = real_lr * eta_min_ratio
+        scheduler = WarmupCosineRestartScheduler(
+            optimizer, warmup_epochs=warmup_epochs,
+            T_0=T_0, T_mult=T_mult, eta_min=eta_min
+        )
+        print(f"Scheduler: WarmupCosineRestart (warmup={warmup_epochs}, T_0={T_0}, T_mult={T_mult}, eta_min={eta_min:.2e})")
+    else:
+        # Fallback: original behavior
+        if EPOCH < 10:
+            scheduler = CosineAnnealingLR(optimizer, T_max=EPOCH, eta_min=real_lr)
+        else:
+            scheduler = CosineAnnealingLR(optimizer, T_max=EPOCH, eta_min=real_lr / 20.0)
+        print(f"Scheduler: CosineAnnealingLR (T_max={EPOCH})")
+
+    # ---- EMA ----
+    ema = EMA(model, decay=0.999)
+    print("EMA enabled (decay=0.999)")
+
+    # ---- Pushforward config ----
+    pf_cfg = args.train.get("pushforward", {"enable": False})
+    pf_enable = pf_cfg.get("enable", False)
+    pf_start = pf_cfg.get("start_epoch", 80)
+    pf_extra_max = pf_cfg.get("extra_steps", 3)
+    pf_ramp = pf_cfg.get("ramp_epochs", 40)
+    if pf_enable:
+        print(f"Pushforward: ON (start={pf_start}, extra_max={pf_extra_max}, ramp={pf_ramp})")
+
+    # ---- Resume ----
+    start_epoch, best_val_error = 0, float("inf")
+
+    if checkpoint is not None:
+        if "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            print("Restored optimizer state.")
+        if 'scheduler' in checkpoint:
+            try:
+                scheduler.load_state_dict(checkpoint['scheduler'])
+                print("Restored scheduler state.")
+            except Exception:
+                print("Scheduler state incompatible, starting fresh scheduler.")
+        if 'epoch' in checkpoint:
+            start_epoch = checkpoint['epoch']
+            print(f"Resuming from epoch {start_epoch}")
+        if 'best_val_error' in checkpoint:
+            best_val_error = checkpoint['best_val_error']
+            print(f"Restored best val error: {best_val_error:.4e}")
+
+    if start_epoch >= EPOCH:
+        print(f"Warning: Start epoch {start_epoch} >= Total EPOCH {EPOCH}. Training may perform 0 steps.")
+
+    with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
+        file.write(f"Optimizer: AdamW (lr={real_lr}, wd={weight_decay})\n")
+        file.write(f"Scheduler: {sched_type}\n")
+        file.write(f"EMA: decay=0.999\n")
+        file.write(f"Pushforward: enable={pf_enable}\n")
+        file.write(f"grad_loss_weight: {args.train.get('grad_loss_weight', 8.0)}\n")
+
+    # ==================== Training Loop ====================
+    for epoch in range(start_epoch, EPOCH):
+        start_time = time.time()
+
+        # Determine if pushforward is active
+        use_pushforward = False
+        pf_extra = 0
+        if pf_enable and epoch >= pf_start:
+            progress = min(1.0, (epoch - pf_start) / max(1, pf_ramp))
+            pf_extra = max(1, int(round(progress * pf_extra_max)))
+            use_pushforward = True
+
+        # Train
+        if use_pushforward:
+            train_error = train_pushforward(
+                args, model, train_dataloader, optimizer, device, normalizer,
+                extra_steps=pf_extra
+            )
+        else:
+            train_error = train_v2(
+                args, model, train_dataloader, optimizer, device, normalizer
+            )
+
+        end_time = time.time()
+
+        # Update EMA
+        ema.update(model)
+
+        # Step scheduler
+        scheduler.step()
+        if hasattr(scheduler, 'get_last_lr'):
+            current_lr = scheduler.get_last_lr()[0]
+        else:
+            current_lr = optimizer.param_groups[0]['lr']
+
+        training_time = (end_time - start_time)
+
+        # Extract metrics
+        train_loss = train_error['loss']
+        train_mean_l2 = train_error['mean_l2']
+        each_t_l2 = train_error['each_l2']
+
+        # Log
+        log_str = f"Training, Epoch: {epoch + 1}/{EPOCH}, train Loss: {train_loss:.4e}, mean_l2: {train_mean_l2:.4e}"
+        writer.add_scalar('lr/lr', current_lr, epoch)
+        writer.add_scalar('Loss/train', train_loss, epoch)
+        writer.add_scalar('L2/train_mean_l2', train_mean_l2, epoch)
+
+        l2_details = []
+        rmse_details = []
+        for fname in fields:
+            l2_val = train_error[f"L2_{fname}"]
+            rmse_val = train_error[f"RMSE_{fname}"]
+            l2_details.append(f"{fname}: {l2_val:.4e}")
+            rmse_details.append(f"{fname}: {rmse_val:.4e}")
+            writer.add_scalar(f'L2/train_L2_{fname}', l2_val, epoch)
+            writer.add_scalar(f'RMSE/train_RMSE_{fname}', rmse_val, epoch)
+
+        print(log_str)
+        value_loss = train_error.get("value_loss", 0)
+        grad_loss = train_error.get("grad_loss", 0)
+        print(f"value_loss:{value_loss} | grad_loss:{grad_loss}")
+        print(f"L2 details: {', '.join(l2_details)}")
+        print(f"RMSE details: {', '.join(rmse_details)}")
+        print(f"each time step loss: {each_t_l2.tolist()}")
+        pf_info = f", pushforward extra={pf_extra}" if use_pushforward else ""
+        print(f"time pre train epoch/s:{training_time:.2f}, current_lr:{current_lr:.4e}{pf_info}")
+        print("--------------")
+
+        with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
+            file.write(f"Training, epoch: {epoch + 1}/{EPOCH}\n")
+            file.write(f"Train Loss: {train_loss:.4e}, mean_l2: {train_mean_l2:.4e}\n")
+            file.write(f"L2 details: {', '.join(l2_details)}\n")
+            file.write(f"RMSE details: {', '.join(rmse_details)}\n")
+            file.write(f"each time step loss: {each_t_l2.tolist()}\n")
+            file.write(f"time pre train epoch/s:{training_time:.2f}, current_lr:{current_lr:.4e}{pf_info}\n")
+
+        # Validation (using EMA model)
+        eval_every = args.train.get("eval_every", 5)
+        if (epoch + 1) % eval_every == 0 or epoch == 0 or (epoch + 1) == EPOCH:
+            start_time = time.time()
+
+            # Apply EMA weights for evaluation
+            ema.apply_shadow(model)
+            test_error = validate(args, model, test_dataloader, device, normalizer, epoch + 1)
+            ema.restore(model)
+
+            end_time = time.time()
+            val_time = (end_time - start_time)
+
+            test_mean_l2 = test_error['mean_l2']
+            test_each_t_l2 = test_error['each_l2']
+
+            test_l2_details = []
+            test_rmse_details = []
+            writer.add_scalar('L2/test_mean_l2', test_mean_l2, epoch)
+
+            for fname in fields:
+                l2_val = test_error[f"L2_{fname}"]
+                rmse_val = test_error[f"RMSE_{fname}"]
+                test_l2_details.append(f"{fname}: {l2_val:.4e}")
+                test_rmse_details.append(f"{fname}: {rmse_val:.4e}")
+                writer.add_scalar(f'L2/test_L2_{fname}', l2_val, epoch)
+                writer.add_scalar(f'RMSE/test_RMSE_{fname}', rmse_val, epoch)
+
+            print("---Inference (EMA)---")
+            print(f"Epoch: {epoch + 1}/{EPOCH}, test_mean_l2: {test_mean_l2:.4e}")
+            print(f"L2 details: {', '.join(test_l2_details)}")
+            print(f"RMSE details: {', '.join(test_rmse_details)}")
+            print(f"each time step loss: {test_each_t_l2.tolist()}")
+            print(f"time pre test epoch/s:{val_time:.2f}")
+            print("--------------")
+
+            with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
+                file.write(f"Inference(EMA), epoch: {epoch + 1}/{EPOCH}, test_mean_l2: {test_mean_l2:.4e}\n")
+                file.write(f"L2 details: {', '.join(test_l2_details)}\n")
+                file.write(f"RMSE details: {', '.join(test_rmse_details)}\n")
+                file.write(f"each time step loss: {test_each_t_l2.tolist()}\n")
+                file.write(f"time pre test epoch/s:{val_time:.2f}\n")
+
+            # Save Best
+            if args.if_save and test_mean_l2 < best_val_error:
+                best_val_error = test_mean_l2
+                ckpt = {
+                    'epoch': epoch + 1,
+                    'state_dict': model.state_dict(),
+                    'ema_shadow': ema.shadow,
+                    'optimizer': optimizer.state_dict(),
+                    'best_val_error': best_val_error,
+                    'config': args
+                }
+                torch.save(ckpt, f"{path_nn}/{args.name}_best.pt")
+                print(f"  >> New best! test_mean_l2={best_val_error:.4e}")
+
+        # Regular Save
+        if (epoch + 1) % 50 == 0 or (epoch + 1) == EPOCH:
+            if args.if_save:
+                ckpt = {
+                    'epoch': epoch + 1,
+                    'state_dict': model.state_dict(),
+                    'ema_shadow': ema.shadow,
+                    'optimizer': optimizer.state_dict(),
+                    'learning_rate': current_lr,
+                    'best_val_error': best_val_error,
+                }
+                torch.save(ckpt, f"{path_nn}/{args.name}_{epoch+1}.pt")
+
+    writer.close()
+
+
+if __name__ == "__main__":
+    cli_args = parse_args()
+    args = load_json_config(cli_args.config)
+
+    print(args)
+
+    path_logs = args.save_path + "/logs"
+    path_nn = args.save_path + "/nn"
+    path_record = args.save_path + "/record"
+
+    os.makedirs(args.save_path, exist_ok=True)
+    os.makedirs(path_logs, exist_ok=True)
+    os.makedirs(path_nn, exist_ok=True)
+    os.makedirs(path_record, exist_ok=True)
+
+    with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
+        file.write(f"{'='*20} Start (main_v2) {'='*20}\n")
+        file.write(str(args) + "\n")
+        file.write(f"Config file: {cli_args.config}\n")
+        file.write(f"time is {time.asctime(time.localtime(time.time()))}\n")
+
+    if args.seed is not None:
+        set_seed(args.seed)
+
+    main(args, path_logs, path_nn, path_record)
+
+    with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
+        file.write(f"time is {time.asctime(time.localtime(time.time()))}\n")

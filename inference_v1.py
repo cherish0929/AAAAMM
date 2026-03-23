@@ -13,10 +13,51 @@ import h5py
 from torch.amp import GradScaler, autocast # 引入 AMP 模块
 
 # 引入项目模块
-# from src.physgto_res import Model
-from src.physgto import Model
 from src.dataset import AeroGtoDataset
 from src.utils import load_json_config, set_seed
+
+
+def _build_model(model_cfg, cond_dim, default_dt, device):
+    """根据 config 中的 model.name 动态构建对应模型（兼容所有变体）"""
+    model_name = model_cfg.get("name", "PhysGTO")
+
+    if model_name == "PhysGTO":
+        from src.physgto import Model
+    elif model_name == "gto_res":
+        from src.physgto_res import Model
+    elif model_name == "gto_lnn":
+        from src.gto_lnn import Model
+    elif model_name == "gto_attnres_multi":
+        from src.physgto_attnres_multi import Model
+    elif model_name == "gto_attnres_multi_v2":
+        from src.physgto_attnres_multi_v2 import Model
+    elif model_name == "gto_res_attnres":
+        from src.physgto_res_attnres import Model
+    else:
+        raise ValueError(f"Unknown model name: {model_name}")
+
+    kwargs = dict(
+        space_size=model_cfg.get("space_size", 3),
+        pos_enc_dim=model_cfg.get("pos_enc_dim", 5),
+        cond_dim=cond_dim,
+        N_block=model_cfg.get("N_block", 4),
+        in_dim=model_cfg.get("in_dim", 4),
+        out_dim=model_cfg.get("out_dim", 4),
+        enc_dim=model_cfg.get("enc_dim", 128),
+        n_head=model_cfg.get("n_head", 4),
+        n_token=model_cfg.get("n_token", 64),
+        dt=model_cfg.get("dt", default_dt),
+    )
+
+    # AttnRes 系列需要额外参数
+    if model_name in ("gto_attnres_multi", "gto_attnres_multi_v2", "gto_res_attnres"):
+        kwargs["n_fields"] = model_cfg.get("n_fields", model_cfg.get("in_dim", 2))
+        kwargs["cross_attn_heads"] = model_cfg.get("cross_attn_heads", 4)
+
+    if model_name in ("gto_attnres_multi_v2", "gto_res_attnres"):
+        kwargs["attn_res_mode"] = model_cfg.get("attn_res_mode", "block_inter")
+
+    return Model(**kwargs).to(device)
 
 class AeroGtoPredictor:
     def __init__(self, config_path, mode="test", model_path=None, device_str="cuda"):
@@ -80,32 +121,33 @@ class AeroGtoPredictor:
         print("[Init] Building Model...")
         cond_dim = self.args.model.get("cond_dim") or self.dataset.cond_dim
         default_dt = self.args.model.get("dt", self.dataset.dt)
-        
-        self.model = Model(
-            space_size=self.args.model.get("space_size", 3),
-            pos_enc_dim=self.args.model.get("pos_enc_dim", 5),
-            cond_dim=cond_dim,
-            N_block=self.args.model.get("N_block", 4),
-            in_dim=self.args.model.get("in_dim", 4),
-            out_dim=self.args.model.get("out_dim", 4),
-            enc_dim=self.args.model.get("enc_dim", 128),
-            n_head=self.args.model.get("n_head", 4),
-            n_token=self.args.model.get("n_token", 64),
-            dt=self.args.model.get("dt", default_dt),
-        ).to(self.device)
 
-        # 3. 加载权重
+        self.model = _build_model(model_cfg, cond_dim, default_dt, self.device)
+
+        # 3. 加载权重（支持 EMA）
         if model_path is None:
             save_root = Path(self.args.save_path)
             model_path = save_root / "nn" / f"{self.args.name}_best.pt"
-        
+
         print(f"[Init] Loading weights from: {model_path}")
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Weight file not found: {model_path}")
-            
+
         checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
-        state_dict = checkpoint.get("state_dict", checkpoint)
-        self.model.load_state_dict(state_dict, strict=False)
+
+        # 优先使用 EMA 权重（main_v2 保存的 checkpoint 包含 ema_shadow）
+        if "ema_shadow" in checkpoint:
+            print("[Init] Loading EMA shadow weights.")
+            ema_shadow = checkpoint["ema_shadow"]
+            state_dict = self.model.state_dict()
+            for name in ema_shadow:
+                if name in state_dict:
+                    state_dict[name] = ema_shadow[name]
+            self.model.load_state_dict(state_dict, strict=False)
+        else:
+            state_dict = checkpoint.get("state_dict", checkpoint)
+            self.model.load_state_dict(state_dict, strict=False)
+
         self.model.eval()
         
         self.normalizer = self.dataset.normalizer
@@ -302,18 +344,27 @@ class AeroGtoPredictor:
             return
         
         # 如果调用方没给范围，则尝试自动给一个默认值
-        if vmin is None or vmax is None:
-            if field_name == "T":
-                vmin, vmax = 300, 3500
-            elif field_name in ["alpha.air", "alpha.titanium", "gamma_liquid"]:
-                vmin, vmax = 0, 1
-            else:
-                # all_data = np.concatenate([result_dict["pred"][..., f_idx], result_dict["gt"][..., f_idx]])
-                vmin = -1.0
-                vmax = 1.0
-                # if not np.isfinite(vmin) or not np.isfinite(vmax) or np.isclose(vmin, vmax):
-                #     vmin = np.nanmin(all_data)
-                #     vmax = np.nanmax(all_data)
+        field_limits = {
+            "T": (300, 3500),         # 温度：室温到沸点以上
+            "alpha.air": (0, 1),      # VOF: 0-1
+            "alpha.titanium": (0, 1), # VOF: 0-1
+            "gamma_liquid": (0, 1),   # 液相分数: 0-1
+        }
+
+        if field_name in field_limits:
+            vmin, vmax = field_limits[field_name]
+            # print(f"[GIF] Using fixed limits for {field_name}: {vmin} ~ {vmax}")
+        else:
+            # 自动计算全局范围，防止每一帧跳变
+            all_pred = result_dict["pred"][..., f_idx]
+            all_gt = result_dict["gt"][..., f_idx]
+            combined = np.concatenate([all_pred.reshape(-1), all_gt.reshape(-1)])
+            vmin, vmax = -1.0, 1.0
+            vmin = np.nanpercentile(combined, 1.0)
+            vmax = np.nanpercentile(combined, 99.0)
+            if np.isclose(vmin, vmax):
+                vmin = min(np.nanmin(all_pred), np.nanmin(all_gt))
+                vmax = max(np.nanmax(all_pred), np.nanmax(all_gt))
 
         pred_data = result_dict["pred"][time_step, :, f_idx]
         gt_data = result_dict["gt"][time_step, :, f_idx]
@@ -500,11 +551,11 @@ class AeroGtoPredictor:
             all_gt = result_dict["gt"][..., f_idx]
             combined = np.concatenate([all_pred.reshape(-1), all_gt.reshape(-1)])
             vmin, vmax = -1.0, 1.0
-            # vmin = np.nanpercentile(combined, 1.0)
-            # vmax = np.nanpercentile(combined, 99.0)
-            # if np.isclose(vmin, vmax):
-            #     vmin = min(np.nanmin(all_pred), np.nanmin(all_gt))
-            #     vmax = max(np.nanmax(all_pred), np.nanmax(all_gt))
+            vmin = np.nanpercentile(combined, 1.0)
+            vmax = np.nanpercentile(combined, 99.0)
+            if np.isclose(vmin, vmax):
+                vmin = min(np.nanmin(all_pred), np.nanmin(all_gt))
+                vmax = max(np.nanmax(all_pred), np.nanmax(all_gt))
             print(f"[GIF] Auto-detected global limits: {vmin:.2f} ~ {vmax:.2f}")
 
         frames = []
@@ -537,7 +588,7 @@ if __name__ == "__main__":
     MODE = "test"
     NAME = "config/aerogto_HR_easypool_v0.json"
     # === 配置区域 ===
-    CONFIG_PATH = f"config/aerogto_large_patch_version.json" 
+    CONFIG_PATH = f"config/config_attnres/gto_attnres_multi_v2_keyhole.json" 
     
     FIELD_TO_PLOT = None   # ["T", "Ux", "Uy", "Uz", "alpha.air", "alpha.titanium", "gamma_liquid"] 
     SLICE_AXIS = "z"        # 'x', 'y', 'z'
@@ -547,9 +598,9 @@ if __name__ == "__main__":
     try:
         predictor = AeroGtoPredictor(CONFIG_PATH, MODE)
         if FIELD_TO_PLOT is None:
-            OUT_DIR = f"result/inference_results/{predictor.args.name}/{MODE}/batch"
+            OUT_DIR = f"result/gto_attnres_results/{predictor.args.name}/{MODE}/batch"
         else:
-            OUT_DIR = f"result/inference_results/{predictor.args.name}/{MODE}/{FIELD_TO_PLOT}"
+            OUT_DIR = f"result/gto_attnres_results/{predictor.args.name}/{MODE}/{FIELD_TO_PLOT}"
         os.makedirs(OUT_DIR, exist_ok=True)
     except Exception as e:
         print(f"初始化失败: {e}")
@@ -558,45 +609,47 @@ if __name__ == "__main__":
         sys.exit(1)
     
     # SAMPLE_IDX = random.randint(0, len(predictor.dataset)-1)    
-    print(len(predictor.dataset))
-    SAMPLE_IDX = 35
-    # print(predictor.dataset[50]["conditions"])
-    # print(predictor.dataset[55]["conditions"])
-    # exit()
+    dataset_length = len(predictor.dataset); print(dataset_length)
+    sample_idxs = random.sample(range(0, dataset_length), 10)
+    for sample_idx in sample_idxs:
+        # print(predictor.dataset[50]["conditions"])
+        # print(predictor.dataset[55]["conditions"])
+        # exit()
 
-    # 1. 执行推理 (自动获取主物理场和边界场)
-    results = predictor.predict_rollout(sample_idx=SAMPLE_IDX, interface_field=INTERFACE_FIELD)
-    
-    # 2. 生成单帧图片 (例如第 5 步)
-    # for step in range(10):
-    #     # if step < results["pred"].shape[0]:
-    #     save_p = os.path.join(OUT_DIR, f"snapshot_sample{SAMPLE_IDX}_step{step}_{FIELD_TO_PLOT}_{SLICE_AXIS}.png")
-    #     predictor.plot_slice(results, time_step=step, field_name=FIELD_TO_PLOT, axis=SLICE_AXIS, slice_pos=SLICE_POS,
-    #                             vmin=0, vmax=4000, save_path=save_p)
+        # 1. 执行推理 (自动获取主物理场和边界场)
+        results = predictor.predict_rollout(sample_idx=sample_idx, interface_field=INTERFACE_FIELD)
+        
+        # 2. 生成单帧图片 (例如第 5 步)
+        for step in range(0, predictor.args.data.get("horizon_test", 10), 4):
+            # if step < results["pred"].shape[0]:
+            for field in predictor.fields:
+                save_p = os.path.join(OUT_DIR, f"snapshot_sample{sample_idx}_step{step}_{field}_{SLICE_AXIS}.png")
+                predictor.plot_slice(results, time_step=step, field_name=field, axis=SLICE_AXIS, slice_pos=SLICE_POS,
+                                        save_path=save_p)
 
-    # 3. 生成 GIF
-    if FIELD_TO_PLOT is None:
-        for field in predictor.fields:
-            gif_path = os.path.join(OUT_DIR, f"rollout_sample{SAMPLE_IDX}_{field}.gif")
-            # if os.path.exists(gif_path):
-            #     break
+        # 3. 生成 GIF
+        if FIELD_TO_PLOT is None:
+            for field in predictor.fields:
+                gif_path = os.path.join(OUT_DIR, f"rollout_sample{sample_idx}_{field}.gif")
+                # if os.path.exists(gif_path):
+                #     break
+                predictor.generate_gif(
+                    results, 
+                    field_name=field, 
+                    axis=SLICE_AXIS, 
+                    slice_pos=SLICE_POS, 
+                    git_path=gif_path,
+                    interface=False
+                )
+        else:
+            gif_path = os.path.join(OUT_DIR, f"rollout_sample{sample_idx}_{FIELD_TO_PLOT}.gif")
+            if os.path.exists(gif_path):
+                exit()
             predictor.generate_gif(
                 results, 
-                field_name=field, 
+                field_name=FIELD_TO_PLOT, 
                 axis=SLICE_AXIS, 
                 slice_pos=SLICE_POS, 
                 git_path=gif_path,
                 interface=False
             )
-    else:
-        gif_path = os.path.join(OUT_DIR, f"rollout_sample{SAMPLE_IDX}_{FIELD_TO_PLOT}.gif")
-        if os.path.exists(gif_path):
-            exit()
-        predictor.generate_gif(
-            results, 
-            field_name=FIELD_TO_PLOT, 
-            axis=SLICE_AXIS, 
-            slice_pos=SLICE_POS, 
-            git_path=gif_path,
-            interface=False
-        )
