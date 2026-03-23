@@ -193,20 +193,27 @@ class GNN(nn.Module):
 
 class GatedCrossAttention(nn.Module):
     """
-    门控 Cross-Field Attention (用于 block_inter 模式)
-    单步 MHA + 可学习门控 (初始化为 0)
+    门控 Projection-Inspired Cross-Field Attention (线性复杂度)
+    3步 Projection-Inspired + 门控, 复杂度 O(N x n_token)
     """
-    def __init__(self, enc_dim, n_heads=4):
+    def __init__(self, enc_dim, n_heads=4, n_token=64):
         super().__init__()
-        self.cross_attn = nn.MultiheadAttention(enc_dim, n_heads, batch_first=True)
-        self.ln_q = nn.LayerNorm(enc_dim)
-        self.ln_kv = nn.LayerNorm(enc_dim)
+        self.Q = nn.Parameter(torch.randn(n_token, enc_dim))
+        self.ln_other = nn.LayerNorm(enc_dim)
+        self.ln_self = nn.LayerNorm(enc_dim)
+        self.attn1 = nn.MultiheadAttention(enc_dim, n_heads, batch_first=True)
+        self.attn2 = nn.MultiheadAttention(enc_dim, n_heads, batch_first=True)
+        self.attn3 = nn.MultiheadAttention(enc_dim, n_heads, batch_first=True)
         self.gate = nn.Parameter(torch.zeros(1))
 
     def forward(self, V_self, V_other):
-        q = self.ln_q(V_self)
-        kv = self.ln_kv(V_other)
-        out, _ = self.cross_attn(q, kv, kv)
+        bs = V_self.shape[0]
+        Q = self.Q.unsqueeze(0).expand(bs, -1, -1)
+        other = self.ln_other(V_other)
+        self_normed = self.ln_self(V_self)
+        W, _ = self.attn1(Q, other, other)
+        W, _ = self.attn2(W, W, W)
+        out, _ = self.attn3(self_normed, W, W)
         return torch.tanh(self.gate) * out
 
 
@@ -452,7 +459,7 @@ class MultiFieldMixerBlock(nn.Module):
             ])
         else:
             self.cross_attns = nn.ModuleList([
-                GatedCrossAttention(enc_dim, n_heads=cross_attn_heads)
+                GatedCrossAttention(enc_dim, n_heads=cross_attn_heads, n_token=n_token)
                 for _ in range(n_fields)
             ])
 

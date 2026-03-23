@@ -203,19 +203,22 @@ class GNN(nn.Module):
 
 class GatedCrossAttention(nn.Module):
     """
-    门控 Cross-Field Attention
+    门控 Projection-Inspired Cross-Field Attention (线性复杂度)
 
-    相比 v1 的 3步 Projection-Inspired 方案：
-    - 简化为单步 MultiheadAttention（参数量减少 ~3x）
+    结合 v1 的 Projection-Inspired 方案 + 门控渐进耦合：
+    - 使用学习的 query token 作为中介，复杂度 O(N × n_token) 而非 O(N²)
     - 添加可学习标量门控 gate（初始化为 0）
     - 训练初期 gate≈0 → cross-attention 不干扰主分支
     - 训练后期 gate 逐渐增大 → 逐步引入跨场耦合
     """
-    def __init__(self, enc_dim, n_heads=4):
+    def __init__(self, enc_dim, n_heads=4, n_token=64):
         super().__init__()
-        self.cross_attn = nn.MultiheadAttention(enc_dim, n_heads, batch_first=True)
-        self.ln_q = nn.LayerNorm(enc_dim)
-        self.ln_kv = nn.LayerNorm(enc_dim)
+        self.Q = nn.Parameter(torch.randn(n_token, enc_dim))
+        self.ln_other = nn.LayerNorm(enc_dim)
+        self.ln_self = nn.LayerNorm(enc_dim)
+        self.attn1 = nn.MultiheadAttention(enc_dim, n_heads, batch_first=True)
+        self.attn2 = nn.MultiheadAttention(enc_dim, n_heads, batch_first=True)
+        self.attn3 = nn.MultiheadAttention(enc_dim, n_heads, batch_first=True)
         # 门控初始化为 0 → 训练开始时不影响主分支
         self.gate = nn.Parameter(torch.zeros(1))
 
@@ -223,11 +226,15 @@ class GatedCrossAttention(nn.Module):
         """
         V_self:  [bs, N, D] — 当前场
         V_other: [bs, N, D] — 另一个场
-        Returns: [bs, N, D] — 门控后的跨场信息
+        Returns: [bs, N, D] — 门控后的跨场信息 (线性复杂度)
         """
-        q = self.ln_q(V_self)
-        kv = self.ln_kv(V_other)
-        out, _ = self.cross_attn(q, kv, kv)
+        bs = V_self.shape[0]
+        Q = self.Q.unsqueeze(0).expand(bs, -1, -1)
+        other = self.ln_other(V_other)
+        self_normed = self.ln_self(V_self)
+        W, _ = self.attn1(Q, other, other)       # [bs, n_token, D]
+        W, _ = self.attn2(W, W, W)               # [bs, n_token, D]
+        out, _ = self.attn3(self_normed, W, W)    # [bs, N, D]
         return torch.tanh(self.gate) * out
 
 
@@ -389,7 +396,7 @@ class AttnResMixerBlock(nn.Module):
             ])
         else:
             self.cross_attns = nn.ModuleList([
-                GatedCrossAttention(enc_dim, n_heads=cross_attn_heads)
+                GatedCrossAttention(enc_dim, n_heads=cross_attn_heads, n_token=n_token)
                 for _ in range(n_fields)
             ])
 
