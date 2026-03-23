@@ -107,6 +107,10 @@ def get_model(args, device, cond_dim, default_dt):
         from src.gto_lnn import Model
     elif model_name == "gto_attnres_multi":
         from src.physgto_attnres_multi import Model
+    elif model_name == "gto_attnres_multi_v2":
+        from src.physgto_attnres_multi_v2 import Model
+    elif model_name == "gto_res_attnres":
+        from src.physgto_res_attnres import Model
 
     common_kwargs = dict(
         space_size=model_cfg.get("space_size", 3),
@@ -121,9 +125,12 @@ def get_model(args, device, cond_dim, default_dt):
         dt=model_cfg.get("dt", default_dt),
     )
 
-    if model_name == "gto_attnres_multi":
+    if model_name in ("gto_attnres_multi", "gto_attnres_multi_v2", "gto_res_attnres"):
         common_kwargs["n_fields"] = model_cfg.get("n_fields", model_cfg.get("in_dim", 2))
         common_kwargs["cross_attn_heads"] = model_cfg.get("cross_attn_heads", 4)
+
+    if model_name in ("gto_attnres_multi_v2", "gto_res_attnres"):
+        common_kwargs["attn_res_mode"] = model_cfg.get("attn_res_mode", "block_inter")
 
     model = Model(**common_kwargs).to(device)
 
