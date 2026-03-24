@@ -105,8 +105,10 @@ def get_model(args, device, cond_dim, default_dt):
         from src.physgto_res import Model
     elif model_name == "gto_lnn":
         from src.gto_lnn import Model
+    elif model_name == "gto_sparse":
+        from src.physgto_sparse import Model
     
-    model = Model(
+    base_kwargs = dict(
         space_size=model_cfg.get("space_size", 3),
         pos_enc_dim=model_cfg.get("pos_enc_dim", 5),
         cond_dim=cond_dim,
@@ -117,7 +119,15 @@ def get_model(args, device, cond_dim, default_dt):
         n_head=model_cfg.get("n_head", 4),
         n_token=model_cfg.get("n_token", 64),
         dt=model_cfg.get("dt", default_dt),
-    ).to(device)
+    )
+    if model_name == "gto_sparse":
+        base_kwargs.update(
+            K_ratio=model_cfg.get("K_ratio", 0.1),
+            knn_k=model_cfg.get("knn_k", 16),
+            decoder_mode=model_cfg.get("decoder_mode", "cross_attention"),
+            tau=model_cfg.get("tau", 1.0),
+        )
+    model = Model(**base_kwargs).to(device)
 
     load_path = model_cfg.get("load_path")
     checkpoint = None
