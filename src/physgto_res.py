@@ -29,7 +29,6 @@ def broadcast_dt(dt, ref_tensor):
         dt = dt.view(-1, 1, 1)
     elif dt.dim() == 2:
         dt = dt.unsqueeze(-1)
-
     return dt
 
 class MLP(nn.Module):
@@ -248,10 +247,24 @@ class GatedGNN(nn.Module):
         return node_embeddings, edge_embeddings
 
 
+class OperatorHead(nn.Module):
+    """A lightweight per-component head that maps (enc_dim) -> (state_size)."""
+    def __init__(self, enc_dim, state_size):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(enc_dim, enc_dim // 2),
+            nn.SiLU(),
+            nn.Linear(enc_dim // 2, state_size),
+        )
+    def forward(self, h):
+        return self.net(h)
+
+
 class Decoder(nn.Module):
     """
-    Deep per-component decoder with 2-layer gated residual backbone and
-    separate Ux/Uy/Uz heads.
+    NS-decomposed decoder for physgto_res.
+    Four operator heads (diffusion, convection, pressure, source) combined
+    with spatially-adaptive gating.
     """
     def __init__(self,
                  N = 4,
@@ -261,81 +274,103 @@ class Decoder(nn.Module):
         super().__init__()
 
         self.state_size = state_size
+        self.N = N
+        self.enc_dim = enc_dim
         in_dim = N * enc_dim + enc_s_dim
 
-        # Shared backbone with 2-layer gated residual
+        # Shared projection
         self.proj = nn.Linear(in_dim, enc_dim)
+        self.proj_norm = nn.LayerNorm(enc_dim)
 
-        self.res_block1 = nn.Sequential(
+        # ---- Diffusion branch (local, smooth) ----
+        self.diff_proj = nn.Linear(enc_dim + enc_s_dim, enc_dim)
+        self.diff_res = nn.Sequential(
+            nn.LayerNorm(enc_dim),
+            nn.Linear(enc_dim, enc_dim),
+            nn.SiLU(),
+            nn.Linear(enc_dim, enc_dim),
+        )
+        self.diff_head = OperatorHead(enc_dim, state_size)
+
+        # ---- Convection branch (nonlinear, velocity-dependent) ----
+        self.conv_res = nn.Sequential(
             nn.LayerNorm(enc_dim),
             nn.Linear(enc_dim, enc_dim * 2),
             nn.SiLU(),
             nn.Linear(enc_dim * 2, enc_dim),
         )
-        self.gate1 = nn.Sequential(
-            nn.Linear(enc_dim, enc_dim),
-            nn.Sigmoid(),
-        )
+        self.conv_gate = nn.Sequential(nn.Linear(enc_dim, enc_dim), nn.Sigmoid())
+        self.conv_head = OperatorHead(enc_dim, state_size)
 
-        self.res_block2 = nn.Sequential(
+        # ---- Pressure branch (global, long-range) ----
+        self.press_proj = nn.Linear(enc_dim + enc_s_dim, enc_dim)
+        self.press_res = nn.Sequential(
+            nn.LayerNorm(enc_dim),
+            nn.Linear(enc_dim, enc_dim),
+            nn.SiLU(),
+            nn.Linear(enc_dim, enc_dim),
+        )
+        self.press_head = OperatorHead(enc_dim, state_size)
+
+        # ---- Source branch (localized forces) ----
+        self.src_res1 = nn.Sequential(
             nn.LayerNorm(enc_dim),
             nn.Linear(enc_dim, enc_dim * 2),
             nn.SiLU(),
             nn.Linear(enc_dim * 2, enc_dim),
         )
-        self.gate2 = nn.Sequential(
+        self.src_gate1 = nn.Sequential(nn.Linear(enc_dim, enc_dim), nn.Sigmoid())
+        self.src_res2 = nn.Sequential(
+            nn.LayerNorm(enc_dim),
             nn.Linear(enc_dim, enc_dim),
-            nn.Sigmoid(),
+            nn.SiLU(),
+            nn.Linear(enc_dim, enc_dim),
         )
+        self.src_gate2 = nn.Sequential(nn.Linear(enc_dim, enc_dim), nn.Sigmoid())
+        self.src_head = OperatorHead(enc_dim, state_size)
 
-        self.backbone_norm = nn.LayerNorm(enc_dim)
-
-        # Per-component output heads with deeper architecture
-        self.heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(enc_dim, enc_dim),
-                nn.SiLU(),
-                nn.Linear(enc_dim, enc_dim // 2),
-                nn.SiLU(),
-                nn.Linear(enc_dim // 2, 1),
-            )
-            for _ in range(state_size)
-        ])
-
-        # Spatially-adaptive residual gate
-        self.spatial_gate = nn.Sequential(
+        # ---- Spatially-adaptive combination ----
+        self.combiner = nn.Sequential(
             nn.Linear(enc_dim, enc_dim // 2),
             nn.SiLU(),
-            nn.Linear(enc_dim // 2, state_size),
-            nn.Tanh(),
+            nn.Linear(enc_dim // 2, 4),
         )
 
     def forward(self, V_all, pos_enc):
-
-        # V_all.dim = [bs, n_block, N, enc_dim]
-        # pos_enc.dim = [bs, N, enc_s_dim]
         b, n_block, N, enc_dim = V_all.shape
-        V_all = V_all.permute(0, 2, 1, 3).reshape(b, N, -1)
-        h = self.proj(torch.cat([V_all, pos_enc], dim=-1))
 
-        # 2-layer gated residual
-        r1 = self.res_block1(h)
-        g1 = self.gate1(h)
-        h = h + g1 * r1
+        V_first = V_all[:, 0]
+        V_last = V_all[:, -1]
 
-        r2 = self.res_block2(h)
-        g2 = self.gate2(h)
-        h = h + g2 * r2
+        V_cat = V_all.permute(0, 2, 1, 3).reshape(b, N, -1)
+        h_full = self.proj_norm(self.proj(torch.cat([V_cat, pos_enc], dim=-1)))
 
-        h = self.backbone_norm(h)
+        # Diffusion
+        h_diff = self.diff_proj(torch.cat([V_last, pos_enc], dim=-1))
+        h_diff = h_diff + self.diff_res(h_diff)
+        delta_diff = self.diff_head(h_diff)
 
-        # Per-component prediction
-        components = [head(h) for head in self.heads]
-        raw_delta = torch.cat(components, dim=-1)
+        # Convection
+        r_conv = self.conv_res(h_full)
+        g_conv = self.conv_gate(h_full)
+        h_conv = h_full + g_conv * r_conv
+        delta_conv = self.conv_head(h_conv)
 
-        # Spatially-adaptive scaling
-        scale = self.spatial_gate(h)
-        delta = raw_delta * (1.0 + scale)
+        # Pressure
+        h_press = self.press_proj(torch.cat([V_first, pos_enc], dim=-1))
+        h_press = h_press + self.press_res(h_press)
+        delta_press = self.press_head(h_press)
+
+        # Source
+        h_src = h_full
+        h_src = h_src + self.src_gate1(h_src) * self.src_res1(h_src)
+        h_src = h_src + self.src_gate2(h_src) * self.src_res2(h_src)
+        delta_src = self.src_head(h_src)
+
+        # Combine
+        weights = F.softmax(self.combiner(h_full), dim=-1)
+        deltas = torch.stack([delta_diff, delta_conv, delta_press, delta_src], dim=2)
+        delta = (weights.unsqueeze(-1) * deltas).sum(dim=2)
 
         return delta
 
@@ -427,13 +462,15 @@ class Encoder(nn.Module):
         state_aug = torch.cat((state_in, node_pos, vel_mag, vel_sign), dim=-1)
         V = self.fv1(state_aug)
 
-        # FiLM conditioning
+        # FiLM conditioning (gamma clipped to prevent instability)
         time_film = self.film_time(time_i)
         t_gamma, t_beta = time_film.chunk(2, dim=-1)
+        t_gamma = torch.tanh(t_gamma) * 0.5  # gamma in [-0.5, 0.5]
         V = V * (1.0 + t_gamma.unsqueeze(-2)) + t_beta.unsqueeze(-2)
 
         cond_film = self.film_cond(conditions)
         c_gamma, c_beta = cond_film.chunk(2, dim=-1)
+        c_gamma = torch.tanh(c_gamma) * 0.5
         V = V * (1.0 + c_gamma.unsqueeze(-2)) + c_beta.unsqueeze(-2)
 
         # Edge embedding

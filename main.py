@@ -85,8 +85,15 @@ def get_model(args, device, cond_dim, default_dt):
         from src.physgto_res import Model
     elif model_name == "gto_lnn":
         from src.gto_lnn import Model
-    
-    model = Model(
+    elif model_name == "PhysGTO_attnres":
+        from src.physgto_attnres import Model
+    elif model_name == "PhysGTO_res_crossfield":
+        from src.physgto_res_crossfield import Model
+    elif model_name == "PhysGTO_crossfield":
+        from src.physgto_crossfield import Model
+
+    # Build base kwargs
+    model_kwargs = dict(
         space_size=model_cfg.get("space_size", 3),
         pos_enc_dim=model_cfg.get("pos_enc_dim", 5),
         cond_dim=cond_dim,
@@ -98,7 +105,17 @@ def get_model(args, device, cond_dim, default_dt):
         n_token=model_cfg.get("n_token", 64),
         dt=model_cfg.get("dt", default_dt),
         use_checkpoint=model_cfg.get("use_checkpoint", False),
-    ).to(device)
+    )
+
+    # AttnRes models accept residual_mode
+    if model_name in ("PhysGTO_attnres", "PhysGTO_res_crossfield", "PhysGTO_crossfield"):
+        model_kwargs["residual_mode"] = model_cfg.get("residual_mode", "block_attnres")
+
+    # CrossField model accepts n_fields
+    if model_name in ("PhysGTO_crossfield", "PhysGTO_res_crossfield"):
+        model_kwargs["n_fields"] = model_cfg.get("n_fields", len(args.data.get("fields", ["T"])))
+
+    model = Model(**model_kwargs).to(device)
 
     load_path = model_cfg.get("load_path")
 
@@ -154,10 +171,11 @@ def main(args, path_logs, path_nn, path_record):
         
     # optimizer & scheduler
     optimizer = AdamW(model.parameters(), lr=real_lr, weight_decay=real_lr/50.0)
+    lr_min_ratio = float(args.train.get("lr_min_ratio", 10.0))
     if EPOCH < 100:
         scheduler = CosineAnnealingLR(optimizer, T_max=EPOCH, eta_min=real_lr)
     else:
-        scheduler = CosineAnnealingLR(optimizer, T_max=EPOCH, eta_min=real_lr/50.0)
+        scheduler = CosineAnnealingLR(optimizer, T_max=EPOCH, eta_min=real_lr/lr_min_ratio)
 
     # AMP (mixed precision) setup
     use_amp = args.train.get("use_amp", False) and "cuda" in device_str

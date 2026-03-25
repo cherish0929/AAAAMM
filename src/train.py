@@ -6,32 +6,41 @@ from pathlib import Path
 
 VELOCITY_FIELD_NAMES = ("Ux", "Uy", "Uz")
 
-
-def _magnitude_aware_loss(pred, target, mask=None, base_weight=1.0, mag_scale=5.0):
+def _magnitude_aware_loss(pred, target, mask=None, base_weight=1.0, mag_scale=3.0):
     """
-    Loss that weights each node by the velocity magnitude of the ground truth.
-    Uses a FIXED reference scale (99th percentile per-sample) instead of batch max,
-    which stabilizes training by avoiding batch-dependent loss scaling.
+    Multi-scale loss: combines per-channel MSE + global Huber + magnitude weighting.
+    Key insight: MSE gives strong gradients for large errors, Huber smooths outliers,
+    and per-channel decomposition prevents Ux/Uy/Uz from competing.
     """
-    # Per-node velocity magnitude of ground truth: [B,T,N,1]
     gt_mag = torch.norm(target, dim=-1, keepdim=True)
-    # Use 99th percentile per sample (more robust than max, avoids outlier sensitivity)
-    # Flatten spatial+time dims, compute quantile per batch element
     B = gt_mag.shape[0]
+    C = target.shape[-1]
     flat_mag = gt_mag.reshape(B, -1)
     ref_scale = torch.quantile(flat_mag, 0.99, dim=1, keepdim=True).clamp_min(1e-6)
     ref_scale = ref_scale.view(B, 1, 1, 1)
 
-    # Normalized magnitude weight
+    # Moderate magnitude weighting
     w = base_weight + mag_scale * (gt_mag / ref_scale).clamp_max(1.0)
 
-    # Huber loss with smaller beta for better gradient signal on small errors
-    pointwise_loss = F.smooth_l1_loss(pred, target, reduction='none', beta=0.05)
+    # Per-channel MSE (each velocity component gets equal gradient signal)
+    per_ch_mse = (pred - target) ** 2  # [B, T, N, C]
+    # Global Huber for robustness
+    huber = F.smooth_l1_loss(pred, target, reduction='none', beta=0.15)
+
+    # Blend: channels-balanced MSE + Huber
+    pointwise_loss = 0.5 * per_ch_mse + 0.5 * huber
 
     weighted = pointwise_loss * w
     if mask is not None:
         weighted = weighted * mask
-        return weighted.sum() / mask.sum().clamp_min(1.0)
+        # Per-channel loss averaging (prevents one channel from dominating)
+        total_loss = 0.0
+        for c in range(C):
+            ch_w = weighted[..., c]
+            ch_m = mask[..., c]
+            ch_loss = ch_w.sum() / ch_m.sum().clamp_min(1.0)
+            total_loss = total_loss + ch_loss
+        return total_loss / C
     return weighted.mean()
 
 
@@ -578,7 +587,7 @@ def get_val_loss(args, model, fields, predict_hat, state, normalizer, node_pos_p
 
 def train(args, model, train_dataloader, optim, device, normalizer, epoch=0, scaler=None, use_amp=False):
     horizon = args.data.get("horizon_train", 1) if isinstance(args.data, dict) else getattr(args, "horizon_train", 1)
-    fields, data_mask = args.data.get("fields", ["T"]), args.data.get("mask", False)
+    fields, data_mask, data_mask_zero = args.data.get("fields", ["T"]), args.data.get("mask", False), args.data.get("zero_mask", False)
 
     # Teacher forcing with curriculum decay
     teacher_cfg = args.train.get("teacher", False)
@@ -645,6 +654,9 @@ def train(args, model, train_dataloader, optim, device, normalizer, epoch=0, sca
                         state[:, 1:, :, i][y_mask_bool] = 0.0
                         predict_hat[..., i][y_mask_bool] = 0.0
                         valid_mask[..., i][y_mask_bool] = 0.0
+
+            elif data_mask_zero: # mask 2.0: 为 0 的区域不参与loss计算
+                pass
 
             costs = get_train_loss(
                 args,

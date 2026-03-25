@@ -12,7 +12,6 @@ from pathlib import Path
 import h5py
 
 # 引入项目模块
-from src.physgto import Model
 from src.dataset import AeroGtoDataset
 from src.utils import load_json_config, set_seed
 
@@ -29,6 +28,7 @@ class AeroGtoPredictor:
 
         self.fields = data_cfg.get("fields", ["T"])
         space_dim = model_cfg.get("space_size", 3)
+        model_name = model_cfg.get("name", "PhysGTO")
         
         print("[Init] Loading Train Dataset (for Normalizer)...")
         # 即使是 inference，通常也需要 TrainSet 的统计数据来做 Normalizer
@@ -55,19 +55,41 @@ class AeroGtoPredictor:
         print("[Init] Building Model...")
         cond_dim = self.args.model.get("cond_dim") or self.dataset.cond_dim
         default_dt = self.args.model.get("dt", self.dataset.dt)
-        
-        self.model = Model(
-            space_size=self.args.model.get("space_size", 3),
-            pos_enc_dim=self.args.model.get("pos_enc_dim", 5),
+
+        if model_name == "PhysGTO":
+            from src.physgto import Model
+        elif model_name == "PhysGTO_res":
+            from src.physgto_res import Model
+        elif model_name == "gto_lnn":
+            from src.gto_lnn import Model
+        elif model_name == "PhysGTO_attnres":
+            from src.physgto_attnres import Model
+        elif model_name == "PhysGTO_res_attnres":
+            from physgto_res_crossfield import Model
+        elif model_name == "PhysGTO_crossfield":
+            from src.physgto_crossfield import Model
+
+        model_kwargs = dict(
+            space_size=model_cfg.get("space_size", 3),
+            pos_enc_dim=model_cfg.get("pos_enc_dim", 5),
             cond_dim=cond_dim,
-            N_block=self.args.model.get("N_block", 4),
-            in_dim=self.args.model.get("in_dim", 4),
-            out_dim=self.args.model.get("out_dim", 4),
-            enc_dim=self.args.model.get("enc_dim", 128),
-            n_head=self.args.model.get("n_head", 4),
-            n_token=self.args.model.get("n_token", 64),
-            dt=self.args.model.get("dt", default_dt),
-        ).to(self.device)
+            N_block=model_cfg.get("N_block", 4),
+            in_dim=model_cfg.get("in_dim", 4),
+            out_dim=model_cfg.get("out_dim", 4),
+            enc_dim=model_cfg.get("enc_dim", 128),
+            n_head=model_cfg.get("n_head", 4),
+            n_token=model_cfg.get("n_token", 64),
+            dt=model_cfg.get("dt", default_dt),
+            use_checkpoint=model_cfg.get("use_checkpoint", False),
+        )
+
+        if model_name in ("PhysGTO_attnres", "PhysGTO_res_attnres", "PhysGTO_crossfield"):
+            model_kwargs["residual_mode"] = model_cfg.get("residual_mode", "block_attnres")
+
+        if model_name == "PhysGTO_crossfield":
+            model_kwargs["n_fields"] = model_cfg.get("n_fields", len(self.args.data.get("fields", ["T"])))
+
+        self.model = Model(**model_kwargs).to(self.device)
 
         # 3. 加载权重
         if model_path is None:
@@ -320,7 +342,7 @@ class AeroGtoPredictor:
         # 速度场气态镂空 (NaN) 与 固态置零 (0.0)
         if is_velocity:
             # 1. 气态区域镂空
-            if gt_int is not None:
+            if self.args.data.get("mask", False) and gt_int is not None:
                 gas_mask = gt_int > 0.5
                 pred_data[gas_mask] = np.nan
                 gt_data[gas_mask] = np.nan
@@ -521,7 +543,7 @@ class AeroGtoPredictor:
 if __name__ == "__main__":
     MODE = "test"
     # === 配置区域 ===
-    CONFIG_PATH = f"config/velocity_v3.json" 
+    CONFIG_PATH = f"config/velocity_v6_crossfield.json" 
     
     FIELD_TO_PLOT = None   
     SLICE_AXIS = "z"        # 'x', 'y', 'z'
@@ -541,31 +563,32 @@ if __name__ == "__main__":
         traceback.print_exc()
         sys.exit(1)
     
-    print(len(predictor.dataset))
-    SAMPLE_IDX = 24
+    dataset_length = len(predictor.dataset); print(dataset_length)
+    sample_idxs = random.sample(range(0, dataset_length), 10)
 
-    results = predictor.predict_rollout(sample_idx=SAMPLE_IDX, interface_field=INTERFACE_FIELD)
+    for sample_idx in sample_idxs:
+        results = predictor.predict_rollout(sample_idx=sample_idx, interface_field=INTERFACE_FIELD)
     
-    if FIELD_TO_PLOT is None:
-        for field in predictor.fields:
-            gif_path = os.path.join(OUT_DIR, f"rollout_sample{SAMPLE_IDX}_{field}.gif")
+        if FIELD_TO_PLOT is None:
+            for field in predictor.fields:
+                gif_path = os.path.join(OUT_DIR, f"rollout_sample{sample_idx}_{field}.gif")
+                predictor.generate_gif(
+                    results, 
+                    field_name=field, 
+                    axis=SLICE_AXIS, 
+                    slice_pos=SLICE_POS, 
+                    git_path=gif_path,
+                    interface=True
+                )
+        else:
+            gif_path = os.path.join(OUT_DIR, f"rollout_sample{sample_idx}_{FIELD_TO_PLOT}.gif")
+            if os.path.exists(gif_path):
+                exit()
             predictor.generate_gif(
                 results, 
-                field_name=field, 
+                field_name=FIELD_TO_PLOT, 
                 axis=SLICE_AXIS, 
                 slice_pos=SLICE_POS, 
                 git_path=gif_path,
                 interface=True
             )
-    else:
-        gif_path = os.path.join(OUT_DIR, f"rollout_sample{SAMPLE_IDX}_{FIELD_TO_PLOT}.gif")
-        if os.path.exists(gif_path):
-            exit()
-        predictor.generate_gif(
-            results, 
-            field_name=FIELD_TO_PLOT, 
-            axis=SLICE_AXIS, 
-            slice_pos=SLICE_POS, 
-            git_path=gif_path,
-            interface=True
-        )

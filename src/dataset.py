@@ -220,6 +220,7 @@ class AeroGtoDataset(Dataset):
     ):
         super().__init__()
         assert mode in {"train", "test"}, "mode 只能为 train 或 test"
+        self.config = config
         self.mode = mode
         self.fields = config["fields"]
         self.input_steps = config["input_steps"]
@@ -481,6 +482,7 @@ class AeroGtoDataset(Dataset):
         return state_np, time_all, T_vals, alpha_vals, gamma_vals
     
     def __getitem__(self, idx):
+        data_mask, zero_mask = self.config.get("mask", False), self.config.get("zero_mask", False)
         file_id, start_idx = self.sample_keys[idx]
         path = self.file_paths[file_id]
         meta = self.meta_cache[path]
@@ -492,24 +494,18 @@ class AeroGtoDataset(Dataset):
         
         state_np, time_seq, T_np, alpha_np, gamma_np = self._load_data_with_aux(path, meta["indices"], start_idx)
 
-        state = torch.from_numpy(state_np)
-        T_t = torch.from_numpy(T_np) # [T, N]
-        alpha_t = torch.from_numpy(alpha_np) # [T, N]
-        gamma_t = torch.from_numpy(gamma_np) # [T, N]
-
+        state, T_t = torch.from_numpy(state_np), torch.from_numpy(T_np)
+        alpha_t, gamma_t = torch.from_numpy(alpha_np), torch.from_numpy(gamma_np)
         node_y = meta["node_pos"][:, 1] 
-        y_cutoff_mask = node_y > 1e-4
 
-        gas_mask = alpha_t > 0.6
-
-        solid_mask = (alpha_t < 1e-4) | (gamma_t < 1e-4) # 固相区域
-
+        y_cutoff_mask = node_y > 1e-4; gas_mask = alpha_t > 0.6; solid_mask = (alpha_t < 1e-4) | (gamma_t < 1e-4)
 
         # 不再在 dataset 中裁剪物理场，改为训练过程中不计算相应区域的 loss
         velocity_dead_zone = 1e-3
         vel_indices = [i for i, field in enumerate(self.fields) if field in ["Ux", "Uy", "Uz"]]
         if len(vel_indices) > 0:
             total_vel_abs = sum([state[..., i].abs() for i in vel_indices])
+
             dead_zone_mask = (total_vel_abs < velocity_dead_zone).view_as(gas_mask)
             gas_mask = gas_mask | dead_zone_mask
             
@@ -522,31 +518,31 @@ class AeroGtoDataset(Dataset):
 
         gamma_t[:, y_cutoff_mask] = 0.0
 
-        C = len(self.fields)
+        # C = len(self.fields)
         # 初始化一个[T, N, C]的权重矩阵
-        loss_weight = torch.ones((state.shape[0], state.shape[1], C), dtype=torch.float32)
+        # loss_weight = torch.ones((state.shape[0], state.shape[1], C), dtype=torch.float32)
         # loss_weight = torch.ones_like(state[..., 0:1])
         # loss_weight = torch.full_like(state[..., 0:1], 1e-6)
 
-        # 1） 熔池核心区
-        temp_mask = T_t > 301
-        # 2） 熔池核心区
-        melt_pool_mask = (gamma_t > 0.49) & (alpha_t < 0.51)
-        # 3） 整体金属区 用于预测分界线
-        metal_mask = (alpha_t > 0.49) & (alpha_t < 0.55)
+        # # 1） 熔池核心区
+        # temp_mask = T_t > 301
+        # # 2） 熔池核心区
+        # melt_pool_mask = (gamma_t > 0.49) & (alpha_t < 0.51)
+        # # 3） 整体金属区 用于预测分界线
+        # metal_mask = (alpha_t > 0.49) & (alpha_t < 0.55)
 
         # loss_weight[roi_mask] = 0.5 # high_weight
-
-        for i, field in enumerate(self.fields):
-            if field == "T":
-                loss_weight[..., i] = 1e-4
-                loss_weight[..., i][temp_mask] = 1.0
-            elif field in ["Ux", "Uy", "Uz"]:
-                loss_weight[..., i] = 1e-4  # 背景极低权重
-                loss_weight[..., i][melt_pool_mask] = 1.0
-            elif field in ["alpha.air"]: # , "alpha.titanium", "gamma_liquid"
-                loss_weight[..., i] = 1e-4
-                loss_weight[..., i][metal_mask] = 1.0
+        
+        # for i, field in enumerate(self.fields):
+        #     if field == "T":
+        #         loss_weight[..., i] = 1e-4
+        #         loss_weight[..., i][temp_mask] = 1.0
+        #     elif field in ["Ux", "Uy", "Uz"]:
+        #         loss_weight[..., i] = 1e-4  # 背景极低权重
+        #         loss_weight[..., i][melt_pool_mask] = 1.0
+        #     elif field in ["alpha.air"]: # , "alpha.titanium", "gamma_liquid"
+        #         loss_weight[..., i] = 1e-4
+        #         loss_weight[..., i][metal_mask] = 1.0
 
         if self.normalize:
             state = self.normalizer.normalize(state)
