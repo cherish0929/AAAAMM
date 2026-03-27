@@ -105,7 +105,7 @@ def get_train_loss(fields, predict_hat, label_gt, normalizer, weight_cfg: dict):
         losses["value_loss"] = torch.mean(error_map)
         
     else:
-        losses["value_loss"] = F.mse_loss(pred_fp32, label_fp32,)
+        losses["value_loss"] = F.mse_loss(pred_fp32, label_fp32)
 
     if weight_cfg.get("gradient", False):
         grad_loss_total = 0
@@ -114,8 +114,10 @@ def get_train_loss(fields, predict_hat, label_gt, normalizer, weight_cfg: dict):
         for idx, fld in enumerate(fields):
             if fld in grad_weights:
                 gw = float(grad_weights[fld])
-                pred_gx, pred_gy, pred_gz = compute_spatial_gradient_3d(fld_pred, grid_shape)
-                gt_gx, gt_gy, gt_gz       = compute_spatial_gradient_3d(fld_gt, grid_shape)
+                fld_pred_g = pred_fp32[..., idx:idx+1]
+                fld_gt_g = label_fp32[..., idx:idx+1]
+                pred_gx, pred_gy, pred_gz = compute_spatial_gradient_3d(fld_pred_g, grid_shape)
+                gt_gx, gt_gy, gt_gz       = compute_spatial_gradient_3d(fld_gt_g, grid_shape)
                 # 梯度的纯 MSE
                 loss_gx = F.mse_loss(pred_gx, gt_gx, reduction='mean')
                 loss_gy = F.mse_loss(pred_gy, gt_gy, reduction='mean')

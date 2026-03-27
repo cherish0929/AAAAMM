@@ -418,7 +418,7 @@ class Model(nn.Module):
             else:
                 state_pred = self.forward(state_t, node_pos, edges, time_i, conditions, pos_enc, c_enc, dt)
 
-            outputs.append(state_t)
+            outputs.append(state_pred)
 
             if t < T - 1:
                 if teacher_forcing and gt_states is not None:

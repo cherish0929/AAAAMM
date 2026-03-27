@@ -32,6 +32,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 
+from torch.amp import GradScaler, autocast
 from torch_scatter import scatter_mean
 from torch.utils.checkpoint import checkpoint
 
@@ -717,7 +718,10 @@ class Model(nn.Module):
         V_all_list = self.mixer(V_list, E, edges_long, pos_enc)
         v_pred = self.decoder(V_all_list, pos_enc)
 
-        state_pred = state_in + v_pred
+        with autocast(device_type="cuda", enabled=False):
+            state_pred = state_in.float() + v_pred.float() * dt_tensor.float()
+            
+        # state_pred = state_in + v_pred
         return state_pred
 
     def autoregressive(self,

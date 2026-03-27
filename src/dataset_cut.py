@@ -62,7 +62,7 @@ def _compute_downsample_indices(grid_shape: Tuple[int, int, int], stride: Tuple[
     return np.asarray(indices, dtype=np.int32), ds_shape
 
 
-def _build_grid_edges(ds_shape: Tuple[int, int, int], sample_ratio=0.6) -> torch.Tensor:
+def _build_grid_edges(ds_shape: Tuple[int, int, int], sample_ratio=1.0) -> torch.Tensor:
     """基于裁剪后的网格动态生成六向邻接边"""
     nx, ny, nz = ds_shape
     idx_grid = np.arange(nx * ny * nz).reshape(nz, ny, nx)
@@ -209,6 +209,7 @@ class CutAeroGtoDataset(Dataset):
         self.meta_cache = {}
         self.sample_keys = []
         self.max_start_per_file = []
+        self.dt_scale = 5000 if self.config.get("dt_scale", False) else 1
         self.edge_sample_ratio = self.config.get("edge_sample_ratio", 1.0)
 
 
@@ -228,7 +229,7 @@ class CutAeroGtoDataset(Dataset):
         example_meta = next(iter(self.meta_cache.values()))
         self.cond_dim = example_meta["conditions"].shape[-1]
         self.node_num = example_meta["node_pos_3d"].size
-        self.dt = example_meta["dt"]
+        self.dt = example_meta["dt"] * self.dt_scale
         num_channels = len(self.fields)
         
         if self.normalize and self.mode == "train":
@@ -340,7 +341,7 @@ class CutAeroGtoDataset(Dataset):
         if 'state/gamma_liquid' in f:
             gamma = f['state/gamma_liquid'][time_idx][:, indices, 0].reshape(-1, nz, ny, nx)
             active_mask |= np.any(np.abs(gamma) > 1e-3, axis=0)
-            # print_current_bounds("2.叠加液相(>1e-4)", active_mask)
+            print_current_bounds("2.叠加液相(>1e-4)", active_mask)
 
         # gas_mask = None
         # if 'state/alpha.air' in f:
@@ -448,14 +449,15 @@ class CutAeroGtoDataset(Dataset):
         time_tensor = torch.from_numpy(rel_time.astype(np.float32)).unsqueeze(-1)
         
         sample = {
-            "dt": meta['dt'] * self.time_stride,
+            "dt": meta['dt'] * self.time_stride * self.dt_scale,
             "state": state,          
-            "time_seq": time_tensor,  
+            "time_seq": time_tensor * self.dt_scale,  
             "node_pos": node_pos, 
             "edges": edges,          
             "node_type": node_type,  
             "conditions": meta["conditions"],
             "ds_shape": [nx, ny, nz],
+            "cut_shape": [nx_new, ny_new, nz_new],
             "grid_shape": torch.Tensor([nx_new, ny_new, nz_new])
         }
         return sample
@@ -469,6 +471,7 @@ class CutAeroGtoDataset(Dataset):
 # t0 = time.time()
 
 # test_dataset = CutAeroGtoDataset(
+#         data_cfg=data_cfg,
 #         file_list=data_cfg["train_list"],
 #         mode="train",
 #         fields=data_cfg.get("fields", ["T"]),

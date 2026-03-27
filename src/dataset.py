@@ -261,6 +261,7 @@ class AeroGtoDataset(Dataset):
         self.meta_cache = {}
         self.sample_keys = []
         self.max_start_per_file = []
+        self.dt_scale = 5000 if self.config.get("dt_scale", False) else 1
         self.edge_sample_ratio = self.config.get("edge_sample_ratio", 1.0)
 
         for file_id, path in enumerate(self.file_paths):
@@ -280,7 +281,7 @@ class AeroGtoDataset(Dataset):
         example_meta = next(iter(self.meta_cache.values()))
         self.cond_dim = example_meta["conditions"].shape[-1]
         self.node_num = example_meta["node_pos"].shape[0]
-        self.dt = example_meta["dt"]
+        self.dt = example_meta["dt"] * self.dt_scale
         num_channels = len(self.fields)
         
         if self.normalize and self.mode == "train":
@@ -437,9 +438,9 @@ class AeroGtoDataset(Dataset):
         rel_time = time_seq[1:] - time_seq[0]
         time_tensor = torch.from_numpy(rel_time.astype(np.float32)).unsqueeze(-1)
         sample = {
-            "dt": meta['dt'] * self.time_stride,
+            "dt": meta['dt'] * self.time_stride * self.dt_scale,
             "state": state,  # [1 + horizon, N, 4]
-            "time_seq": time_tensor,  # [horizon, 1]
+            "time_seq": time_tensor * self.dt_scale,  # [horizon, 1]
             "node_pos": node_pos,
             "edges": meta["edges"],
             "node_type": meta["node_type"],

@@ -551,11 +551,11 @@ class AeroGtoPredictor:
             all_gt = result_dict["gt"][..., f_idx]
             combined = np.concatenate([all_pred.reshape(-1), all_gt.reshape(-1)])
             vmin, vmax = -1.0, 1.0
-            vmin = np.nanpercentile(combined, 1.0)
-            vmax = np.nanpercentile(combined, 99.0)
-            if np.isclose(vmin, vmax):
-                vmin = min(np.nanmin(all_pred), np.nanmin(all_gt))
-                vmax = max(np.nanmax(all_pred), np.nanmax(all_gt))
+            # vmin = np.nanpercentile(combined, 1.0)
+            # vmax = np.nanpercentile(combined, 99.0)
+            # if np.isclose(vmin, vmax):
+            #     vmin = min(np.nanmin(all_pred), np.nanmin(all_gt))
+            #     vmax = max(np.nanmax(all_pred), np.nanmax(all_gt))
             print(f"[GIF] Auto-detected global limits: {vmin:.2f} ~ {vmax:.2f}")
 
         frames = []
@@ -585,10 +585,10 @@ class AeroGtoPredictor:
             print("[GIF] Error: No frames generated.")
 
 if __name__ == "__main__":
-    MODE = "test"
+    MODE = "train"
     NAME = "config/aerogto_HR_easypool_v0.json"
     # === 配置区域 ===
-    CONFIG_PATH = f"config/config_attnres/gto_attnres_multi_v2_keyhole.json" 
+    CONFIG_PATH = f"config/lnn_large_patch_easypool.json" 
     
     FIELD_TO_PLOT = None   # ["T", "Ux", "Uy", "Uz", "alpha.air", "alpha.titanium", "gamma_liquid"] 
     SLICE_AXIS = "z"        # 'x', 'y', 'z'
@@ -598,9 +598,9 @@ if __name__ == "__main__":
     try:
         predictor = AeroGtoPredictor(CONFIG_PATH, MODE)
         if FIELD_TO_PLOT is None:
-            OUT_DIR = f"result/gto_attnres_results/{predictor.args.name}/{MODE}/batch"
+            OUT_DIR = f"result/task_0326/{predictor.args.name}/{MODE}/batch"
         else:
-            OUT_DIR = f"result/gto_attnres_results/{predictor.args.name}/{MODE}/{FIELD_TO_PLOT}"
+            OUT_DIR = f"result/task_0326/{predictor.args.name}/{MODE}/{FIELD_TO_PLOT}"
         os.makedirs(OUT_DIR, exist_ok=True)
     except Exception as e:
         print(f"初始化失败: {e}")
@@ -610,7 +610,7 @@ if __name__ == "__main__":
     
     # SAMPLE_IDX = random.randint(0, len(predictor.dataset)-1)    
     dataset_length = len(predictor.dataset); print(dataset_length)
-    sample_idxs = random.sample(range(0, dataset_length), 10)
+    sample_idxs = random.sample(range(0, dataset_length), 4)
     for sample_idx in sample_idxs:
         # print(predictor.dataset[50]["conditions"])
         # print(predictor.dataset[55]["conditions"])
@@ -620,12 +620,12 @@ if __name__ == "__main__":
         results = predictor.predict_rollout(sample_idx=sample_idx, interface_field=INTERFACE_FIELD)
         
         # 2. 生成单帧图片 (例如第 5 步)
-        for step in range(0, predictor.args.data.get("horizon_test", 10), 4):
-            # if step < results["pred"].shape[0]:
-            for field in predictor.fields:
-                save_p = os.path.join(OUT_DIR, f"snapshot_sample{sample_idx}_step{step}_{field}_{SLICE_AXIS}.png")
-                predictor.plot_slice(results, time_step=step, field_name=field, axis=SLICE_AXIS, slice_pos=SLICE_POS,
-                                        save_path=save_p)
+        # for step in range(0, predictor.args.data.get("horizon_test", 10), 4):
+        #     # if step < results["pred"].shape[0]:
+        #     for field in predictor.fields:
+        #         save_p = os.path.join(OUT_DIR, f"snapshot_sample{sample_idx}_step{step}_{field}_{SLICE_AXIS}.png")
+        #         predictor.plot_slice(results, time_step=step, field_name=field, axis=SLICE_AXIS, slice_pos=SLICE_POS,
+        #                                 save_path=save_p)
 
         # 3. 生成 GIF
         if FIELD_TO_PLOT is None:

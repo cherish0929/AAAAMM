@@ -582,7 +582,7 @@ if __name__ == "__main__":
     MODE = "test"
     NAME = "config/aerogto_HR_easypool_v0.json"
     # === 配置区域 ===
-    CONFIG_PATH = f"config/config_0319/gto_res_cut_keyhole_use_amp_check.json" 
+    CONFIG_PATH = f"config/aerogto_cut_easypool_relative_scale_res.json" 
     
     FIELD_TO_PLOT = None   # ["T", "Ux", "Uy", "Uz", "alpha.air", "alpha.titanium", "gamma_liquid"] 
     SLICE_AXIS = "z"        # 'x', 'y', 'z'
@@ -604,7 +604,7 @@ if __name__ == "__main__":
     
     # SAMPLE_IDX = random.randint(0, len(predictor.dataset)-1)    
     print(len(predictor.dataset))
-    SAMPLE_IDX = 27
+    SAMPLE_IDX = 30
     # print(predictor.dataset[50]["conditions"])
     # print(predictor.dataset[55]["conditions"])
     # exit()

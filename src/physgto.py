@@ -4,12 +4,13 @@ import numpy as np
 
 from torch_scatter import scatter_mean
 from torch.utils.checkpoint import checkpoint
+from torch.amp import GradScaler, autocast
 
 def get_edge_info(edges, node_pos):
     senders = torch.gather(node_pos, -2, edges[..., 0].unsqueeze(-1).expand(-1, -1, node_pos.shape[-1]))
     receivers = torch.gather(node_pos, -2, edges[..., 1].unsqueeze(-1).expand(-1, -1, node_pos.shape[-1]))
     d = receivers - senders
-    norm = torch.sqrt((d ** 2).sum(-1, keepdims=True) + 1e-8)
+    norm = torch.sqrt((d ** 2).sum(-1, keepdims=True))
     # distance_2 = -distance_1
     E = torch.cat([d, -d, norm], dim=-1)
     return E
@@ -345,7 +346,7 @@ class Model(nn.Module):
         V_all = self.mixer(V, E, edges_long, pos_enc)
         
         v_pred = self.decoder(V_all, pos_enc)
-        
+
         # if self.stepper_scheme == "euler":
         if dt is None: dt = self.dt  # 没有输入用默认 dt
         elif len(dt.shape) == 1: dt = dt.view(-1, 1, 1)
@@ -402,4 +403,3 @@ class Model(nn.Module):
 # 均匀化
 # 二维到三维演化
 # 简单的算例
-

@@ -53,6 +53,16 @@ def FourierEmbedding(pos, pos_start, pos_length):
     embedding = embedding.view(*original_shape[:-1], -1)
     return torch.cat([embedding, pos], dim=-1)
 
+def FourierLinearEmbedding(info, max_freq, length):
+    original_shape = info.shape
+    new_info = info.reshape(-1, original_shape[-1])
+    freq = torch.linspace(1, max_freq, length)
+    cos_feat = torch.cos(freq.view(1, 1, -1) * new_info.unsqueeze(-1))
+    sin_feat = torch.sin(freq.view(1, 1, -1) * new_info.unsqueeze(-1))
+    embedding = torch.cat([cos_feat, sin_feat], dim=-1)
+    embedding = embedding.view(*original_shape[:-1], -1)
+    return torch.cat([embedding, info], dim=-1)
+
 
 # =============================================================================
 # AttnRes 核心组件
@@ -284,8 +294,13 @@ class MultiFieldEncoder(nn.Module):
 
         self.fv_time = MLP(input_size=enc_t_dim, output_size=enc_dim, act='SiLU', layer_norm=False)
         self.fv_cond = MLP(input_size=enc_c_dim, output_size=enc_dim, act='SiLU', layer_norm=False)
-        self.fuse_para = MLP(input_size=enc_dim * 2, output_size=enc_dim, act='SiLU', layer_norm=False)
+        self.fuse_para = MLP(input_size=enc_dim * 2, output_size=enc_dim * 2, act='SiLU', layer_norm=False)
         self.fe = MLP(input_size=2 * space_size + 1, output_size=enc_dim, n_hidden=1, act='SiLU', layer_norm=False)
+
+        # LayerNorm 层
+        self.field_norms = nn.ModuleList([nn.LayerNorm(enc_dim) for _ in range(n_fields)])
+
+        self.exchange_norms = nn.ModuleList([nn.LayerNorm(enc_dim) for _ in range(n_fields)])
 
         # 场间信息交换 (门控)
         self.field_exchange = nn.ModuleList([
@@ -300,14 +315,18 @@ class MultiFieldEncoder(nn.Module):
         time_enc = self.fv_time(time_i)
         cond_enc = self.fv_cond(conditions) # [B, 128]
 
+        # FiLM 调制，时间参数决定当前阶段
         h = torch.cat([cond_enc, time_enc], dim=-1) # [B, 256]
-        para_enc = self.fuse_para(h) # [B, 128], 不强迫处于同一语义空间
+        para = self.fuse_para(h) # [B, 128], 不强迫处于同一语义空间
+        gamma, beta = para.chunk(2, dim=-1) # [B, 128] / [B, 128]
 
         V_list = []
         for i in range(self.n_fields):
             field_i = state_in[..., i:i+1]
             inp = torch.cat([field_i, node_pos], dim=-1)
-            V_i = self.fv_fields[i](inp) + time_enc.unsqueeze(-2) + cond_enc.unsqueeze(-2)
+            V_local = self.fv_fields[i](inp)
+            V_i = gamma.unsqueeze(-2) * V_local + beta.unsqueeze(-2)
+            V_i = self.field_norms[i](V_i)
             V_list.append(V_i)
 
         # 场间信息交换
@@ -316,7 +335,9 @@ class MultiFieldEncoder(nn.Module):
             other_sum = sum(V_list[j] for j in range(self.n_fields) if j != i)
             exchange_info = self.field_exchange[i](other_sum)
             gate = torch.tanh(self.field_exchange_gate[i])
-            V_exchanged.append(V_list[i] + gate * exchange_info)
+            V_new = V_list[i] + gate * exchange_info
+            V_new = self.exchange_norms[i](V_new)
+            V_exchanged.append(V_new)
 
         E = self.fe(get_edge_info(edges, node_pos))
         return V_exchanged, E
@@ -328,10 +349,10 @@ class MultiFieldEncoder(nn.Module):
 
 class Decoder(nn.Module):
     """单场 Decoder (与 physgto_res.py 一致)"""
-    def __init__(self, N=4, enc_dim=128, enc_s_dim=10, state_size=1):
+    def __init__(self, n_block=4, enc_dim=128, enc_s_dim=10, state_size=1):
         super().__init__()
         self.delta_net = nn.Sequential(
-            nn.Linear(N * enc_dim + enc_s_dim, enc_dim),
+            nn.Linear(n_block * enc_dim + enc_s_dim, enc_dim),
             nn.SiLU(),
             nn.Linear(enc_dim, enc_dim),
             nn.SiLU(),
@@ -341,7 +362,7 @@ class Decoder(nn.Module):
     def forward(self, V_all, pos_enc):
         b, n_block, N, enc_dim = V_all.shape
         V_all = V_all.permute(0, 2, 1, 3).reshape(b, N, -1)
-        V = self.delta_net(torch.cat([V_all, pos_enc], dim=-1))
+        V = self.delta_net(torch.cat([V_all, pos_enc], dim=-1)) # 避免位置细节变模糊
         return V
 
 
@@ -351,7 +372,7 @@ class MultiFieldDecoder(nn.Module):
         super().__init__()
         self.n_fields = n_fields
         self.decoders = nn.ModuleList([
-            Decoder(N=N_block, enc_dim=enc_dim, enc_s_dim=enc_s_dim, state_size=1)
+            Decoder(n_block=N_block, enc_dim=enc_dim, enc_s_dim=enc_s_dim, state_size=1)
             for _ in range(n_fields)
         ])
 
@@ -714,7 +735,7 @@ class Model(nn.Module):
 
         # Decoder
         if self.n_fields == 1:
-            self.decoder = Decoder(N=N_block, enc_dim=enc_dim, enc_s_dim=enc_s_dim, state_size=out_dim)
+            self.decoder = Decoder(n_block=N_block, enc_dim=enc_dim, enc_s_dim=enc_s_dim, state_size=out_dim)
         else:
             self.decoder = MultiFieldDecoder(
                 N_block=N_block, enc_dim=enc_dim, enc_s_dim=enc_s_dim, n_fields=self.n_fields,
