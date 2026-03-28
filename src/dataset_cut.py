@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .utils import ChannelNormalizer
+from .utils import ChannelNormalizer, build_active_mask
 
 
 def _read_file_list(file_list: Iterable[str]) -> List[str]:
@@ -204,6 +204,8 @@ class CutAeroGtoDataset(Dataset):
         self.samples_per_file = samples_per_file
         self.norm_cache = norm_cache
         self.margin = margin
+
+        self.mask_cfg = data_cfg.get("active_mask", None)
 
         self.file_paths = _read_file_list(file_list)
         self.meta_cache = {}
@@ -431,6 +433,8 @@ class CutAeroGtoDataset(Dataset):
         node_pos = torch.from_numpy(crop_pos).reshape(N_new, 3)
         node_type = torch.from_numpy(crop_type).reshape(N_new, 1)
 
+        active_mask = build_active_mask(state, self.fields, self.mask_cfg)
+
         # 5. 归一化 (位置依然使用全场极值)
         if self.normalize:
             state = self.normalizer.normalize(state)
@@ -450,16 +454,18 @@ class CutAeroGtoDataset(Dataset):
         
         sample = {
             "dt": meta['dt'] * self.time_stride * self.dt_scale,
-            "state": state,          
-            "time_seq": time_tensor * self.dt_scale,  
-            "node_pos": node_pos, 
-            "edges": edges,          
-            "node_type": node_type,  
+            "state": state,
+            "time_seq": time_tensor * self.dt_scale,
+            "node_pos": node_pos,
+            "edges": edges,
+            "node_type": node_type,
             "conditions": meta["conditions"],
             "ds_shape": [nx, ny, nz],
             "cut_shape": [nx_new, ny_new, nz_new],
             "grid_shape": torch.Tensor([nx_new, ny_new, nz_new])
         }
+        if active_mask is not None:
+            sample["active_mask"] = active_mask
         return sample
 
 # from utils import load_json_config

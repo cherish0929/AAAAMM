@@ -32,7 +32,7 @@ from torch.optim import AdamW
 from src.dataset import AeroGtoDataset
 from src.dataset_2d import AeroGtoDataset2D
 from src.dataset_cut import CutAeroGtoDataset
-from src.train import train, validate, get_train_loss
+from src.train import train, validate, get_train_loss, _init_region_agg, _accumulate_region, _finalize_region
 from src.utils import set_seed, init_weights, parse_args, load_json_config
 
 
@@ -135,6 +135,7 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
     agg["num"] = 0
     agg["value_loss"] = 0.0
     agg["grad_loss"] = 0.0
+    has_region = False
 
     model.train()
     normalizer.to(device)
@@ -152,9 +153,19 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
         if weight_loss.get("gradient", False):
             weight_loss["grid_shape"] = batch['grid_shape'].numpy()
 
+        active_mask = batch.get("active_mask")
+        if active_mask is not None:
+            active_mask = active_mask[:, 1:].to(device)
+            if not has_region:
+                _init_region_agg(agg, fields)
+                has_region = True
+
         batch_num = state.shape[0]
         T_total = time_seq.shape[1]
         T_pf = min(base_horizon + extra_steps, T_total)
+
+        # Slice active_mask for base horizon
+        base_mask = active_mask[:, :base_horizon] if active_mask is not None else None
 
         if use_amp:
             with autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -162,15 +173,16 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
                     state[:, 0], node_pos, edges, time_seq[:, :T_pf], conditions, dt, check_point
                 )
                 # Loss on original horizon
-                costs = get_train_loss(fields, predict_hat[:, :base_horizon], state[:, 1:base_horizon+1], normalizer, weight_loss)
+                costs = get_train_loss(fields, predict_hat[:, :base_horizon], state[:, 1:base_horizon+1], normalizer, weight_loss, active_mask=base_mask)
                 loss_base = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
 
                 # Loss on extra steps (pushforward)
                 if T_pf > base_horizon and state.shape[1] > base_horizon + 1:
                     T_extra = min(T_pf, state.shape[1] - 1)
+                    pf_mask = active_mask[:, base_horizon:T_extra] if active_mask is not None else None
                     costs_pf = get_train_loss(
                         fields, predict_hat[:, base_horizon:T_extra],
-                        state[:, base_horizon+1:T_extra+1], normalizer, weight_loss
+                        state[:, base_horizon+1:T_extra+1], normalizer, weight_loss, active_mask=pf_mask
                     )
                     loss_pf = costs_pf["value_loss"] + grad_loss_weight * costs_pf["grad_loss"]
                     total_loss = loss_base + 0.5 * loss_pf  # pushforward weighted less
@@ -185,14 +197,15 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
             predict_hat = model.autoregressive(
                 state[:, 0], node_pos, edges, time_seq[:, :T_pf], conditions, dt, check_point
             )
-            costs = get_train_loss(fields, predict_hat[:, :base_horizon], state[:, 1:base_horizon+1], normalizer, weight_loss)
+            costs = get_train_loss(fields, predict_hat[:, :base_horizon], state[:, 1:base_horizon+1], normalizer, weight_loss, active_mask=base_mask)
             loss_base = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
 
             if T_pf > base_horizon and state.shape[1] > base_horizon + 1:
                 T_extra = min(T_pf, state.shape[1] - 1)
+                pf_mask = active_mask[:, base_horizon:T_extra] if active_mask is not None else None
                 costs_pf = get_train_loss(
                     fields, predict_hat[:, base_horizon:T_extra],
-                    state[:, base_horizon+1:T_extra+1], normalizer, weight_loss
+                    state[:, base_horizon+1:T_extra+1], normalizer, weight_loss, active_mask=pf_mask
                 )
                 loss_pf = costs_pf["value_loss"] + grad_loss_weight * costs_pf["grad_loss"]
                 total_loss = loss_base + 0.5 * loss_pf
@@ -215,13 +228,21 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
         agg["each_l2"] += costs["each_l2"] * batch_num
         agg["num"] += batch_num
 
+        if has_region:
+            _accumulate_region(agg, costs, batch_num, fields, include_loss=True)
+
         avg_loss = agg["loss"] / agg["num"]
         pbar.set_postfix({"Loss": f"{avg_loss:.4e}"})
 
+    from src.train import _REGION_PREFIXES, _REGION_MEANS
     for key, value in agg.items():
-        if key != "each_l2" and key != "num":
-            agg[key] = value / agg["num"]
+        if key != "each_l2" and key != "num" and not key.endswith("_cnt"):
+            if key not in ("active_loss", "inactive_loss") and key not in _REGION_MEANS and not any(key.startswith(p + "_") for p in _REGION_PREFIXES):
+                agg[key] = value / agg["num"]
+
     agg["each_l2"] = (agg["each_l2"] / agg["num"]).cpu()
+    if has_region:
+        _finalize_region(agg, fields, agg["num"], include_loss=True)
     return agg
 
 
@@ -252,6 +273,7 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer):
     agg["num"] = 0
     agg["value_loss"] = 0.0
     agg["grad_loss"] = 0.0
+    has_region = False
 
     model.train()
     normalizer.to(device)
@@ -267,12 +289,19 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer):
         if weight_loss.get("gradient", False):
             weight_loss["grid_shape"] = batch['grid_shape'].numpy()
 
+        active_mask = batch.get("active_mask")
+        if active_mask is not None:
+            active_mask = active_mask[:, 1:].to(device)
+            if not has_region:
+                _init_region_agg(agg, fields)
+                has_region = True
+
         batch_num = state.shape[0]
 
         if use_amp:
             with autocast(device_type="cuda", dtype=torch.bfloat16):
                 predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
-                costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss)
+                costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss, active_mask=active_mask)
 
             # Use configurable grad_loss_weight
             loss = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
@@ -282,7 +311,7 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer):
             optim.zero_grad()
         else:
             predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
-            costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss)
+            costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss, active_mask=active_mask)
 
             loss = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
             loss.backward()
@@ -304,13 +333,21 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer):
         agg["each_l2"] += costs["each_l2"] * batch_num
         agg["num"] += batch_num
 
+        if has_region:
+            _accumulate_region(agg, costs, batch_num, fields, include_loss=True)
+
         avg_loss = agg["loss"] / agg["num"]
         pbar.set_postfix({"Loss": f"{avg_loss:.4e}"})
 
+    from src.train import _REGION_PREFIXES, _REGION_MEANS
     for key, value in agg.items():
-        if key != "each_l2" and key != "num":
-            agg[key] = value / agg["num"]
+        if key != "each_l2" and key != "num" and not key.endswith("_cnt"):
+            if key not in ("active_loss", "inactive_loss") and key not in _REGION_MEANS and not any(key.startswith(p + "_") for p in _REGION_PREFIXES):
+                agg[key] = value / agg["num"]
+
     agg["each_l2"] = (agg["each_l2"] / agg["num"]).cpu()
+    if has_region:
+        _finalize_region(agg, fields, agg["num"], include_loss=True)
     return agg
 
 
@@ -604,6 +641,7 @@ def main(args, path_logs, path_nn, path_record):
 
         l2_details = []
         rmse_details = []
+        region_l2_details = []
         for fname in fields:
             l2_val = train_error[f"L2_{fname}"]
             rmse_val = train_error[f"RMSE_{fname}"]
@@ -612,12 +650,33 @@ def main(args, path_logs, path_nn, path_record):
             writer.add_scalar(f'L2/train_L2_{fname}', l2_val, epoch)
             writer.add_scalar(f'RMSE/train_RMSE_{fname}', rmse_val, epoch)
 
+            for prefix in ("active_L2", "inactive_L2", "active_RMSE", "inactive_RMSE"):
+                rval = train_error.get(f"{prefix}_{fname}")
+                if rval is not None and not math.isnan(rval):
+                    writer.add_scalar(f'{prefix}/train_{prefix}_{fname}', rval, epoch)
+
+            a_l2 = train_error.get(f"active_L2_{fname}")
+            i_l2 = train_error.get(f"inactive_L2_{fname}")
+            if a_l2 is not None:
+                region_l2_details.append(f"{fname}: act={a_l2:.4e}, inact={i_l2:.4e}")
+
+        for key in ("active_mean_l2", "inactive_mean_l2"):
+            val = train_error.get(key)
+            if val is not None and not math.isnan(val):
+                writer.add_scalar(f'L2/train_{key}', val, epoch)
+        for key in ("active_loss", "inactive_loss"):
+            val = train_error.get(key)
+            if val is not None:
+                writer.add_scalar(f'Loss/train_{key}', val, epoch)
+
         print(log_str)
         value_loss = train_error.get("value_loss", 0)
         grad_loss = train_error.get("grad_loss", 0)
         print(f"value_loss:{value_loss} | grad_loss:{grad_loss}")
         print(f"L2 details: {', '.join(l2_details)}")
         print(f"RMSE details: {', '.join(rmse_details)}")
+        if region_l2_details:
+            print(f"Region L2: {', '.join(region_l2_details)}")
         print(f"each time step loss: {each_t_l2.tolist()}")
         pf_info = f", pushforward extra={pf_extra}" if use_pushforward else ""
         print(f"time pre train epoch/s:{training_time:.2f}, current_lr:{current_lr:.4e}{pf_info}")
@@ -628,6 +687,8 @@ def main(args, path_logs, path_nn, path_record):
             file.write(f"Train Loss: {train_loss:.4e}, mean_l2: {train_mean_l2:.4e}\n")
             file.write(f"L2 details: {', '.join(l2_details)}\n")
             file.write(f"RMSE details: {', '.join(rmse_details)}\n")
+            if region_l2_details:
+                file.write(f"Region L2: {', '.join(region_l2_details)}\n")
             file.write(f"each time step loss: {each_t_l2.tolist()}\n")
             file.write(f"time pre train epoch/s:{training_time:.2f}, current_lr:{current_lr:.4e}{pf_info}\n")
 
@@ -649,6 +710,7 @@ def main(args, path_logs, path_nn, path_record):
 
             test_l2_details = []
             test_rmse_details = []
+            test_region_l2_details = []
             writer.add_scalar('L2/test_mean_l2', test_mean_l2, epoch)
 
             for fname in fields:
@@ -659,10 +721,27 @@ def main(args, path_logs, path_nn, path_record):
                 writer.add_scalar(f'L2/test_L2_{fname}', l2_val, epoch)
                 writer.add_scalar(f'RMSE/test_RMSE_{fname}', rmse_val, epoch)
 
+                for prefix in ("active_L2", "inactive_L2", "active_RMSE", "inactive_RMSE"):
+                    rval = test_error.get(f"{prefix}_{fname}")
+                    if rval is not None and not math.isnan(rval):
+                        writer.add_scalar(f'{prefix}/test_{prefix}_{fname}', rval, epoch)
+
+                a_l2 = test_error.get(f"active_L2_{fname}")
+                i_l2 = test_error.get(f"inactive_L2_{fname}")
+                if a_l2 is not None:
+                    test_region_l2_details.append(f"{fname}: act={a_l2:.4e}, inact={i_l2:.4e}")
+
+            for key in ("active_mean_l2", "inactive_mean_l2"):
+                val = test_error.get(key)
+                if val is not None and not math.isnan(val):
+                    writer.add_scalar(f'L2/test_{key}', val, epoch)
+
             print("---Inference (EMA)---")
             print(f"Epoch: {epoch + 1}/{EPOCH}, test_mean_l2: {test_mean_l2:.4e}")
             print(f"L2 details: {', '.join(test_l2_details)}")
             print(f"RMSE details: {', '.join(test_rmse_details)}")
+            if test_region_l2_details:
+                print(f"Region L2: {', '.join(test_region_l2_details)}")
             print(f"each time step loss: {test_each_t_l2.tolist()}")
             print(f"time pre test epoch/s:{val_time:.2f}")
             print("--------------")
@@ -671,6 +750,8 @@ def main(args, path_logs, path_nn, path_record):
                 file.write(f"Inference(EMA), epoch: {epoch + 1}/{EPOCH}, test_mean_l2: {test_mean_l2:.4e}\n")
                 file.write(f"L2 details: {', '.join(test_l2_details)}\n")
                 file.write(f"RMSE details: {', '.join(test_rmse_details)}\n")
+                if test_region_l2_details:
+                    file.write(f"Region L2: {', '.join(test_region_l2_details)}\n")
                 file.write(f"each time step loss: {test_each_t_l2.tolist()}\n")
                 file.write(f"time pre test epoch/s:{val_time:.2f}\n")
 

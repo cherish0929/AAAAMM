@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import os
+import math
 import time
 from pathlib import Path
 from datetime import datetime
@@ -33,31 +34,13 @@ def get_dataloader(args, path_record, device_type):
         
     # 构建数据集
     train_dataset = Datasetclass(
-        data_cfg=data_cfg,
-        file_list=data_cfg["train_list"],
-        mode="train",
-        fields=data_cfg.get("fields", ["T"]),
-        input_steps=data_cfg.get("input_steps", 1),
-        horizon=data_cfg.get("horizon_train", 1),
-        time_stride=data_cfg.get("time_stride", 1),
-        spatial_stride=data_cfg.get("spatial_stride", 1),
-        normalize=data_cfg.get("normalize", True),
-        samples_per_file=data_cfg.get("samples_per_file", 32),
-        norm_cache=data_cfg.get("norm_cache"),
+        args=args,
+        mode="train"
     )
 
     test_dataset = Datasetclass(
-        data_cfg=data_cfg,
-        file_list=data_cfg["test_list"],
+        args=args,
         mode="test",
-        fields=data_cfg.get("fields", ["T"]),
-        input_steps=data_cfg.get("input_steps", 1),
-        horizon=data_cfg.get("horizon_test", 1),
-        time_stride=data_cfg.get("time_stride", 1),
-        spatial_stride=data_cfg.get("spatial_stride", 1),
-        normalize=data_cfg.get("normalize", True),
-        samples_per_file=data_cfg.get("samples_per_file", 32),
-        norm_cache=data_cfg.get("norm_cache"),
         mat_data=train_dataset.mat_mean_and_std if train_dataset.normalize else None
     )
     
@@ -248,31 +231,57 @@ def main(args, path_logs, path_nn, path_record):
         # 动态记录每个物理场 (Field)
         l2_details = []
         rmse_details = []
+        region_l2_details = []
         for fname in fields:
             l2_val = train_error[f"L2_{fname}"]
             rmse_val = train_error[f"RMSE_{fname}"]
-            
+
             l2_details.append(f"{fname}: {l2_val:.4e}")
             rmse_details.append(f"{fname}: {rmse_val:.4e}")
-            
+
             writer.add_scalar(f'L2/train_L2_{fname}', l2_val, epoch)
             writer.add_scalar(f'RMSE/train_RMSE_{fname}', rmse_val, epoch)
+
+            # Region metrics per field
+            for prefix in ("active_L2", "inactive_L2", "active_RMSE", "inactive_RMSE"):
+                rval = train_error.get(f"{prefix}_{fname}")
+                if rval is not None and not math.isnan(rval):
+                    writer.add_scalar(f'{prefix}/train_{prefix}_{fname}', rval, epoch)
+
+            a_l2 = train_error.get(f"active_L2_{fname}")
+            i_l2 = train_error.get(f"inactive_L2_{fname}")
+            if a_l2 is not None:
+                region_l2_details.append(f"{fname}: act={a_l2:.4e}, inact={i_l2:.4e}")
+
+        # Region mean metrics
+        for key in ("active_mean_l2", "inactive_mean_l2"):
+            val = train_error.get(key)
+            if val is not None and not math.isnan(val):
+                writer.add_scalar(f'L2/train_{key}', val, epoch)
+        for key in ("active_loss", "inactive_loss"):
+            val = train_error.get(key)
+            if val is not None:
+                writer.add_scalar(f'Loss/train_{key}', val, epoch)
 
         print(log_str)
         value_loss, grad_loss = train_error.get("value_loss", 0), train_error.get("grad_loss", 0)
         print(f"value_loss:{value_loss} | grad_loss:{grad_loss}")
         print(f"L2 details: {', '.join(l2_details)}")
         print(f"RMSE details: {', '.join(rmse_details)}")
+        if region_l2_details:
+            print(f"Region L2: {', '.join(region_l2_details)}")
         print(f"each time step loss: {each_t_l2.tolist()}")
         print(f"time pre train epoch/s:{training_time:.2f}, current_lr:{current_lr:.4e}")
         print("--------------")
-        
+
         # 写入文件日志
         with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
             file.write(f"Training, epoch: {epoch + 1}/{EPOCH}\n")
             file.write(f"Train Loss: {train_loss:.4e}, mean_l2: {train_mean_l2:.4e}\n")
             file.write(f"L2 details: {', '.join(l2_details)}\n")
             file.write(f"RMSE details: {', '.join(rmse_details)}\n")
+            if region_l2_details:
+                file.write(f"Region L2: {', '.join(region_l2_details)}\n")
             file.write(f"each time step loss: {each_t_l2.tolist()}\n")
             file.write(f"time pre train epoch/s:{training_time:.2f}, current_lr:{current_lr:.4e}\n")
         
@@ -291,33 +300,55 @@ def main(args, path_logs, path_nn, path_record):
             # 动态构建 Test Log
             test_l2_details = []
             test_rmse_details = []
-            
+            test_region_l2_details = []
+
             writer.add_scalar('L2/test_mean_l2', test_mean_l2, epoch)
-            
+
             for fname in fields:
                 l2_val = test_error[f"L2_{fname}"]
                 rmse_val = test_error[f"RMSE_{fname}"]
-                
+
                 test_l2_details.append(f"{fname}: {l2_val:.4e}")
                 test_rmse_details.append(f"{fname}: {rmse_val:.4e}")
-                
+
                 writer.add_scalar(f'L2/test_L2_{fname}', l2_val, epoch)
                 writer.add_scalar(f'RMSE/test_RMSE_{fname}', rmse_val, epoch)
+
+                # Region metrics per field
+                for prefix in ("active_L2", "inactive_L2", "active_RMSE", "inactive_RMSE"):
+                    rval = test_error.get(f"{prefix}_{fname}")
+                    if rval is not None and not math.isnan(rval):
+                        writer.add_scalar(f'{prefix}/test_{prefix}_{fname}', rval, epoch)
+
+                a_l2 = test_error.get(f"active_L2_{fname}")
+                i_l2 = test_error.get(f"inactive_L2_{fname}")
+                if a_l2 is not None:
+                    test_region_l2_details.append(f"{fname}: act={a_l2:.4e}, inact={i_l2:.4e}")
+
+            # Region mean metrics
+            for key in ("active_mean_l2", "inactive_mean_l2"):
+                val = test_error.get(key)
+                if val is not None and not math.isnan(val):
+                    writer.add_scalar(f'L2/test_{key}', val, epoch)
 
             print("---Inference---")
             print(f"Epoch: {epoch + 1}/{EPOCH}, test_mean_l2: {test_mean_l2:.4e}")
             print(f"L2 details: {', '.join(test_l2_details)}")
             print(f"RMSE details: {', '.join(test_rmse_details)}")
+            if test_region_l2_details:
+                print(f"Region L2: {', '.join(test_region_l2_details)}")
             print(f"each time step loss: {test_each_t_l2.tolist()}")
             print(f"time pre test epoch/s:{val_time:.2f}")
             print("--------------")
-            
+
             with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
                 file.write(f"Inference, epoch: {epoch + 1}/{EPOCH}, test_mean_l2: {test_mean_l2:.4e}\n")
                 file.write(f"L2 details: {', '.join(test_l2_details)}\n")
                 file.write(f"RMSE details: {', '.join(test_rmse_details)}\n")
+                if test_region_l2_details:
+                    file.write(f"Region L2: {', '.join(test_region_l2_details)}\n")
                 file.write(f"each time step loss: {test_each_t_l2.tolist()}\n")
-                file.write(f"time pre test epoch/s:{val_time:.2f}\n") 
+                file.write(f"time pre test epoch/s:{val_time:.2f}\n")
             
             # Save Best
             if args.if_save and test_mean_l2 < best_val_error:

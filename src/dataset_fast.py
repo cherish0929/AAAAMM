@@ -1,3 +1,10 @@
+"""
+dataset_fast.py — 优化版 AeroGtoDataset
+
+主要优化点（相对 dataset.py）：
+1. scale_3D_pos 结果缓存到 meta，避免每个 __getitem__ 重复计算 min/max
+2. ChannelNormalizer.mean/std 提前固定到 CPU，避免每次 normalize 调用 .to(device)
+"""
 import json
 import random
 from pathlib import Path
@@ -11,8 +18,11 @@ from torch.utils.data import Dataset
 from .utils import ChannelNormalizer, build_active_mask
 
 
+# ---------------------------------------------------------------------------
+# 工具函数（与 dataset.py 保持一致，不做修改）
+# ---------------------------------------------------------------------------
+
 def _read_file_list(file_list: Iterable[str]) -> List[str]:
-    """读取txt列表或直接的路径列表，返回绝对路径列表。"""
     paths = []
     for item in file_list:
         p = Path(item)
@@ -38,7 +48,6 @@ def _normalize_stride(stride) -> Tuple[int, int, int]:
 
 
 def _compute_downsample_indices(grid_shape: Tuple[int, int, int], stride: Tuple[int, int, int]):
-    """根据网格尺寸和步长生成下采样索引以及下采样后的shape。"""
     gx, gy, gz = grid_shape
     sx, sy, sz = stride
 
@@ -64,9 +73,9 @@ def _compute_downsample_indices(grid_shape: Tuple[int, int, int], stride: Tuple[
 
 
 def _build_grid_edges(ds_shape: Tuple[int, int, int], sample_ratio=1.0) -> torch.Tensor:
-    """基于规则网格生成六向邻接边。"""
     nx, ny, nz = ds_shape
     edges = []
+
     def idx(x, y, z):
         return x + nx * y + nx * ny * z
 
@@ -82,14 +91,12 @@ def _build_grid_edges(ds_shape: Tuple[int, int, int], sample_ratio=1.0) -> torch
                     edges.append((cur, idx(x, y, z + 1)))
 
     edges_arr = np.asarray(edges, dtype=np.int32)
-    # 保证无向去重
     edges_arr = np.sort(edges_arr, axis=1)
     edges_arr = np.unique(edges_arr, axis=0)
 
     if sample_ratio < 1.0:
         total_edges = edges_arr.shape[0]
         target_num = int(total_edges * sample_ratio)
-        # print(f"[Warning] 正在对边进行下采样: {total_edges} -> {target_num} (Ratio={sample_ratio})")   
         sample_indices = np.random.choice(total_edges, target_num, replace=False)
         edges_arr = edges_arr[sample_indices]
 
@@ -97,30 +104,33 @@ def _build_grid_edges(ds_shape: Tuple[int, int, int], sample_ratio=1.0) -> torch
 
 
 def _build_node_type(ds_shape: Tuple[int, int, int], y_divide=17) -> torch.Tensor:
-    """0: 内部节点，1: 固相边界节点，2:液相边界节点"""
     nx, ny, nz = ds_shape
     node_types = np.zeros((nx * ny * nz, 1), dtype=np.int32)
     for z in range(nz):
         for y in range(ny):
             for x in range(nx):
                 idx = x + nx * y + nx * ny * z
-                if y == 0: node_types[idx] = 1
-                elif y == ny - 1: node_types[idx] = 2
+                if y == 0:
+                    node_types[idx] = 1
+                elif y == ny - 1:
+                    node_types[idx] = 2
                 else:
                     if x in (x, nx - 1) or z in (0, nz - 1):
-                        if y <= y_divide: node_types[idx] = 1
-                        else: node_types[idx] = 2
+                        if y <= y_divide:
+                            node_types[idx] = 1
+                        else:
+                            node_types[idx] = 2
     return torch.from_numpy(node_types)
 
+
 def _process_condition_normalize(f: h5py.File, mat_mean_and_std=None) -> np.ndarray:
-    """对参数进行标准化操作，数据集中不变的参数暂时不传入模型"""
     cond_list = []
     thermal_cond_list = [
-    ("parameter/thermal", 3, np.arange(100, 300, 10).mean(), np.arange(100, 300, 10).std()),    # 激光功率
-    ("parameter/thermal", 4, np.arange(35e-6, 45e-6, 1e-6).mean(), np.arange(35e-6, 45e-6, 1e-6).std()),   # 激光半径
-    ("parameter/thermal", 5, np.arange(2e-4, 7e-4, 1e-4).mean(), np.arange(2e-4, 7e-4, 1e-4).std()), # 激光起始 x 坐标
-    ("parameter/thermal", 7, np.arange(0.35, 0.45, 0.01).mean(), np.arange(0.35, 0.45, 0.01).std()), # 吸收率
-    ("parameter/thermal", 8, np.arange(0.2, 0.4, 0.01).mean(), np.arange(0.2, 0.4, 0.01).std()), # 能量移动速度】
+        ("parameter/thermal", 3, np.arange(100, 300, 10).mean(), np.arange(100, 300, 10).std()),
+        ("parameter/thermal", 4, np.arange(35e-6, 45e-6, 1e-6).mean(), np.arange(35e-6, 45e-6, 1e-6).std()),
+        ("parameter/thermal", 5, np.arange(2e-4, 7e-4, 1e-4).mean(), np.arange(2e-4, 7e-4, 1e-4).std()),
+        ("parameter/thermal", 7, np.arange(0.35, 0.45, 0.01).mean(), np.arange(0.35, 0.45, 0.01).std()),
+        ("parameter/thermal", 8, np.arange(0.2, 0.4, 0.01).mean(), np.arange(0.2, 0.4, 0.01).std()),
     ]
 
     for path, idx, mean_val, std_val in thermal_cond_list:
@@ -131,7 +141,7 @@ def _process_condition_normalize(f: h5py.File, mat_mean_and_std=None) -> np.ndar
             cond_list.append([val_norm])
         else:
             cond_list.append([0.0])
-    # 针对 material 的处理 （3*15）的数组
+
     mat_path = "parameter/material"
     mat_all = f[mat_path][:]
     mat_2 = mat_all[0:-1, :]
@@ -152,8 +162,8 @@ def _process_condition_normalize(f: h5py.File, mat_mean_and_std=None) -> np.ndar
 
     return np.concatenate(cond_list, axis=0).astype(np.float32), (mat_mean, mat_std)
 
+
 def _condition_vector(f: h5py.File, field_names: List[str]) -> np.ndarray:
-    """将全局参数、场信息、边界条件压平成一个条件向量。"""
     thermal = f["parameter/thermal"][:].reshape(-1)
     material = f["parameter/material"][:].reshape(-1)
     interact = f["parameter/interact"][:].reshape(-1)
@@ -179,18 +189,8 @@ def _condition_vector(f: h5py.File, field_names: List[str]) -> np.ndarray:
     boundcond = np.concatenate(boundcond_list, axis=0)
 
     cond_vec = np.concatenate(
-        [
-            thermal,
-            material,
-            interact,
-            dump_mean,
-            dump_std,
-            field_box,
-            field_scalar,
-            field_velocity,
-            inicond,
-            boundcond,
-        ],
+        [thermal, material, interact, dump_mean, dump_std,
+         field_box, field_scalar, field_velocity, inicond, boundcond],
         axis=0,
     ).astype(np.float32)
 
@@ -198,13 +198,13 @@ def _condition_vector(f: h5py.File, field_names: List[str]) -> np.ndarray:
 
 
 def _compute_stats(path: str, indices: np.ndarray, field_names: List[str], chunk: int = 10):
-    """按通道统计均值和方差，避免一次性载入全部数据。"""
     num_channels = len(field_names)
 
     with h5py.File(path, "r") as f:
         total_t = f[f'state/{field_names[0]}'].shape[0]
-        mean, sq = np.zeros(num_channels, dtype=np.float64), np.zeros(num_channels, dtype=np.float64)
-        count = 0        
+        mean = np.zeros(num_channels, dtype=np.float64)
+        sq = np.zeros(num_channels, dtype=np.float64)
+        count = 0
 
         for start in range(0, total_t, chunk):
             end = min(total_t, start + chunk)
@@ -214,33 +214,50 @@ def _compute_stats(path: str, indices: np.ndarray, field_names: List[str], chunk
                 full_chunk = f[fkey][start:end]
                 d = full_chunk[:, indices, 0]
                 phys_data.append(d)
-            data = np.stack(phys_data, axis=-1).reshape(-1, num_channels) # [Points, Channels]
+            data = np.stack(phys_data, axis=-1).reshape(-1, num_channels)
 
             mean += data.sum(axis=0)
-            sq += (data**2).sum(axis=0)
+            sq += (data ** 2).sum(axis=0)
             count += data.shape[0]
 
         mean = mean / count
-        std = np.sqrt(np.maximum(sq / count - mean**2, 1e-12))
+        std = np.sqrt(np.maximum(sq / count - mean ** 2, 1e-12))
         std = np.clip(std, 1e-6, None)
     return mean.astype(np.float32), std.astype(np.float32)
 
 
+# ---------------------------------------------------------------------------
+# 优化版 Dataset
+# ---------------------------------------------------------------------------
+
 class AeroGtoDataset(Dataset):
-    """面向LPBF数据的自回归训练集封装。"""
+    """面向LPBF数据的自回归训练集封装（优化版）。
+
+    优化点：
+    - scale_3D_pos 结果预先计算并缓存在 meta 中，__getitem__ 不再重复计算
+    - ChannelNormalizer 的 mean/std 保持在 CPU tensor，利用 PyTorch
+      广播自动上设备，减少每步 .to(device) 调用次数
+    """
 
     def __init__(
-        self, args,
+        self, data_cfg,
+        file_list: Iterable[str],
         mode: str = "train",
-        mat_data = None,
+        fields: List['str'] = ['T'],
+        input_steps: int = 1,
+        horizon: int = 5,
+        time_stride: int = 1,
+        spatial_stride: Union[int, Tuple[int, int, int]] = 1,
+        normalize: bool = True,
+        samples_per_file: int = 32,
+        norm_cache: Optional[str] = None,
+        mat_data=None,
     ):
         super().__init__()
         assert mode in {"train", "test"}, "mode 只能为 train 或 test"
-        data_cfg = args.data
         self.config = data_cfg
         self.mode = mode
-
-        self.fields = data_cfg.get("fields", ["T"])
+        self.fields = fields
         self.input_steps = input_steps
         self.horizon = horizon
         self.time_stride = time_stride
@@ -266,9 +283,8 @@ class AeroGtoDataset(Dataset):
 
             if mode == "train":
                 for _ in range(samples_per_file):
-                    self.sample_keys.append((file_id, None))  # None 表示随机起点
+                    self.sample_keys.append((file_id, None))
             else:
-                # 测试阶段均匀取样，覆盖全序列
                 step = max(1, horizon // 2)
                 for start in range(1, meta["max_start"] + 1, step):
                     self.sample_keys.append((file_id, start))
@@ -278,12 +294,33 @@ class AeroGtoDataset(Dataset):
         self.node_num = example_meta["node_pos"].shape[0]
         self.dt = example_meta["dt"] * self.dt_scale
         num_channels = len(self.fields)
-        
+
         if self.normalize and self.mode == "train":
-            # self.normalizer = self._load_or_compute_normalizer()
             self.normalizer = self._load_normalizer()
         else:
-            self.normalizer = ChannelNormalizer(np.zeros(num_channels, dtype=np.float32), np.ones(num_channels, dtype=np.float32))
+            self.normalizer = ChannelNormalizer(
+                np.zeros(num_channels, dtype=np.float32),
+                np.ones(num_channels, dtype=np.float32)
+            )
+
+        # 优化：初始化完成后，把 normalizer 的统计量 pin 到 CPU
+        # __getitem__ 里直接用，不再反复 .to()
+        self.norm_mean = self.normalizer.mean  # shape [1, 1, C]
+        self.norm_std = self.normalizer.std + self.normalizer.eps
+
+        # 优化：把 normalize=True 时的 scaled node_pos 预先缓存
+        if self.normalize:
+            for path, meta in self.meta_cache.items():
+                meta["node_pos_scaled"] = self._scale_3D_pos(meta["node_pos"])
+
+    # ------------------------------------------------------------------
+    # 静态方法：向量化位置归一化（与原版逻辑完全一致）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _scale_3D_pos(node_pos: torch.Tensor) -> torch.Tensor:
+        pos_min = node_pos.min(dim=0).values
+        pos_max = node_pos.max(dim=0).values
+        return (node_pos - pos_min) / (pos_max - pos_min + 1e-8)
 
     def _load_or_compute_normalizer(self) -> ChannelNormalizer:
         cache_path = Path(self.norm_cache) if self.norm_cache else None
@@ -298,9 +335,13 @@ class AeroGtoDataset(Dataset):
                     if len(stats["mean"]) == len(self.fields):
                         return ChannelNormalizer(stats["mean"], stats["std"])
             except Exception:
-                pass  # 缓存损坏则重新计算
+                pass
 
-        mean, std = _compute_stats(self.file_paths[0], self.meta_cache[self.file_paths[0]]["indices"], self.fields)
+        mean, std = _compute_stats(
+            self.file_paths[0],
+            self.meta_cache[self.file_paths[0]]["indices"],
+            self.fields
+        )
         if cache_path:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             cache = {}
@@ -317,51 +358,34 @@ class AeroGtoDataset(Dataset):
         return ChannelNormalizer(mean, std)
 
     def _load_normalizer(self) -> ChannelNormalizer:
-        
         field_stats_config = {
-            "T":         (5.2999e+02, 4.5454e+02),  
-            "Ux":        (4.0041e-05, 2.4173e-01),
-            "Uy":        (-1.6900e-05, 2.5172e-01),
-            "Uz":        (3.3602e-07, 1.1976e-01),
-            "alpha.air": (0, 1), # (3.6361e-01, 4.6604e-01)    
-            "alpha.titanium": (0, 1), # (6.3635e-01, 4.6607e-01)
-            "gamma_liquid": (0, 1)} # (2.9447e-02, 1.6011e-01)
-        
+            "T":              (5.2999e+02, 4.5454e+02),
+            "Ux":             (4.0041e-05, 2.4173e-01),
+            "Uy":             (-1.6900e-05, 2.5172e-01),
+            "Uz":             (3.3602e-07, 1.1976e-01),
+            "alpha.air":      (0, 1),
+            "alpha.titanium": (0, 1),
+            "gamma_liquid":   (0, 1),
+        }
         mean_list, std_list = [], []
         for fname in self.fields:
             m, s = field_stats_config[fname]
             mean_list.append(m)
             std_list.append(s)
-        mean_arr = np.array(mean_list, dtype=np.float32)
-        std_arr = np.array(std_list, dtype=np.float32)
-
-        return ChannelNormalizer(mean_arr, std_arr)
-
-
-    def scale_3D_pos(self, node_pos):
-        
-        xx = node_pos[...,0]
-        yy = node_pos[...,1]
-        zz = node_pos[...,2]
-
-        x_norm = (xx - xx.min()) / (xx.max() - xx.min())
-        y_norm = (yy - yy.min()) / (yy.max() - yy.min())
-        z_norm = (zz - zz.min()) / (zz.max() - zz.min())
-        
-        node_pos_new = torch.stack((x_norm, y_norm, z_norm), dim=-1)
-        return node_pos_new
+        return ChannelNormalizer(
+            np.array(mean_list, dtype=np.float32),
+            np.array(std_list, dtype=np.float32)
+        )
 
     def _build_meta(self, path: str):
         path = str(Path(path).expanduser().resolve())
         with h5py.File(path, "r") as f:
-            # 网格尺寸与下采样索引
             block = f["mesh/block"][0].astype(int)
-            grid_shape = (block[0] + 1, block[1] + 1, block[2] + 1)  # 点的数量
+            grid_shape = (block[0] + 1, block[1] + 1, block[2] + 1)
             indices, ds_shape = _compute_downsample_indices(grid_shape, self.spatial_stride)
 
             point_all = f["point"][:]
             point = point_all[indices]
-
             node_pos = torch.from_numpy(point.astype(np.float32))
 
             edges = _build_grid_edges(ds_shape, self.edge_sample_ratio)
@@ -374,7 +398,7 @@ class AeroGtoDataset(Dataset):
                     conditions, _ = _process_condition_normalize(f, self.mat_mean_and_std)
             else:
                 conditions = _condition_vector(f, self.fields)
-            
+
             conditions = torch.from_numpy(conditions)
 
             time_all = f["time"][:]
@@ -400,7 +424,6 @@ class AeroGtoDataset(Dataset):
         return len(self.sample_keys)
 
     def _load_window(self, path: str, indices: np.ndarray, start: int):
-        """读取 [start, start + horizon] 对应的状态与时间。"""
         with h5py.File(path, "r") as f:
             time_idx = start + np.arange(0, self.horizon + 1) * self.time_stride
             channels = []
@@ -422,28 +445,29 @@ class AeroGtoDataset(Dataset):
             start_idx = random.randint(1, meta["max_start"])
 
         state_np, time_seq = self._load_window(path, meta["indices"], start_idx)
-        state = torch.from_numpy(state_np)  # [T, N, 4]
+        state = torch.from_numpy(state_np)  # [T, N, C]
 
         active_mask = build_active_mask(state_np, self.fields, self.mask_cfg)
 
         if self.normalize:
-            state = self.normalizer.normalize(state)
-            node_pos = self.scale_3D_pos(meta["node_pos"])
+            # 优化：直接用预先固定的 CPU tensor 做广播，避免 .to(device) 调用
+            state = (state - self.norm_mean) / self.norm_std
+            node_pos = meta["node_pos_scaled"]  # 预先缓存，直接取用
         else:
             node_pos = meta["node_pos"]
 
-        # 目标时间步（相对起始时刻）
         rel_time = time_seq[1:] - time_seq[0]
         time_tensor = torch.from_numpy(rel_time.astype(np.float32)).unsqueeze(-1)
+
         sample = {
-            "dt": meta['dt'] * self.time_stride * self.dt_scale,
-            "state": state,  # [1 + horizon, N, 4]
-            "time_seq": time_tensor * self.dt_scale,  # [horizon, 1]
-            "node_pos": node_pos,
-            "edges": meta["edges"],
-            "node_type": meta["node_type"],
+            "dt":         meta['dt'] * self.time_stride * self.dt_scale,
+            "state":      state,
+            "time_seq":   time_tensor * self.dt_scale,
+            "node_pos":   node_pos,
+            "edges":      meta["edges"],
+            "node_type":  meta["node_type"],
             "conditions": meta["conditions"],
-            "grid_shape": torch.tensor(list(meta["ds_shape"]))
+            "grid_shape": torch.tensor(list(meta["ds_shape"])),
         }
         if active_mask is not None:
             sample["active_mask"] = active_mask

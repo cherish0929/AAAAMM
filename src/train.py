@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn.functional as F
 import random
@@ -32,6 +33,59 @@ def _rmse(pred, target):
     mse = torch.mean(diff**2, dim=[0, 1, 2])
     return torch.sqrt(mse)
 
+# ---- Region-masked metric helpers ----
+
+def _masked_relative_l2(pred, target, mask):
+    """
+    Relative L2 error over masked spatial points for a single channel.
+    Args:
+        pred, target: [B, T, N, 1] denormalized
+        mask: [B, T, N, 1] bool
+    Returns:
+        float scalar, or float('nan') if mask has zero True entries.
+    """
+    if mask.sum() == 0:
+        return float('nan')
+    error = (pred - target) * mask.float()
+    target_masked = target * mask.float()
+    error_norm = torch.norm(error, dim=-2)          # [B, T, 1]
+    target_norm = torch.norm(target_masked, dim=-2)  # [B, T, 1]
+    rel = error_norm / (target_norm + 1e-6)
+    return rel.mean().item()
+
+
+def _masked_rmse(pred, target, mask):
+    """
+    RMSE over masked spatial points for a single channel.
+    Args:
+        pred, target: [B, T, N, 1] denormalized
+        mask: [B, T, N, 1] bool
+    Returns:
+        float scalar, or float('nan') if mask is empty.
+    """
+    count = mask.sum()
+    if count == 0:
+        return float('nan')
+    diff = (pred - target) * mask.float()
+    mse = (diff ** 2).sum() / count
+    return torch.sqrt(mse).item()
+
+
+def _masked_mse(pred, target, mask):
+    """
+    MSE over masked region (monitoring only, not for backprop).
+    Args:
+        pred, target: [B, T, N, C] (normalized)
+        mask: [B, T, N, C] bool
+    Returns:
+        float scalar.
+    """
+    count = mask.sum()
+    if count == 0:
+        return 0.0
+    diff = (pred - target) * mask.float()
+    return ((diff ** 2).sum() / count).item()
+
 def compute_spatial_gradient_3d(tensor_field, grid_shape):
     """
     计算 3D 空间梯度 (一阶有限差分)
@@ -56,7 +110,7 @@ def compute_spatial_gradient_3d(tensor_field, grid_shape):
     
     return grad_x, grad_y, grad_z
 
-def get_train_loss(fields, predict_hat, label_gt, normalizer, weight_cfg: dict):
+def get_train_loss(fields, predict_hat, label_gt, normalizer, weight_cfg: dict, active_mask=None):
     """返回loss张量及监控指标（其余转为float）。"""
     num_channels = float(len(fields))
 
@@ -131,23 +185,42 @@ def get_train_loss(fields, predict_hat, label_gt, normalizer, weight_cfg: dict):
 
     with torch.no_grad():
         rmse = _rmse(pred_real, label_real)
+        inactive_mask = (~active_mask) if active_mask is not None else None
 
         for i, fname in enumerate(fields):
             pred_ch_real = pred_real[..., i:i+1]
             gt_ch_real = label_real[..., i:i+1]
 
             rel_l2_val = _relative_l2(pred_ch_real, gt_ch_real)
-            
+
             losses[f"L2_{fname}"] = rel_l2_val
             losses['mean_l2'] += rel_l2_val / num_channels
             losses[f"RMSE_{fname}"] = rmse[i].item()
+
+            if active_mask is not None:
+                ch_active = active_mask[..., i:i+1]
+                ch_inactive = inactive_mask[..., i:i+1]
+                losses[f"active_L2_{fname}"] = _masked_relative_l2(pred_ch_real, gt_ch_real, ch_active)
+                losses[f"inactive_L2_{fname}"] = _masked_relative_l2(pred_ch_real, gt_ch_real, ch_inactive)
+                losses[f"active_RMSE_{fname}"] = _masked_rmse(pred_ch_real, gt_ch_real, ch_active)
+                losses[f"inactive_RMSE_{fname}"] = _masked_rmse(pred_ch_real, gt_ch_real, ch_inactive)
+
+        if active_mask is not None:
+            valid_active = [losses[f"active_L2_{f}"] for f in fields
+                           if not math.isnan(losses.get(f"active_L2_{f}", float('nan')))]
+            valid_inactive = [losses[f"inactive_L2_{f}"] for f in fields
+                             if not math.isnan(losses.get(f"inactive_L2_{f}", float('nan')))]
+            losses["active_mean_l2"] = sum(valid_active) / len(valid_active) if valid_active else float('nan')
+            losses["inactive_mean_l2"] = sum(valid_inactive) / len(valid_inactive) if valid_inactive else float('nan')
+            losses["active_loss"] = _masked_mse(pred_fp32, label_fp32, active_mask)
+            losses["inactive_loss"] = _masked_mse(pred_fp32, label_fp32, inactive_mask)
 
     losses["each_l2"] = _each_l2(pred_real, label_real)
 
     return losses
 
 
-def get_val_loss(fields, predict_hat, state, normalizer):
+def get_val_loss(fields, predict_hat, state, normalizer, active_mask=None):
     num_channels = float(len(fields))
 
     pred_fp32 = predict_hat.detach().float()
@@ -159,22 +232,90 @@ def get_val_loss(fields, predict_hat, state, normalizer):
     losses = {
         'mean_l2': 0
         }
-    
+
     rmse = _rmse(pred_real, state_real)
+    inactive_mask = (~active_mask) if active_mask is not None else None
 
     for i, fname in enumerate(fields):
         pred_ch_real = pred_real[..., i:i+1]
         gt_ch_real = state_real[..., i:i+1]
-        
+
         rel_l2_val = _relative_l2(pred_ch_real, gt_ch_real)
-        
+
         losses[f"L2_{fname}"] = rel_l2_val
         losses['mean_l2'] += rel_l2_val / num_channels
         losses[f"RMSE_{fname}"] = rmse[i].item()
 
+        if active_mask is not None:
+            ch_active = active_mask[..., i:i+1]
+            ch_inactive = inactive_mask[..., i:i+1]
+            losses[f"active_L2_{fname}"] = _masked_relative_l2(pred_ch_real, gt_ch_real, ch_active)
+            losses[f"inactive_L2_{fname}"] = _masked_relative_l2(pred_ch_real, gt_ch_real, ch_inactive)
+            losses[f"active_RMSE_{fname}"] = _masked_rmse(pred_ch_real, gt_ch_real, ch_active)
+            losses[f"inactive_RMSE_{fname}"] = _masked_rmse(pred_ch_real, gt_ch_real, ch_inactive)
+
+    if active_mask is not None:
+        valid_active = [losses[f"active_L2_{f}"] for f in fields
+                       if not math.isnan(losses.get(f"active_L2_{f}", float('nan')))]
+        valid_inactive = [losses[f"inactive_L2_{f}"] for f in fields
+                         if not math.isnan(losses.get(f"inactive_L2_{f}", float('nan')))]
+        losses["active_mean_l2"] = sum(valid_active) / len(valid_active) if valid_active else float('nan')
+        losses["inactive_mean_l2"] = sum(valid_inactive) / len(valid_inactive) if valid_inactive else float('nan')
+
     losses["each_l2"] = _each_l2(pred_real, state_real)
-    
+
     return losses
+
+
+# ---- Region metric aggregation helpers ----
+
+_REGION_PREFIXES = ("active_L2", "inactive_L2", "active_RMSE", "inactive_RMSE")
+_REGION_MEANS = ("active_mean_l2", "inactive_mean_l2")
+
+
+def _init_region_agg(agg, fields):
+    """Initialize region metric accumulators in the agg dict."""
+    for fname in fields:
+        for prefix in _REGION_PREFIXES:
+            agg[f"{prefix}_{fname}"] = 0.0
+            agg[f"{prefix}_{fname}_cnt"] = 0
+    for key in _REGION_MEANS:
+        agg[key] = 0.0
+        agg[f"{key}_cnt"] = 0
+    agg["active_loss"] = 0.0
+    agg["inactive_loss"] = 0.0
+
+
+def _accumulate_region(agg, costs, batch_num, fields, include_loss=True):
+    """Accumulate region metrics from one batch, skipping NaN values."""
+    for fname in fields:
+        for prefix in _REGION_PREFIXES:
+            val = costs.get(f"{prefix}_{fname}")
+            if val is not None and not math.isnan(val):
+                agg[f"{prefix}_{fname}"] += val * batch_num
+                agg[f"{prefix}_{fname}_cnt"] += batch_num
+    for key in _REGION_MEANS:
+        val = costs.get(key)
+        if val is not None and not math.isnan(val):
+            agg[key] += val * batch_num
+            agg[f"{key}_cnt"] += batch_num
+    if include_loss:
+        agg["active_loss"] += costs.get("active_loss", 0.0) * batch_num
+        agg["inactive_loss"] += costs.get("inactive_loss", 0.0) * batch_num
+
+
+def _finalize_region(agg, fields, total_num, include_loss=True):
+    """Average region accumulators and remove count keys."""
+    for fname in fields:
+        for prefix in _REGION_PREFIXES:
+            cnt = agg.pop(f"{prefix}_{fname}_cnt", 0)
+            agg[f"{prefix}_{fname}"] = agg[f"{prefix}_{fname}"] / cnt if cnt > 0 else float('nan')
+    for key in _REGION_MEANS:
+        cnt = agg.pop(f"{key}_cnt", 0)
+        agg[key] = agg[key] / cnt if cnt > 0 else float('nan')
+    if include_loss:
+        agg["active_loss"] = agg["active_loss"] / total_num if total_num > 0 else 0.0
+        agg["inactive_loss"] = agg["inactive_loss"] / total_num if total_num > 0 else 0.0
 
 
 def train(args, model, train_dataloader, optim, device, normalizer):
@@ -194,6 +335,7 @@ def train(args, model, train_dataloader, optim, device, normalizer):
     agg["num"] = 0
     agg["value_loss"] = 0.0
     agg["grad_loss"] = 0.0
+    has_region = False  # will be set True on first batch with active_mask
 
     model.train()
     normalizer.to(device)
@@ -210,26 +352,33 @@ def train(args, model, train_dataloader, optim, device, normalizer):
         if weight_loss.get("gradient", False):
             weight_loss["grid_shape"] = batch['grid_shape'].numpy() # 针对一个 batch 生效
 
+        active_mask = batch.get("active_mask")
+        if active_mask is not None:
+            active_mask = active_mask[:, 1:].to(device)  # slice off t=0 (input step)
+            if not has_region:
+                _init_region_agg(agg, fields)
+                has_region = True
+
         batch_num = state.shape[0]
 
         if use_amp:
-            with autocast(device_type="cuda", dtype=torch.bfloat16):   
+            with autocast(device_type="cuda", dtype=torch.bfloat16):
                 predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
-                costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss)
-            
+                costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss, active_mask=active_mask)
+
             costs["loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optim.step()
             optim.zero_grad()
-                
+
         else:
             predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
 
-            costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss)
+            costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss, active_mask=active_mask)
             costs["loss"].backward()
             optim.step()
             optim.zero_grad()
-            
+
         agg["loss"] += costs["loss"].item() * batch_num
         agg["value_loss"] += costs["value_loss"].item() * batch_num
         agg["grad_loss"] += costs["grad_loss"].item() * batch_num
@@ -241,16 +390,22 @@ def train(args, model, train_dataloader, optim, device, normalizer):
         agg["each_l2"] += costs["each_l2"] * batch_num
         agg["num"] += batch_num
 
+        if has_region:
+            _accumulate_region(agg, costs, batch_num, fields, include_loss=True)
+
         avg_loss = agg["loss"] / agg["num"]
         pbar.set_postfix({
             "Loss": f"{avg_loss :.4e}"
         })
 
     for key, value in agg.items():
-        if key != "each_l2" and key != "num":
-            agg[key] = value / agg["num"]
+        if key != "each_l2" and key != "num" and not key.endswith("_cnt"):
+            if key not in ("active_loss", "inactive_loss") and key not in _REGION_MEANS and not any(key.startswith(p + "_") for p in _REGION_PREFIXES):
+                agg[key] = value / agg["num"]
 
     agg["each_l2"] = (agg["each_l2"] / agg["num"]).cpu()
+    if has_region:
+        _finalize_region(agg, fields, agg["num"], include_loss=True)
     return agg
 
 
@@ -267,6 +422,7 @@ def validate(args, model, val_dataloader, device, normalizer, epoch):
             agg[key] = 0.0
     agg["each_l2"] = torch.zeros(horizon, device=device)
     agg["num"] = 0
+    has_region = False
 
     model.eval()
     normalizer.to(device)
@@ -286,15 +442,22 @@ def validate(args, model, val_dataloader, device, normalizer, epoch):
             time_seq = batch["time_seq"].to(device)
             conditions = batch["conditions"].to(device).float()
 
+            active_mask = batch.get("active_mask")
+            if active_mask is not None:
+                active_mask = active_mask[:, 1:].to(device)
+                if not has_region:
+                    _init_region_agg(agg, fields)
+                    has_region = True
+
             batch_num = state.shape[0]
 
             if use_amp:
                 with autocast("cuda", dtype=torch.bfloat16):
                     predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
-                    costs = get_val_loss(fields, predict_hat, state[:, 1:], normalizer)
+                    costs = get_val_loss(fields, predict_hat, state[:, 1:], normalizer, active_mask=active_mask)
             else:
                 predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
-                costs = get_val_loss(fields, predict_hat, state[:, 1:], normalizer)
+                costs = get_val_loss(fields, predict_hat, state[:, 1:], normalizer, active_mask=active_mask)
 
             for fname in fields:
                 agg[f"L2_{fname}"] += costs[f"L2_{fname}"].mean().item() * batch_num
@@ -302,20 +465,17 @@ def validate(args, model, val_dataloader, device, normalizer, epoch):
             agg["mean_l2"] += costs["mean_l2"].mean().item() * batch_num
             agg["each_l2"] += costs["each_l2"] * batch_num
             agg["num"] += batch_num
-            # 只保存 batch 中的第一个（任意一个）样本
-            # if i in viz_batch_indices:
-            #     # 随机选择一个样本进行可视化
-            #     sample_idx = random.randint(0, batch_num - 1)
-            #     pred_real = normalizer.denormalize(predict_hat)
-            #     gt_real = normalizer.denormalize(state[:, 1:])
 
-            #     from src.utils import save_vtk_result
-            #     save_vtk_result(save_dir=args.save_path, epoch=epoch, file_id=f"batch{i}_sample{sample_idx}",
-            #                     predictions=pred_real[sample_idx], ground_truths=gt_real[sample_idx], node_pos=node_pos[0], field_names=fields)
+            if has_region:
+                _accumulate_region(agg, costs, batch_num, fields, include_loss=False)
 
 
     for key, value in agg.items():
-        if key != "each_l2" and key != "num":
-            agg[key] = value / agg["num"]
+        if key != "each_l2" and key != "num" and not key.endswith("_cnt"):
+            if key not in _REGION_MEANS and not any(key.startswith(p + "_") for p in _REGION_PREFIXES):
+                agg[key] = value / agg["num"]
+
     agg["each_l2"] = (agg["each_l2"] / agg["num"]).cpu()
+    if has_region:
+        _finalize_region(agg, fields, agg["num"], include_loss=False)
     return agg

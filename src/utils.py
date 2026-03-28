@@ -65,6 +65,51 @@ class ChannelNormalizer:
         }
 
 
+def build_active_mask(state_raw, fields, mask_cfg):
+    """
+    Build per-channel boolean active mask from raw (unnormalized) state data.
+
+    Args:
+        state_raw: numpy array or torch tensor, shape [..., C] (raw physical values).
+                   Typically [T, N, C] from dataset or [B, T, N, C] from batch.
+        fields: list of field names, e.g. ["T", "alpha.air"]
+        mask_cfg: dict with "field" and "threshold" keys, or None.
+                  Example: {"field": ["T", "alpha.air"], "threshold": [800, [0.4, 0.6]]}
+
+    Returns:
+        active_mask: bool tensor same shape as state_raw, True where active.
+                     None if mask_cfg is None/empty or has no valid field+threshold.
+    """
+    if not mask_cfg:
+        return None
+    mask_fields = mask_cfg.get("field", [])
+    thresholds = mask_cfg.get("threshold", [])
+    if not mask_fields or not thresholds:
+        return None
+
+    if isinstance(state_raw, np.ndarray):
+        state_t = torch.from_numpy(state_raw)
+    else:
+        state_t = state_raw
+
+    mask = torch.zeros_like(state_t, dtype=torch.bool)
+
+    for i, fname in enumerate(fields):
+        if fname not in mask_fields:
+            continue
+        cfg_idx = mask_fields.index(fname)
+        if cfg_idx >= len(thresholds):
+            continue
+        thresh = thresholds[cfg_idx]
+        ch = state_t[..., i:i+1]
+        if isinstance(thresh, (list, tuple)):
+            mask[..., i:i+1] = (ch > thresh[0]) & (ch < thresh[1])
+        else:
+            mask[..., i:i+1] = ch > thresh
+
+    return mask
+
+
 def load_json_config(path: str):
     """加载JSON配置并转为SimpleNamespace，便于点号访问。"""
     with open(path, "r") as f:
