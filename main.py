@@ -124,8 +124,12 @@ def get_model(args, device, cond_dim, default_dt):
         base_kwargs.update(
             K_ratio=model_cfg.get("K_ratio", 0.1),
             knn_k=model_cfg.get("knn_k", 16),
+            radius_cutoff=model_cfg.get("radius_cutoff", 0.0),
             decoder_mode=model_cfg.get("decoder_mode", "cross_attention"),
             tau=model_cfg.get("tau", 1.0),
+            resample_every=model_cfg.get("resample_every", 5),
+            scorer_chunk_size=model_cfg.get("scorer_chunk_size", 100000),
+            decoder_chunk_size=model_cfg.get("decoder_chunk_size", 50000),
         )
     model = Model(**base_kwargs).to(device)
 

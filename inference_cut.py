@@ -87,8 +87,10 @@ class AeroGtoPredictor:
             from src.physgto_res import Model
         elif model_name == "gto_lnn":
             from src.gto_lnn import Model
-        
-        self.model = Model(
+        elif model_name in ("gto_sparse"):
+            from src.physgto_sparse import Model
+
+        model_kwargs = dict(
             space_size=self.args.model.get("space_size", 3),
             pos_enc_dim=self.args.model.get("pos_enc_dim", 5),
             cond_dim=cond_dim,
@@ -99,7 +101,19 @@ class AeroGtoPredictor:
             n_head=self.args.model.get("n_head", 4),
             n_token=self.args.model.get("n_token", 64),
             dt=self.args.model.get("dt", default_dt),
-        ).to(self.device)
+        )
+        if model_name in ("gto_sparse"):
+            model_kwargs.update(dict(
+                K_ratio=self.args.model.get("K_ratio", 0.1),
+                knn_k=self.args.model.get("knn_k", 16),
+                radius_cutoff=self.args.model.get("radius_cutoff", 0.0),
+                decoder_mode=self.args.model.get("decoder_mode", "cross_attention"),
+                tau=self.args.model.get("tau", 1.0),
+                resample_every=self.args.model.get("resample_every", 5),
+                scorer_chunk_size=self.args.model.get("scorer_chunk_size", 100000),
+                decoder_chunk_size=self.args.model.get("decoder_chunk_size", 50000),
+            ))
+        self.model = Model(**model_kwargs).to(self.device)
 
         # 3. 加载权重
         if model_path is None:
@@ -544,7 +558,7 @@ if __name__ == "__main__":
     MODE = "test"
     NAME = "config/aerogto_HR_easypool_v0.json"
     # === 配置区域 ===
-    CONFIG_PATH = f"config/aerogto_cut_easypool_downsample.json" 
+    CONFIG_PATH = f"config/sparse_fullres_easypool.json" 
     
     FIELD_TO_PLOT = None   # ["T", "Ux", "Uy", "Uz", "alpha.air", "alpha.titanium", "gamma_liquid"] 
     SLICE_AXIS = "z"        # 'x', 'y', 'z'
