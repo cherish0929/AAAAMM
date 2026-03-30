@@ -104,6 +104,210 @@ def get_val_loss(fields, predict_hat, state, normalizer):
     return losses
 
 
+# ---------------------------------------------------------------------------
+#  Adaptive-graph training & validation
+# ---------------------------------------------------------------------------
+
+def train_adaptive(args, model, train_dataloader, optim, device, normalizer, epoch):
+    """Training loop for the adaptive-graph model (PhysGTO_adaptive).
+
+    The key difference from the standard `train()`:
+      - Passes full-grid state, backbone graph info, and optionally ground-truth
+        states to `model.autoregressive()`.
+      - The model internally manages backbone + refinement graph refresh.
+    """
+    horizon = args.data.get("horizon_train", 1)
+    fields = args.data.get("fields", ["T"])
+    use_amp = args.model.get("use_amp", False)
+    check_point = args.model.get("check_point", False)
+    adaptive_cfg = getattr(args, "adaptive_graph", None) or {}
+
+    agg = {}
+    for key in ["loss", "L2", "mean_l2", "RMSE"]:
+        if key in ("L2", "RMSE"):
+            for fname in fields:
+                agg[f"{key}_{fname}"] = 0.0
+        else:
+            agg[key] = 0.0
+    agg["each_l2"] = torch.zeros(horizon, device=device)
+    agg["num"] = 0
+
+    model.train()
+    normalizer.to(device)
+    if use_amp:
+        scaler = GradScaler('cuda')
+
+    pbar = tqdm(train_dataloader, desc="  Train(adaptive)", unit="bt", leave=True, ncols=130, colour='green')
+    for batch in pbar:
+        dt_val = batch["dt"].to(device)
+        state = batch["state"].to(device)                       # [B, 1+H, N_full, C]
+        fullres_pos = batch["fullres_pos"].to(device)           # [B, N_full, 3]
+        backbone_indices = batch["backbone_indices"].to(device) # [B, N_bb]
+        backbone_shape = batch["backbone_shape"].to(device)     # [B, 3]
+        backbone_edges = batch["backbone_edges"].to(device)     # [B, E_bb, 2]
+        fullres_shape = batch["fullres_shape"].to(device)       # [B, 3]
+        time_seq = batch["time_seq"].to(device)                 # [B, H, 1]
+        conditions = batch["conditions"].to(device).float()     # [B, cond_dim]
+
+        batch_num = state.shape[0]
+
+        # ground-truth states for active-zone scoring (teacher signal)
+        gt_states = state[:, 1:]  # [B, H, N_full, C]
+
+        if use_amp:
+            with autocast(device_type="cuda", dtype=torch.bfloat16):
+                predict_hat = model.autoregressive(
+                    state_in_full=state[:, 0],
+                    fullres_pos=fullres_pos,
+                    backbone_indices=backbone_indices,
+                    backbone_shape=backbone_shape,
+                    backbone_edges=backbone_edges,
+                    fullres_shape=fullres_shape,
+                    time_seq=time_seq,
+                    conditions=conditions,
+                    gt_states=gt_states,
+                    dt=dt_val,
+                    check_point=check_point,
+                    epoch=epoch,
+                )
+                costs = get_train_loss(
+                    fields, predict_hat, gt_states, normalizer,
+                    args.train.get("loss_flag", "L2_norm_loss"),
+                )
+            costs["loss"].backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optim.step()
+            optim.zero_grad()
+        else:
+            predict_hat = model.autoregressive(
+                state_in_full=state[:, 0],
+                fullres_pos=fullres_pos,
+                backbone_indices=backbone_indices,
+                backbone_shape=backbone_shape,
+                backbone_edges=backbone_edges,
+                fullres_shape=fullres_shape,
+                time_seq=time_seq,
+                conditions=conditions,
+                gt_states=gt_states,
+                dt=dt_val,
+                check_point=check_point,
+                epoch=epoch,
+            )
+            costs = get_train_loss(
+                fields, predict_hat, gt_states, normalizer,
+                args.train.get("loss_flag", "L2_norm_loss"),
+            )
+            costs["loss"].backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optim.step()
+            optim.zero_grad()
+
+        agg["loss"] += costs["loss"].item() * batch_num
+        for fname in fields:
+            agg[f"L2_{fname}"] += costs[f"L2_{fname}"].mean().item() * batch_num
+            agg[f"RMSE_{fname}"] += costs[f"RMSE_{fname}"] * batch_num
+        agg["mean_l2"] += costs["mean_l2"].mean().item() * batch_num
+        agg["each_l2"] += costs["each_l2"] * batch_num
+        agg["num"] += batch_num
+
+        avg_loss = agg["loss"] / agg["num"]
+        pbar.set_postfix({"Loss": f"{avg_loss:.4e}"})
+
+    for key, value in agg.items():
+        if key not in ("each_l2", "num"):
+            agg[key] = value / agg["num"]
+    agg["each_l2"] = (agg["each_l2"] / agg["num"]).cpu()
+    return agg
+
+
+def validate_adaptive(args, model, val_dataloader, device, normalizer, epoch):
+    """Validation loop for the adaptive-graph model."""
+    horizon = args.data.get("horizon_test", 1)
+    fields = args.data.get("fields", ["T"])
+    use_amp = args.model.get("use_amp", False)
+    check_point = args.model.get("check_point", False)
+
+    agg = {}
+    for key in ["L2", "mean_l2", "RMSE"]:
+        if key in ("L2", "RMSE"):
+            for fname in fields:
+                agg[f"{key}_{fname}"] = 0.0
+        else:
+            agg[key] = 0.0
+    agg["each_l2"] = torch.zeros(horizon, device=device)
+    agg["num"] = 0
+
+    model.eval()
+    normalizer.to(device)
+
+    with torch.no_grad():
+        pbar = tqdm(val_dataloader, desc="  Valid(adaptive)", unit="bt", leave=False, ncols=130, colour='yellow')
+        for batch in pbar:
+            dt_val = batch["dt"].to(device)
+            state = batch["state"].to(device)
+            fullres_pos = batch["fullres_pos"].to(device)
+            backbone_indices = batch["backbone_indices"].to(device)
+            backbone_shape = batch["backbone_shape"].to(device)
+            backbone_edges = batch["backbone_edges"].to(device)
+            fullres_shape = batch["fullres_shape"].to(device)
+            time_seq = batch["time_seq"].to(device)
+            conditions = batch["conditions"].to(device).float()
+
+            batch_num = state.shape[0]
+            gt_states = state[:, 1:]
+
+            if use_amp:
+                with autocast("cuda", dtype=torch.bfloat16):
+                    predict_hat = model.autoregressive(
+                        state_in_full=state[:, 0],
+                        fullres_pos=fullres_pos,
+                        backbone_indices=backbone_indices,
+                        backbone_shape=backbone_shape,
+                        backbone_edges=backbone_edges,
+                        fullres_shape=fullres_shape,
+                        time_seq=time_seq,
+                        conditions=conditions,
+                        gt_states=gt_states,
+                        dt=dt_val,
+                        check_point=check_point,
+                        epoch=epoch,
+                    )
+                    costs = get_val_loss(fields, predict_hat, gt_states, normalizer)
+            else:
+                predict_hat = model.autoregressive(
+                    state_in_full=state[:, 0],
+                    fullres_pos=fullres_pos,
+                    backbone_indices=backbone_indices,
+                    backbone_shape=backbone_shape,
+                    backbone_edges=backbone_edges,
+                    fullres_shape=fullres_shape,
+                    time_seq=time_seq,
+                    conditions=conditions,
+                    gt_states=gt_states,
+                    dt=dt_val,
+                    check_point=check_point,
+                    epoch=epoch,
+                )
+                costs = get_val_loss(fields, predict_hat, gt_states, normalizer)
+
+            for fname in fields:
+                agg[f"L2_{fname}"] += costs[f"L2_{fname}"].mean().item() * batch_num
+                agg[f"RMSE_{fname}"] += costs[f"RMSE_{fname}"] * batch_num
+            agg["mean_l2"] += costs["mean_l2"].mean().item() * batch_num
+            agg["each_l2"] += costs["each_l2"] * batch_num
+            agg["num"] += batch_num
+
+    for key, value in agg.items():
+        if key not in ("each_l2", "num"):
+            agg[key] = value / agg["num"]
+    agg["each_l2"] = (agg["each_l2"] / agg["num"]).cpu()
+    return agg
+
+
+# ---------------------------------------------------------------------------
+#  Original (non-adaptive) training & validation — unchanged
+# ---------------------------------------------------------------------------
+
 def train(args, model, train_dataloader, optim, device, normalizer):
     horizon = args.data.get("horizon_train", 1) if isinstance(args.data, dict) else getattr(args, "horizon_train", 1)
     fields = args.data.get("fields", ["T"])

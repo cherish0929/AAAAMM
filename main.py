@@ -12,53 +12,59 @@ from torch.optim import AdamW
 
 # load specific modules for LPBF project
 from src.dataset import AeroGtoDataset
-from src.dataset_2d import AeroGtoDataset2D
 from src.dataset_cut import CutAeroGtoDataset
+from src.dataset_adaptive import AdaptiveGraphDataset
 # from src.physgto import Model
-from src.train import train, validate
+from src.train import train, validate, train_adaptive, validate_adaptive
 from src.utils import set_seed, init_weights, parse_args, load_json_config
 
 def get_dataloader(args, path_record, device_type):
     data_cfg = args.data
     model_cfg = args.model
     space_dim = model_cfg.get("space_size", 3)
-    
-    if space_dim == 3:
+    use_adaptive = data_cfg.get("adaptive", False)
+    adaptive_cfg = getattr(args, "adaptive_graph", None) or {}
+
+    if use_adaptive:
+        Datasetclass = AdaptiveGraphDataset
+    elif space_dim == 3:
         if data_cfg.get("cut", False):
             Datasetclass = CutAeroGtoDataset
         else:
             Datasetclass = AeroGtoDataset
-    elif space_dim == 2:
-        Datasetclass = AeroGtoDataset2D
-        
-    # 构建数据集
-    train_dataset = Datasetclass(
+
+    # shared kwargs
+    common_kwargs = dict(
         data_cfg=data_cfg,
-        file_list=data_cfg["train_list"],
-        mode="train",
         fields=data_cfg.get("fields", ["T"]),
         input_steps=data_cfg.get("input_steps", 1),
-        horizon=data_cfg.get("horizon_train", 1),
         time_stride=data_cfg.get("time_stride", 1),
         spatial_stride=data_cfg.get("spatial_stride", 1),
         normalize=data_cfg.get("normalize", True),
         samples_per_file=data_cfg.get("samples_per_file", 32),
         norm_cache=data_cfg.get("norm_cache"),
     )
+    if use_adaptive:
+        common_kwargs["adaptive_cfg"] = adaptive_cfg
+
+    train_dataset = Datasetclass(
+        file_list=data_cfg["train_list"],
+        mode="train",
+        horizon=data_cfg.get("horizon_train", 1),
+        **common_kwargs,
+    )
+
+    test_kwargs = dict(common_kwargs)
+    if not use_adaptive:
+        test_kwargs["mat_data"] = train_dataset.mat_mean_and_std if train_dataset.normalize else None
+    else:
+        test_kwargs["mat_data"] = train_dataset.mat_mean_and_std if train_dataset.normalize else None
 
     test_dataset = Datasetclass(
-        data_cfg=data_cfg,
         file_list=data_cfg["test_list"],
         mode="test",
-        fields=data_cfg.get("fields", ["T"]),
-        input_steps=data_cfg.get("input_steps", 1),
         horizon=data_cfg.get("horizon_test", 1),
-        time_stride=data_cfg.get("time_stride", 1),
-        spatial_stride=data_cfg.get("spatial_stride", 1),
-        normalize=data_cfg.get("normalize", True),
-        samples_per_file=data_cfg.get("samples_per_file", 32),
-        norm_cache=data_cfg.get("norm_cache"),
-        mat_data=train_dataset.mat_mean_and_std if train_dataset.normalize else None
+        **test_kwargs,
     )
     
     # 共享 Normalizer
@@ -85,7 +91,11 @@ def get_dataloader(args, path_record, device_type):
 
     # 记录数据集信息
     cond_dim = args.model.get("cond_dim") or train_dataset.cond_dim
-    edge_num = train_dataset.meta_cache[train_dataset.file_paths[0]]["edges"].shape[0]
+    first_meta = train_dataset.meta_cache[train_dataset.file_paths[0]]
+    if use_adaptive:
+        edge_num = first_meta["backbone_edges"].shape[0]
+    else:
+        edge_num = first_meta["edges"].shape[0]
     
     with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
         file.write(f"No. of train samples: {len(train_dataset)}, No. of test samples: {len(test_dataset)}\n")
@@ -98,26 +108,43 @@ def get_dataloader(args, path_record, device_type):
 def get_model(args, device, cond_dim, default_dt):
     model_cfg = args.model
     model_name = model_cfg.get("name", "PhysGTO")
+    adaptive_cfg = getattr(args, "adaptive_graph", None) or {}
 
-    if model_name == "PhysGTO":
-        from src.physgto import Model
-    elif model_name == "gto_res":
-        from src.physgto_res import Model
-    elif model_name == "gto_lnn":
-        from src.gto_lnn import Model
-    
-    model = Model(
-        space_size=model_cfg.get("space_size", 3),
-        pos_enc_dim=model_cfg.get("pos_enc_dim", 5),
-        cond_dim=cond_dim,
-        N_block=model_cfg.get("N_block", 4),
-        in_dim=model_cfg.get("in_dim", 4),
-        out_dim=model_cfg.get("out_dim", 4),
-        enc_dim=model_cfg.get("enc_dim", 128),
-        n_head=model_cfg.get("n_head", 4),
-        n_token=model_cfg.get("n_token", 64),
-        dt=model_cfg.get("dt", default_dt),
-    ).to(device)
+    if model_name == "PhysGTO_adaptive":
+        from src.physgto_adaptive import AdaptiveModel
+        model = AdaptiveModel(
+            space_size=model_cfg.get("space_size", 3),
+            pos_enc_dim=model_cfg.get("pos_enc_dim", 5),
+            cond_dim=cond_dim,
+            N_block=model_cfg.get("N_block", 4),
+            in_dim=model_cfg.get("in_dim", 4),
+            out_dim=model_cfg.get("out_dim", 4),
+            enc_dim=model_cfg.get("enc_dim", 128),
+            n_head=model_cfg.get("n_head", 4),
+            n_token=model_cfg.get("n_token", 64),
+            dt=model_cfg.get("dt", default_dt),
+            adaptive_cfg=adaptive_cfg,
+        ).to(device)
+    else:
+        if model_name == "PhysGTO":
+            from src.physgto import Model
+        elif model_name == "gto_res":
+            from src.physgto_res import Model
+        # elif model_name == "gto_lnn":
+        #     from src.gto_lnn import Model
+
+        model = Model(
+            space_size=model_cfg.get("space_size", 3),
+            pos_enc_dim=model_cfg.get("pos_enc_dim", 5),
+            cond_dim=cond_dim,
+            N_block=model_cfg.get("N_block", 4),
+            in_dim=model_cfg.get("in_dim", 4),
+            out_dim=model_cfg.get("out_dim", 4),
+            enc_dim=model_cfg.get("enc_dim", 128),
+            n_head=model_cfg.get("n_head", 4),
+            n_token=model_cfg.get("n_token", 64),
+            dt=model_cfg.get("dt", default_dt),
+        ).to(device)
 
     load_path = model_cfg.get("load_path")
     checkpoint = None
@@ -143,20 +170,24 @@ def main(args, path_logs, path_nn, path_record):
         print("! Warning: CUDA not available, using CPU")
         device_str = "cpu"
     device = torch.device(device_str)
-    
+
     EPOCH = int(args.train["epoch"])
     real_lr = float(args.train["lr"])
-    fields = args.data.get("fields", ["T"]) # 获取物理场列表，例如 ['T', 'Ux', 'Uy', 'Uz']
+    fields = args.data.get("fields", ["T"])
+    use_adaptive = args.data.get("adaptive", False)
 
     # dataloader & normalizer
     train_dataloader, test_dataloader, normalizer, cond_dim, default_dt = get_dataloader(args, path_record, device_str)
 
     # model
-    model, checkpoint = get_model(args, device, cond_dim, default_dt)    
-    model_parameters = filter(lambda p: p.requires_grad, model.parameters())    
+    model, checkpoint = get_model(args, device, cond_dim, default_dt)
+    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     params = int(sum([np.prod(p.size()) for p in model_parameters]))
 
-    print(f"EPOCH: {EPOCH}, #params: {params/1e6:.2f}M")      
+    print(f"EPOCH: {EPOCH}, #params: {params/1e6:.2f}M")
+    if use_adaptive:
+        print(f"[Adaptive Graph] backbone stride={getattr(args, 'adaptive_graph', {}).get('backbone', {}).get('stride', [2,2,2])}, "
+              f"refresh_K={getattr(args, 'adaptive_graph', {}).get('refinement', {}).get('refresh_every_K', 4)}")
 
     with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
         file.write(f"Using device: {device}\n")
@@ -201,15 +232,15 @@ def main(args, path_logs, path_nn, path_record):
     
     for epoch in range(start_epoch, EPOCH):
         start_time = time.time()
-        # Train
-        train_error = train(
-            args,
-            model,
-            train_dataloader,
-            optimizer,
-            device,
-            normalizer
-        )
+        # Train — dispatch to adaptive or standard
+        if use_adaptive:
+            train_error = train_adaptive(
+                args, model, train_dataloader, optimizer, device, normalizer, epoch
+            )
+        else:
+            train_error = train(
+                args, model, train_dataloader, optimizer, device, normalizer
+            )
         end_time = time.time()
 
         scheduler.step()
@@ -260,8 +291,11 @@ def main(args, path_logs, path_nn, path_record):
         # Validation
         eval_every = args.train.get("eval_every", 5)
         if (epoch+1) % eval_every == 0 or epoch == 0 or (epoch+1) == EPOCH:
-            start_time = time.time() 
-            test_error = validate(args, model, test_dataloader, device, normalizer, epoch+1)
+            start_time = time.time()
+            if use_adaptive:
+                test_error = validate_adaptive(args, model, test_dataloader, device, normalizer, epoch+1)
+            else:
+                test_error = validate(args, model, test_dataloader, device, normalizer, epoch+1)
             end_time = time.time()
             
             val_time = (end_time - start_time)
