@@ -1,57 +1,517 @@
 """
-adaptive_graph.py
-=================
+adaptive_graph.py  (zone-first refactored)
+==========================================
 Dynamic adaptive graph construction for LPBF physics field prediction.
 
-Architecture overview:
-  1. Backbone graph  – coarse, fixed, always present (Section: build_backbone_*)
-  2. Active zone scoring – gradient + temporal change (Section: compute_active_score)
-  3. Zone classification – core / ring / background (Section: classify_zones)
-  4. Refinement point sampling – from high-res candidates (Section: sample_refinement_points)
-  5. Hybrid edge construction – backbone-backbone fixed + local radius/KNN (Section: build_combined_edges)
-  6. Graph refresh logic – called every K steps (Section: refresh_refinement_graph)
+## Core design principle (本次重构核心):
+    "先分区, 再采样, 再建边"
+    Zone-first, then sample, then build edges.
+
+    backbone 现在只是背景参考层 / 全局粗网格存档层。
+    active 区域优先级高于 backbone。
+    所有采样和建边决策以 zone 为主, 而不是以 backbone 身份为主。
+
+Architecture:
+  1. Active zone scoring   – regular-grid finite-difference gradient + temporal
+                             change + physics-trigger terms (Section 1)
+  2. Zone classification   – core / ring / background (Section 2)
+  3. Zone-first sampling   – zone-priority, not backbone-priority (Section 3)
+  4. Stencil edge builder  – structured grid stencils per zone (Section 4)
+  5. Cross-layer edges     – coarse-fine parent-child mapping (Section 5)
+  6. Graph refresh + delayed writeback manager (Section 6)
 """
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 
-# ---------------------------------------------------------------------------
-#  1. Backbone graph construction (固定粗网格骨架图)
-# ---------------------------------------------------------------------------
+# ===================================================================
+#  1. Active zone scoring  (规则网格有限差分 + 时间变化 + 物理触发)
+# ===================================================================
+
+def compute_active_score(
+    pred_field: torch.Tensor,
+    gt_field: Optional[torch.Tensor],
+    prev_field: torch.Tensor,
+    grid_shape: Tuple[int, int, int],
+    gradient_weight: float = 0.5,
+    temporal_weight: float = 0.3,
+    physics_weight: float = 0.2,
+    gt_blend: float = 1.0,
+    physics_triggers: Optional[Dict] = None,
+) -> torch.Tensor:
+    """Per-node activity score in [0, 1].
+
+    Composed of three terms (all normalized to [0,1] before blending):
+      a) spatial gradient  – regular-grid 6-neighbor finite difference
+      b) temporal change   – |field_t - field_{t-1}|
+      c) physics triggers  – per-channel thresholding (e.g. high T, velocity mag)
+
+    Uses regular cubic grid finite-difference instead of KNN gradient,
+    exploiting the structured-grid nature of LPBF data.
+
+    Args:
+        pred_field:  [N, C] predicted state (normalized).
+        gt_field:    [N, C] ground-truth state (normalized), or None.
+        prev_field:  [N, C] previous-step state (normalized).
+        grid_shape:  (nx, ny, nz) of the full-resolution structured grid.
+        physics_triggers: dict mapping channel_index -> threshold, e.g.
+            {0: 0.8, 3: 0.5}.  A node scores 1 for a channel if its
+            normalized value exceeds the threshold.
+    """
+    if gt_field is not None and gt_blend > 0.0:
+        field = gt_blend * gt_field + (1.0 - gt_blend) * pred_field
+    else:
+        field = pred_field
+
+    device = field.device
+
+    # --- a) spatial gradient via regular-grid finite difference ---
+    spatial_grad = _grid_finite_difference_gradient(field, grid_shape)
+
+    # --- b) temporal change rate ---
+    temporal_change = (field - prev_field).abs().mean(dim=-1)
+
+    # --- c) physics-trigger score ---
+    physics_score = _physics_trigger_score(field, physics_triggers)
+
+    # normalize each to [0, 1]
+    spatial_grad = _safe_minmax(spatial_grad)
+    temporal_change = _safe_minmax(temporal_change)
+    # physics_score is already in [0, 1]
+
+    score = (gradient_weight * spatial_grad
+             + temporal_weight * temporal_change
+             + physics_weight * physics_score)
+    return score.clamp(0.0, 1.0)
+
+
+def _grid_finite_difference_gradient(
+    field: torch.Tensor,
+    grid_shape: Tuple[int, int, int],
+) -> torch.Tensor:
+    """Approximate spatial gradient magnitude using 6-neighbor stencil on
+    the regular cubic grid (central differences).
+
+    Much faster than KNN-based gradient: O(N) with no distance computation.
+
+    Returns:
+        grad_mag: [N] per-node gradient magnitude.
+    """
+    nx, ny, nz = grid_shape
+    C = field.shape[-1]
+    # reshape to (nz, ny, nx, C) matching the flat-index layout:
+    #   flat = z * nx * ny + y * nx + x
+    vol = field.view(nz, ny, nx, C)
+
+    grad_sq = torch.zeros(nz, ny, nx, device=field.device)
+
+    # central differences along each axis, forward/backward at boundaries
+    # x-axis (dim=2)
+    if nx > 1:
+        dx = torch.zeros_like(vol)
+        dx[:, :, 1:-1] = (vol[:, :, 2:] - vol[:, :, :-2]) / 2.0
+        dx[:, :, 0] = vol[:, :, 1] - vol[:, :, 0]
+        dx[:, :, -1] = vol[:, :, -1] - vol[:, :, -2]
+        grad_sq += (dx ** 2).sum(dim=-1)
+
+    # y-axis (dim=1)
+    if ny > 1:
+        dy = torch.zeros_like(vol)
+        dy[:, 1:-1] = (vol[:, 2:] - vol[:, :-2]) / 2.0
+        dy[:, 0] = vol[:, 1] - vol[:, 0]
+        dy[:, -1] = vol[:, -1] - vol[:, -2]
+        grad_sq += (dy ** 2).sum(dim=-1)
+
+    # z-axis (dim=0)
+    if nz > 1:
+        dz = torch.zeros_like(vol)
+        dz[1:-1] = (vol[2:] - vol[:-2]) / 2.0
+        dz[0] = vol[1] - vol[0]
+        dz[-1] = vol[-1] - vol[-2]
+        grad_sq += (dz ** 2).sum(dim=-1)
+
+    grad_mag = grad_sq.sqrt().view(-1)  # [N]
+    return grad_mag
+
+
+def _physics_trigger_score(
+    field: torch.Tensor,
+    triggers: Optional[Dict],
+) -> torch.Tensor:
+    """Per-node physics-based trigger score in [0, 1].
+
+    Each trigger maps a channel index to a threshold.  If the node's
+    normalized value for that channel exceeds the threshold, that
+    channel contributes 1.0; otherwise 0.0.  The final score is
+    the max across triggered channels (any-of semantics).
+
+    If no triggers are configured, returns zeros (neutral contribution).
+    """
+    N = field.shape[0]
+    device = field.device
+    if not triggers:
+        return torch.zeros(N, device=device)
+
+    score = torch.zeros(N, device=device)
+    for ch_idx, threshold in triggers.items():
+        ch_idx = int(ch_idx)
+        if ch_idx < field.shape[-1]:
+            # use abs value so both positive/negative extremes trigger
+            ch_val = field[:, ch_idx].abs()
+            ch_norm = _safe_minmax(ch_val)
+            triggered = (ch_norm >= threshold).float()
+            score = torch.max(score, triggered)
+    return score
+
+
+def _safe_minmax(x: torch.Tensor) -> torch.Tensor:
+    """Min-max normalize to [0, 1]; returns zeros if range is negligible."""
+    xmin, xmax = x.min(), x.max()
+    rng = xmax - xmin
+    if rng < 1e-12:
+        return torch.zeros_like(x)
+    return (x - xmin) / rng
+
+
+# ===================================================================
+#  2. Zone classification (core / ring / background)
+# ===================================================================
+
+def classify_zones(
+    score: torch.Tensor,
+    core_threshold: float = 0.6,
+    ring_threshold: float = 0.2,
+) -> torch.Tensor:
+    """Classify nodes: 2=core, 1=ring, 0=background.
+
+    This operates on the FULL grid — backbone identity is irrelevant here.
+    """
+    zone = torch.zeros_like(score, dtype=torch.long)
+    zone[score >= ring_threshold] = 1
+    zone[score >= core_threshold] = 2
+    return zone
+
+
+# ===================================================================
+#  3. Zone-first point sampling
+#     核心原则: 先按 zone 决定保留, 而不是先按 backbone 身份决定保留.
+#     backbone 点如果落在 core/ring 里, 按 core/ring 规则保留.
+#     background 区域只保留 coarse backbone 点.
+# ===================================================================
+
+def zone_first_sample(
+    zone_full: torch.Tensor,
+    backbone_mask: torch.Tensor,
+    core_keep_ratio: float = 1.0,
+    ring_keep_ratio: float = 0.5,
+    background_extra_ratio: float = 0.0,
+) -> torch.Tensor:
+    """Zone-priority sampling — zone determines keep ratio, not backbone status.
+
+    Logic:
+      - core (zone==2):  keep core_keep_ratio of ALL core nodes (backbone or not)
+      - ring  (zone==1):  keep ring_keep_ratio of ALL ring nodes
+      - background (zone==0): keep ONLY backbone nodes (coarse reference layer)
+        optionally keep background_extra_ratio of non-backbone background nodes
+
+    Returns:
+        selected_indices: 1-D long tensor, indices into full grid for the
+            combined sub-graph (includes backbone nodes in active zones AND
+            non-backbone active nodes).
+    """
+    device = zone_full.device
+    selected = []
+
+    # ---- core zone (highest priority) ----
+    core_all = torch.where(zone_full == 2)[0]
+    if core_all.numel() > 0:
+        n_keep = max(1, int(core_all.numel() * core_keep_ratio))
+        if n_keep < core_all.numel():
+            perm = torch.randperm(core_all.numel(), device=device)[:n_keep]
+            selected.append(core_all[perm])
+        else:
+            selected.append(core_all)
+
+    # ---- ring zone ----
+    ring_all = torch.where(zone_full == 1)[0]
+    if ring_all.numel() > 0:
+        n_keep = max(1, int(ring_all.numel() * ring_keep_ratio))
+        if n_keep < ring_all.numel():
+            perm = torch.randperm(ring_all.numel(), device=device)[:n_keep]
+            selected.append(ring_all[perm])
+        else:
+            selected.append(ring_all)
+
+    # ---- background zone: only backbone nodes ----
+    bg_backbone = torch.where((zone_full == 0) & backbone_mask)[0]
+    if bg_backbone.numel() > 0:
+        selected.append(bg_backbone)
+
+    # optional: small fraction of non-backbone background for smoothness
+    if background_extra_ratio > 0.0:
+        bg_non_bb = torch.where((zone_full == 0) & (~backbone_mask))[0]
+        if bg_non_bb.numel() > 0:
+            n_keep = max(1, int(bg_non_bb.numel() * background_extra_ratio))
+            perm = torch.randperm(bg_non_bb.numel(), device=device)[:n_keep]
+            selected.append(bg_non_bb[perm])
+
+    if selected:
+        all_selected = torch.cat(selected)
+        # deduplicate (a backbone node in core was already selected by core)
+        all_selected = torch.unique(all_selected)
+        return all_selected
+
+    # fallback: at least backbone
+    return torch.where(backbone_mask)[0]
+
+
+# ===================================================================
+#  4. Stencil-based edge construction on the regular grid
+#     利用规则立方体网格优势, 用结构化 stencil 替代 KNN/radius graph.
+# ===================================================================
+
+# Pre-computed stencil offsets (dx, dy, dz) for 6/18/26 connectivity
+_STENCIL_6 = [
+    (-1, 0, 0), (1, 0, 0),
+    (0, -1, 0), (0, 1, 0),
+    (0, 0, -1), (0, 0, 1),
+]
+
+_STENCIL_18 = _STENCIL_6 + [
+    (-1, -1, 0), (-1, 1, 0), (1, -1, 0), (1, 1, 0),
+    (-1, 0, -1), (-1, 0, 1), (1, 0, -1), (1, 0, 1),
+    (0, -1, -1), (0, -1, 1), (0, 1, -1), (0, 1, 1),
+]
+
+_STENCIL_26 = _STENCIL_18 + [
+    (-1, -1, -1), (-1, -1, 1), (-1, 1, -1), (-1, 1, 1),
+    (1, -1, -1), (1, -1, 1), (1, 1, -1), (1, 1, 1),
+]
+
+
+def build_stencil_edges(
+    selected_indices: torch.Tensor,
+    zone_labels: torch.Tensor,
+    grid_shape: Tuple[int, int, int],
+    backbone_mask: torch.Tensor,
+    bg_stencil: int = 6,
+    ring_stencil: int = 18,
+    core_stencil: int = 26,
+) -> torch.Tensor:
+    """Build edges using structured-grid stencils, per-zone connectivity.
+
+    Each selected node gets edges to neighbors that are also selected,
+    with the stencil size determined by the node's zone:
+      - background/backbone: 6-neighbor
+      - ring:                18-neighbor (or 6)
+      - core:                26-neighbor (or 18)
+
+    This replaces the old KNN/radius-based refinement edge construction.
+
+    Args:
+        selected_indices: [N_sel] indices into the full grid (flat).
+        zone_labels:      [N_full] zone labels for the full grid.
+        grid_shape:       (nx, ny, nz).
+        backbone_mask:    [N_full] bool.
+        bg_stencil:       stencil size for background (6).
+        ring_stencil:     stencil size for ring (6 or 18).
+        core_stencil:     stencil size for core (18 or 26).
+
+    Returns:
+        edges: [E, 2] long tensor in LOCAL indexing (0-based within selected_indices).
+    """
+    nx, ny, nz = grid_shape
+    device = selected_indices.device
+    N_sel = selected_indices.shape[0]
+
+    if N_sel == 0:
+        return torch.zeros((0, 2), dtype=torch.long, device=device)
+
+    stencil_map = {6: _STENCIL_6, 18: _STENCIL_18, 26: _STENCIL_26}
+    bg_offsets = stencil_map.get(bg_stencil, _STENCIL_6)
+    ring_offsets = stencil_map.get(ring_stencil, _STENCIL_18)
+    core_offsets = stencil_map.get(core_stencil, _STENCIL_26)
+
+    # Build lookup: full_grid_flat_idx -> local index in selected_indices
+    # Use a dense tensor for O(1) lookup (memory: N_full ints, acceptable)
+    N_full = nx * ny * nz
+    full_to_local = torch.full((N_full,), -1, dtype=torch.long, device=device)
+    full_to_local[selected_indices] = torch.arange(N_sel, device=device)
+
+    # Convert flat indices to (x, y, z) coordinates
+    sel_np = selected_indices  # keep on device
+    sel_x = sel_np % nx
+    sel_y = (sel_np // nx) % ny
+    sel_z = sel_np // (nx * ny)
+
+    # Zone of each selected node
+    sel_zone = zone_labels[selected_indices]
+
+    # Prepare offset tensors for each stencil level
+    def _offsets_tensor(offsets_list):
+        return torch.tensor(offsets_list, dtype=torch.long, device=device)  # [K, 3]
+
+    bg_off_t = _offsets_tensor(bg_offsets)      # [6, 3]
+    ring_off_t = _offsets_tensor(ring_offsets)   # [18, 3]
+    core_off_t = _offsets_tensor(core_offsets)   # [26, 3]
+
+    # Vectorized edge construction per zone level
+    edge_list = []
+
+    for zone_val, off_t in [(0, bg_off_t), (1, ring_off_t), (2, core_off_t)]:
+        mask = (sel_zone == zone_val)
+        if not mask.any():
+            continue
+
+        local_ids = torch.where(mask)[0]  # local indices of this zone
+        n_zone = local_ids.shape[0]
+        K = off_t.shape[0]
+
+        # coordinates of these nodes: [n_zone]
+        zx = sel_x[local_ids]
+        zy = sel_y[local_ids]
+        zz = sel_z[local_ids]
+
+        # neighbor coords: [n_zone, K]
+        nb_x = zx.unsqueeze(1) + off_t[:, 0].unsqueeze(0)  # [n_zone, K]
+        nb_y = zy.unsqueeze(1) + off_t[:, 1].unsqueeze(0)
+        nb_z = zz.unsqueeze(1) + off_t[:, 2].unsqueeze(0)
+
+        # boundary check
+        valid = ((nb_x >= 0) & (nb_x < nx) &
+                 (nb_y >= 0) & (nb_y < ny) &
+                 (nb_z >= 0) & (nb_z < nz))
+
+        # compute flat indices for valid neighbors
+        nb_flat = nb_z * (nx * ny) + nb_y * nx + nb_x  # [n_zone, K]
+        nb_flat = nb_flat.clamp(0, N_full - 1)  # safe clamp for invalid
+
+        # check if neighbor is in selected set
+        nb_local = full_to_local[nb_flat]  # [n_zone, K], -1 if not selected
+        in_selected = (nb_local >= 0) & valid
+
+        # build source indices (local)
+        src_local = local_ids.unsqueeze(1).expand(-1, K)  # [n_zone, K]
+
+        # extract valid edges
+        src_edges = src_local[in_selected]
+        dst_edges = nb_local[in_selected]
+
+        if src_edges.numel() > 0:
+            edge_list.append(torch.stack([src_edges, dst_edges], dim=1))
+
+    if edge_list:
+        edges = torch.cat(edge_list, dim=0)
+        # remove self-loops (shouldn't happen with nonzero offsets, but safety)
+        mask = edges[:, 0] != edges[:, 1]
+        edges = edges[mask]
+        return edges
+
+    return torch.zeros((0, 2), dtype=torch.long, device=device)
+
+
+# ===================================================================
+#  5. Cross-layer (coarse-fine) edges via parent-child grid mapping
+#     用规则网格的 parent-child 映射替代全局 KNN 跨层连接.
+# ===================================================================
+
+def build_cross_layer_edges(
+    selected_indices: torch.Tensor,
+    zone_labels: torch.Tensor,
+    backbone_indices_set: torch.Tensor,
+    backbone_stride: Tuple[int, int, int],
+    grid_shape: Tuple[int, int, int],
+    full_to_local: torch.Tensor,
+) -> torch.Tensor:
+    """Build cross-layer edges between fine (core/ring) nodes and their
+    coarse backbone parent cells using regular-grid parent-child mapping.
+
+    For each fine node at (x,y,z), its parent backbone node is at
+    (x // sx, y // sy, z // sz) * stride.  We connect the fine node to
+    the nearest backbone node(s) using the stride relationship.
+
+    This replaces the old KNN-based cross edges.
+
+    Returns:
+        edges: [E, 2] in local indexing (within selected_indices).
+    """
+    nx, ny, nz = grid_shape
+    sx, sy, sz = backbone_stride
+    device = selected_indices.device
+    N_full = nx * ny * nz
+
+    # fine nodes = core or ring nodes in the selected set
+    sel_zone = zone_labels[selected_indices]
+    fine_mask = (sel_zone >= 1)  # ring or core
+    if not fine_mask.any():
+        return torch.zeros((0, 2), dtype=torch.long, device=device)
+
+    fine_local = torch.where(fine_mask)[0]
+    fine_full = selected_indices[fine_local]
+
+    # convert to coordinates
+    fine_x = fine_full % nx
+    fine_y = (fine_full // nx) % ny
+    fine_z = fine_full // (nx * ny)
+
+    # parent backbone coordinates (nearest coarse grid node)
+    # round to nearest stride multiple
+    parent_x = ((fine_x + sx // 2) // sx * sx).clamp(0, nx - 1)
+    parent_y = ((fine_y + sy // 2) // sy * sy).clamp(0, ny - 1)
+    parent_z = ((fine_z + sz // 2) // sz * sz).clamp(0, nz - 1)
+
+    parent_flat = parent_z * (nx * ny) + parent_y * nx + parent_x
+
+    # check if parent is in our selected set
+    parent_local = full_to_local[parent_flat]
+    valid = (parent_local >= 0)
+
+    # also avoid self-loops
+    valid = valid & (fine_local != parent_local)
+
+    if not valid.any():
+        return torch.zeros((0, 2), dtype=torch.long, device=device)
+
+    # bidirectional edges
+    src = fine_local[valid]
+    dst = parent_local[valid]
+
+    fwd = torch.stack([src, dst], dim=1)
+    bwd = torch.stack([dst, src], dim=1)
+    edges = torch.cat([fwd, bwd], dim=0)
+
+    return edges
+
+
+# ===================================================================
+#  6. AdaptiveGraphManager  (zone-first, delayed writeback)
+# ===================================================================
 
 def build_backbone_indices(
     grid_shape: Tuple[int, int, int],
     backbone_stride: Tuple[int, int, int],
 ) -> Tuple[np.ndarray, Tuple[int, int, int]]:
-    """Compute 1-D flat indices for the backbone (coarse) grid.
+    """Compute backbone (coarse grid) indices — kept for dataset compatibility.
 
-    The backbone is a regularly-strided subset of the full-resolution grid.
-    Boundary points are always included to avoid losing edge information.
-
-    Returns:
-        backbone_indices: 1-D array of flat indices into the full grid.
-        backbone_shape: (nx_b, ny_b, nz_b) of the backbone sub-grid.
+    backbone 现在只是背景参考层 / 全局粗网格存档层, 不再是优先保留的主图.
     """
     gx, gy, gz = grid_shape
     sx, sy, sz = backbone_stride
-
     xs = list(range(0, gx, sx))
     ys = list(range(0, gy, sy))
     zs = list(range(0, gz, sz))
-    # always include last point per axis
     if xs[-1] != gx - 1:
         xs.append(gx - 1)
     if ys[-1] != gy - 1:
         ys.append(gy - 1)
     if zs[-1] != gz - 1:
         zs.append(gz - 1)
-
     backbone_shape = (len(xs), len(ys), len(zs))
     indices = []
     for z in zs:
@@ -66,18 +526,10 @@ def build_backbone_edges(
     backbone_shape: Tuple[int, int, int],
     sample_ratio: float = 1.0,
 ) -> torch.Tensor:
-    """6-neighbor grid edges for the backbone sub-grid.
-
-    This is identical to the existing `_build_grid_edges`, kept here for
-    clarity and to decouple the backbone from the dataset module.
-
-    Returns:
-        edges: [E_bb, 2] long tensor (undirected, deduplicated).
-    """
+    """6-neighbor edges for backbone — kept for dataset compatibility."""
     nx, ny, nz = backbone_shape
     idx_grid = np.arange(nx * ny * nz).reshape(nz, ny, nx)
     parts = []
-
     if nx > 1:
         src = idx_grid[:, :, :-1].flatten()
         dst = idx_grid[:, :, 1:].flatten()
@@ -90,403 +542,28 @@ def build_backbone_edges(
         src = idx_grid[:-1, :, :].flatten()
         dst = idx_grid[1:, :, :].flatten()
         parts.append(np.stack([src, dst], axis=1))
-
     if parts:
         edges_arr = np.concatenate(parts, axis=0)
     else:
         edges_arr = np.zeros((0, 2), dtype=np.int64)
-
     if sample_ratio < 1.0 and edges_arr.shape[0] > 0:
         total = edges_arr.shape[0]
         keep = int(total * sample_ratio)
         sel = np.random.choice(total, keep, replace=False)
         edges_arr = edges_arr[sel]
-
     return torch.from_numpy(edges_arr.astype(np.int64))
 
 
-# ---------------------------------------------------------------------------
-#  2. Active zone scoring (活跃区域评分)
-# ---------------------------------------------------------------------------
-
-def compute_active_score(
-    pred_field: torch.Tensor,
-    gt_field: torch.Tensor,
-    prev_field: torch.Tensor,
-    node_pos: torch.Tensor,
-    gradient_weight: float = 0.6,
-    temporal_weight: float = 0.4,
-    gt_blend: float = 1.0,
-) -> torch.Tensor:
-    """Per-node activity score in [0, 1] based on spatial gradient + temporal change.
-
-    The score blends contributions from the predicted field and the ground-truth
-    field.  As training progresses, `gt_blend` decreases from 1 → 0 so the model
-    increasingly relies on its own predictions for refinement decisions.
-
-    Args:
-        pred_field:  [N, C] predicted physical state (normalized).
-        gt_field:    [N, C] ground-truth physical state (normalized), or None.
-        prev_field:  [N, C] state at the previous time-step (normalized).
-        node_pos:    [N, 3] spatial positions.
-        gradient_weight: weight for the spatial gradient term.
-        temporal_weight: weight for the temporal change term.
-        gt_blend:    blend ratio for ground-truth (1 = use GT fully, 0 = pred only).
-
-    Returns:
-        score: [N] tensor in [0, 1].
-    """
-    # blend predicted and ground-truth fields for scoring
-    if gt_field is not None and gt_blend > 0.0:
-        field = gt_blend * gt_field + (1.0 - gt_blend) * pred_field
-    else:
-        field = pred_field
-
-    N = field.shape[0]
-    device = field.device
-
-    # --- spatial gradient approximation via finite differences to neighbors ---
-    # Use pairwise distances to 8 nearest neighbors (cheap approx with cdist chunk)
-    spatial_grad = _approximate_spatial_gradient(field, node_pos)
-
-    # --- temporal change rate ---
-    temporal_change = (field - prev_field).abs().mean(dim=-1)  # [N]
-
-    # normalize each term to [0, 1]
-    spatial_grad = _safe_minmax(spatial_grad)
-    temporal_change = _safe_minmax(temporal_change)
-
-    score = gradient_weight * spatial_grad + temporal_weight * temporal_change
-    return score.clamp(0.0, 1.0)
-
-
-def _approximate_spatial_gradient(
-    field: torch.Tensor,
-    pos: torch.Tensor,
-    k: int = 6,
-    chunk_size: int = 4096,
-) -> torch.Tensor:
-    """Approximate per-node spatial gradient magnitude using KNN differences.
-
-    Computes gradient as the mean absolute field difference to the k nearest
-    neighbors, weighted by inverse distance.  Uses chunked cdist to keep
-    memory bounded.
-
-    Returns:
-        grad_mag: [N] tensor.
-    """
-    N = pos.shape[0]
-    device = pos.device
-    k_use = min(k + 1, N)  # +1 because the nearest is the node itself
-
-    grad_mag = torch.zeros(N, device=device)
-
-    for start in range(0, N, chunk_size):
-        end = min(start + chunk_size, N)
-        # [chunk, N]
-        dists = torch.cdist(pos[start:end].unsqueeze(0), pos.unsqueeze(0)).squeeze(0)
-        # top-k nearest (excluding self)
-        _, idx = dists.topk(k_use, dim=-1, largest=False)
-        # drop self (index 0 in sorted)
-        nn_idx = idx[:, 1:]  # [chunk, k]
-
-        # field differences
-        chunk_field = field[start:end]  # [chunk, C]
-        neighbor_field = field[nn_idx]  # [chunk, k, C]
-        diff = (neighbor_field - chunk_field.unsqueeze(1)).abs().mean(dim=-1)  # [chunk, k]
-
-        # inverse-distance weighting
-        nn_dists = torch.gather(dists, 1, nn_idx)  # [chunk, k]
-        weights = 1.0 / (nn_dists + 1e-8)
-        weights = weights / weights.sum(dim=-1, keepdim=True)
-
-        grad_mag[start:end] = (diff * weights).sum(dim=-1)
-
-    return grad_mag
-
-
-def _safe_minmax(x: torch.Tensor) -> torch.Tensor:
-    """Min-max normalize to [0, 1]; returns zeros if range is negligible."""
-    xmin, xmax = x.min(), x.max()
-    rng = xmax - xmin
-    if rng < 1e-12:
-        return torch.zeros_like(x)
-    return (x - xmin) / rng
-
-
-# ---------------------------------------------------------------------------
-#  3. Zone classification (三层区域分类: core / ring / background)
-# ---------------------------------------------------------------------------
-
-def classify_zones(
-    score: torch.Tensor,
-    core_threshold: float = 0.6,
-    ring_threshold: float = 0.2,
-) -> torch.Tensor:
-    """Classify nodes into 3 zones based on activity score.
-
-    Returns:
-        zone: [N] int tensor with values:
-            2 = core  (high activity, dense refinement)
-            1 = ring  (transition, medium refinement)
-            0 = background (backbone only)
-    """
-    zone = torch.zeros_like(score, dtype=torch.long)
-    zone[score >= ring_threshold] = 1  # ring
-    zone[score >= core_threshold] = 2  # core
-    return zone
-
-
-# ---------------------------------------------------------------------------
-#  4. Refinement point sampling (从全分辨率候选中采样加密点)
-# ---------------------------------------------------------------------------
-
-def sample_refinement_points(
-    zone_full: torch.Tensor,
-    backbone_mask: torch.Tensor,
-    core_keep_ratio: float = 1.0,
-    ring_keep_ratio: float = 0.5,
-) -> torch.Tensor:
-    """Select refinement point indices from the full-resolution candidate set.
-
-    Backbone points are never duplicated here — they are always present in the
-    combined graph.  This function only selects *additional* high-res points.
-
-    Args:
-        zone_full:     [N_full] zone labels (0/1/2) for every full-res node.
-        backbone_mask: [N_full] bool, True for nodes already in the backbone.
-        core_keep_ratio: fraction of non-backbone core nodes to keep.
-        ring_keep_ratio: fraction of non-backbone ring nodes to keep.
-
-    Returns:
-        refinement_indices: 1-D long tensor of indices into the full-res grid
-                            for the selected refinement points (excludes backbone).
-    """
-    non_backbone = ~backbone_mask
-    selected = []
-
-    # core points (zone == 2) that are NOT backbone
-    core_candidates = torch.where(non_backbone & (zone_full == 2))[0]
-    if core_candidates.numel() > 0:
-        n_keep = max(1, int(core_candidates.numel() * core_keep_ratio))
-        perm = torch.randperm(core_candidates.numel(), device=core_candidates.device)[:n_keep]
-        selected.append(core_candidates[perm])
-
-    # ring points (zone == 1) that are NOT backbone
-    ring_candidates = torch.where(non_backbone & (zone_full == 1))[0]
-    if ring_candidates.numel() > 0:
-        n_keep = max(1, int(ring_candidates.numel() * ring_keep_ratio))
-        perm = torch.randperm(ring_candidates.numel(), device=ring_candidates.device)[:n_keep]
-        selected.append(ring_candidates[perm])
-
-    if selected:
-        return torch.cat(selected)
-    return torch.zeros(0, dtype=torch.long, device=zone_full.device)
-
-
-# ---------------------------------------------------------------------------
-#  5. Hybrid edge construction
-#     (backbone-backbone 固定模板 + refinement 局部半径图/KNN)
-# ---------------------------------------------------------------------------
-
-def build_combined_edges(
-    backbone_pos: torch.Tensor,
-    refinement_pos: torch.Tensor,
-    backbone_edges_local: torch.Tensor,
-    n_backbone: int,
-    cfg_edges: dict,
-) -> torch.Tensor:
-    """Build the union edge set for the combined (backbone + refinement) graph.
-
-    Node ordering convention in the combined graph:
-        [0 .. n_backbone-1]  →  backbone nodes
-        [n_backbone .. n_backbone + n_ref - 1]  →  refinement nodes
-
-    Edge types constructed:
-        (a) backbone ↔ backbone: pre-computed grid edges (passed in).
-        (b) refinement ↔ refinement: local radius graph, optionally capped by KNN.
-        (c) refinement → backbone: each refinement node connects to its
-            nearest `refinement_backbone_k` backbone nodes.
-
-    Args:
-        backbone_pos:        [N_bb, 3] positions.
-        refinement_pos:      [N_ref, 3] positions (may be empty).
-        backbone_edges_local:[E_bb, 2] edges in local backbone indexing.
-        n_backbone:          number of backbone nodes.
-        cfg_edges:           dict with keys:
-            refinement_local_radius, refinement_local_k,
-            refinement_backbone_k, max_refinement_edges.
-
-    Returns:
-        combined_edges: [E_total, 2] long tensor in the combined node indexing.
-    """
-    device = backbone_pos.device
-    parts = []
-
-    # (a) backbone ↔ backbone (already in local backbone indices, no shift needed)
-    if backbone_edges_local.numel() > 0:
-        parts.append(backbone_edges_local.to(device))
-
-    n_ref = refinement_pos.shape[0] if refinement_pos is not None else 0
-    if n_ref == 0:
-        if parts:
-            return torch.cat(parts, dim=0)
-        return torch.zeros((0, 2), dtype=torch.long, device=device)
-
-    ref_offset = n_backbone  # refinement nodes start after backbone
-
-    # (b) refinement ↔ refinement: local radius graph with KNN cap
-    radius = cfg_edges.get("refinement_local_radius", 0.08)
-    local_k = cfg_edges.get("refinement_local_k", 8)
-    max_ref_edges = cfg_edges.get("max_refinement_edges", 50000)
-
-    ref_edges = _build_local_radius_knn(
-        refinement_pos, radius, local_k, max_ref_edges
-    )
-    if ref_edges.numel() > 0:
-        ref_edges = ref_edges + ref_offset  # shift to combined indexing
-        parts.append(ref_edges)
-
-    # (c) refinement → backbone: nearest backbone neighbors
-    rb_k = cfg_edges.get("refinement_backbone_k", 3)
-    rb_edges = _build_cross_knn(
-        query_pos=refinement_pos,
-        target_pos=backbone_pos,
-        k=rb_k,
-        query_offset=ref_offset,
-        target_offset=0,
-    )
-    if rb_edges.numel() > 0:
-        parts.append(rb_edges)
-
-    if parts:
-        return torch.cat(parts, dim=0)
-    return torch.zeros((0, 2), dtype=torch.long, device=device)
-
-
-def _build_local_radius_knn(
-    pos: torch.Tensor,
-    radius: float,
-    k: int,
-    max_edges: int,
-    chunk_size: int = 2048,
-) -> torch.Tensor:
-    """Radius graph with KNN cap among refinement points.
-
-    For each node, connects to neighbors within `radius` but keeps at most
-    `k` nearest.  Processes in chunks to avoid OOM on large point sets.
-
-    Returns:
-        edges: [E, 2] long tensor in local indexing (0-based within pos).
-    """
-    N = pos.shape[0]
-    if N <= 1:
-        return torch.zeros((0, 2), dtype=torch.long, device=pos.device)
-
-    k_use = min(k + 1, N)
-    edge_list = []
-
-    for start in range(0, N, chunk_size):
-        end = min(start + chunk_size, N)
-        dists = torch.cdist(pos[start:end].unsqueeze(0), pos.unsqueeze(0)).squeeze(0)  # [chunk, N]
-
-        # mask beyond radius
-        within = dists <= radius
-        # self-loop mask
-        self_mask = torch.zeros_like(within)
-        for i in range(end - start):
-            self_mask[i, start + i] = True
-        within = within & ~self_mask
-
-        # for each row, keep at most k
-        for i in range(end - start):
-            cands = torch.where(within[i])[0]
-            if cands.numel() == 0:
-                continue
-            if cands.numel() > k:
-                d = dists[i, cands]
-                _, topk_idx = d.topk(k, largest=False)
-                cands = cands[topk_idx]
-            src = torch.full_like(cands, start + i)
-            edge_list.append(torch.stack([src, cands], dim=1))
-
-    if not edge_list:
-        return torch.zeros((0, 2), dtype=torch.long, device=pos.device)
-
-    edges = torch.cat(edge_list, dim=0)
-
-    # cap total refinement edges
-    if edges.shape[0] > max_edges:
-        perm = torch.randperm(edges.shape[0], device=edges.device)[:max_edges]
-        edges = edges[perm]
-
-    return edges
-
-
-def _build_cross_knn(
-    query_pos: torch.Tensor,
-    target_pos: torch.Tensor,
-    k: int,
-    query_offset: int,
-    target_offset: int,
-    chunk_size: int = 2048,
-) -> torch.Tensor:
-    """Cross-set KNN: each query point connects to its k nearest target points.
-
-    Produces bidirectional edges (both directions).
-
-    Returns:
-        edges: [E, 2] long tensor in combined indexing.
-    """
-    N_q = query_pos.shape[0]
-    N_t = target_pos.shape[0]
-    if N_q == 0 or N_t == 0:
-        return torch.zeros((0, 2), dtype=torch.long, device=query_pos.device)
-
-    k_use = min(k, N_t)
-    edge_list = []
-
-    for start in range(0, N_q, chunk_size):
-        end = min(start + chunk_size, N_q)
-        dists = torch.cdist(
-            query_pos[start:end].unsqueeze(0),
-            target_pos.unsqueeze(0),
-        ).squeeze(0)  # [chunk, N_t]
-
-        _, nn_idx = dists.topk(k_use, dim=-1, largest=False)  # [chunk, k_use]
-
-        chunk_len = end - start
-        src = torch.arange(start, end, device=query_pos.device).unsqueeze(1).expand(-1, k_use)
-        # forward: query → target
-        fwd = torch.stack([src.reshape(-1) + query_offset, nn_idx.reshape(-1) + target_offset], dim=1)
-        # backward: target → query
-        bwd = torch.stack([nn_idx.reshape(-1) + target_offset, src.reshape(-1) + query_offset], dim=1)
-        edge_list.append(fwd)
-        edge_list.append(bwd)
-
-    if not edge_list:
-        return torch.zeros((0, 2), dtype=torch.long, device=query_pos.device)
-    return torch.cat(edge_list, dim=0)
-
-
-# ---------------------------------------------------------------------------
-#  6. Graph refresh orchestrator (每 K 步刷新一次 refinement graph)
-# ---------------------------------------------------------------------------
-
 class AdaptiveGraphManager:
-    """Manages backbone + periodic refinement graph refresh during rollout.
+    """Zone-first adaptive graph manager with delayed writeback.
 
-    Usage during autoregressive inference:
-
-        mgr = AdaptiveGraphManager(cfg, backbone_data, fullres_data, device)
-
-        for t in range(T):
-            if mgr.should_refresh(t):
-                mgr.refresh(pred_field, gt_field, prev_field, epoch)
-
-            combined_pos, combined_edges, combined_state = mgr.get_graph(pred_state)
-            ...  # run GNN on combined graph
-            full_pred = mgr.writeback(combined_pred)
+    核心改动:
+      1. backbone 只是背景参考层, active 区域优先级最高
+      2. zone-first 采样: 先 compute_active_score → classify_zones →
+         zone_first_sample, 而不是 "先保留 backbone 再补 refinement"
+      3. stencil 建边: 用规则网格 stencil 替代 KNN/radius graph
+      4. delayed writeback: 非 refresh 步不 materialize full grid,
+         只在 refresh / full supervision / 最终输出步做回写
     """
 
     def __init__(
@@ -502,38 +579,32 @@ class AdaptiveGraphManager:
         self.cfg = cfg
         self.device = device
 
-        # backbone meta
+        # backbone meta (背景参考层)
         self.backbone_indices_np = backbone_indices
         self.backbone_shape = backbone_shape
         self.n_backbone = len(backbone_indices)
         self.backbone_edges = backbone_edges.to(device)
 
         # full resolution meta
-        self.fullres_pos = fullres_pos.to(device)         # [N_full, 3]
+        self.fullres_pos = fullres_pos.to(device)
         self.n_full = fullres_pos.shape[0]
         self.fullres_grid_shape = fullres_grid_shape
 
-        # boolean mask: True for backbone nodes in the full grid
+        # backbone mask on full grid
         self.backbone_mask = torch.zeros(self.n_full, dtype=torch.bool, device=device)
         bb_idx_tensor = torch.from_numpy(backbone_indices).long().to(device)
         self.backbone_mask[bb_idx_tensor] = True
         self.bb_idx_tensor = bb_idx_tensor
 
-        # backbone positions (in full-grid coordinates)
-        self.backbone_pos = fullres_pos[bb_idx_tensor]    # [N_bb, 3]
+        # backbone stride (needed for cross-layer edges)
+        bb_cfg = cfg.get("backbone", {})
+        self.backbone_stride = tuple(bb_cfg.get("stride", [2, 2, 2]))
 
-        # mapping from full-grid index → backbone local index
-        self.full_to_bb = torch.full((self.n_full,), -1, dtype=torch.long, device=device)
-        self.full_to_bb[bb_idx_tensor] = torch.arange(self.n_backbone, device=device)
-
-        # refinement state (updated on refresh)
-        self.refinement_full_indices: Optional[torch.Tensor] = None  # indices in full grid
-        self.refinement_pos: Optional[torch.Tensor] = None
-        self.n_refinement = 0
-        self.combined_edges: Optional[torch.Tensor] = None
-
-        # combined-graph → full-grid index mapping
-        self.combined_to_full: Optional[torch.Tensor] = None
+        # --- current subgraph state ---
+        self.selected_full_indices: Optional[torch.Tensor] = None  # [N_sel] in full grid
+        self.selected_edges: Optional[torch.Tensor] = None         # [E, 2] local
+        self.n_selected = 0
+        self.zone_full: Optional[torch.Tensor] = None              # [N_full] zone labels
 
         # config shortcuts
         self.refresh_K = cfg.get("refinement", {}).get("refresh_every_K", 4)
@@ -541,14 +612,26 @@ class AdaptiveGraphManager:
         self.edge_cfg = cfg.get("edges", {})
         self.wb_cfg = cfg.get("writeback", {})
 
-    # ---- refresh logic ----------------------------------------------------
+        # physics trigger config: parse from active_zone config
+        self._physics_triggers = self._parse_physics_triggers()
+
+    def _parse_physics_triggers(self) -> Optional[Dict]:
+        """Parse physics_triggers from config.
+
+        Format in JSON: {"physics_triggers": {"0": 0.8, "1": 0.5}}
+        channel_index -> threshold.
+        """
+        raw = self.az_cfg.get("physics_triggers", None)
+        if raw and isinstance(raw, dict):
+            return {int(k): float(v) for k, v in raw.items() if not k.startswith("_")}
+        return None
+
+    # ---- refresh logic -----------------------------------------------
 
     def should_refresh(self, t: int) -> bool:
-        """Returns True on steps 0, K, 2K, ..."""
         return t % self.refresh_K == 0
 
     def get_gt_blend(self, epoch: int) -> float:
-        """Linear blend from gt_blend_start → gt_blend_end over warmup epochs."""
         ref_cfg = self.cfg.get("refinement", {})
         start = ref_cfg.get("gt_blend_start", 1.0)
         end = ref_cfg.get("gt_blend_end", 0.0)
@@ -566,128 +649,166 @@ class AdaptiveGraphManager:
         prev_field: torch.Tensor,
         epoch: int = 0,
     ):
-        """Rebuild the refinement graph based on current activity.
+        """Rebuild the subgraph: zone-first scoring → sampling → stencil edges.
 
-        All tensors are [N_full, C] on device, in *normalized* space.
+        All tensors are [N_full, C] on device, in normalized space.
         """
         gt_blend = self.get_gt_blend(epoch)
 
-        # 2. compute per-node activity score
+        # Step 1: compute activity score (uses regular-grid finite difference)
         score = compute_active_score(
             pred_field=pred_field,
             gt_field=gt_field,
             prev_field=prev_field,
-            node_pos=self.fullres_pos,
-            gradient_weight=self.az_cfg.get("gradient_weight", 0.6),
-            temporal_weight=self.az_cfg.get("temporal_weight", 0.4),
+            grid_shape=self.fullres_grid_shape,
+            gradient_weight=self.az_cfg.get("gradient_weight", 0.5),
+            temporal_weight=self.az_cfg.get("temporal_weight", 0.3),
+            physics_weight=self.az_cfg.get("physics_weight", 0.2),
             gt_blend=gt_blend,
+            physics_triggers=self._physics_triggers,
         )
 
-        # 3. zone classification (core=2, ring=1, bg=0)
+        # Step 2: zone classification
         zone = classify_zones(
             score,
             core_threshold=self.az_cfg.get("core_threshold", 0.6),
             ring_threshold=self.az_cfg.get("ring_threshold", 0.2),
         )
+        self.zone_full = zone
 
-        # 4. sample refinement points (non-backbone)
-        ref_indices = sample_refinement_points(
-            zone,
-            self.backbone_mask,
+        # Step 3: zone-first sampling (NOT backbone-first!)
+        selected = zone_first_sample(
+            zone_full=zone,
+            backbone_mask=self.backbone_mask,
             core_keep_ratio=self.az_cfg.get("core_keep_ratio", 1.0),
             ring_keep_ratio=self.az_cfg.get("ring_keep_ratio", 0.5),
+            background_extra_ratio=self.az_cfg.get("background_extra_ratio", 0.0),
         )
-        self.refinement_full_indices = ref_indices
-        self.n_refinement = ref_indices.numel()
 
-        if self.n_refinement > 0:
-            self.refinement_pos = self.fullres_pos[ref_indices]
+        # Step 4: build stencil edges within the selected subgraph
+        intra_edges = build_stencil_edges(
+            selected_indices=selected,
+            zone_labels=zone,
+            grid_shape=self.fullres_grid_shape,
+            backbone_mask=self.backbone_mask,
+            bg_stencil=self.edge_cfg.get("bg_stencil", 6),
+            ring_stencil=self.edge_cfg.get("ring_stencil", 18),
+            core_stencil=self.edge_cfg.get("core_stencil", 26),
+        )
+
+        # Step 5: cross-layer edges (fine→coarse parent-child mapping)
+        N_full = self.n_full
+        full_to_local = torch.full((N_full,), -1, dtype=torch.long, device=self.device)
+        full_to_local[selected] = torch.arange(selected.shape[0], device=self.device)
+
+        cross_edges = build_cross_layer_edges(
+            selected_indices=selected,
+            zone_labels=zone,
+            backbone_indices_set=self.bb_idx_tensor,
+            backbone_stride=self.backbone_stride,
+            grid_shape=self.fullres_grid_shape,
+            full_to_local=full_to_local,
+        )
+
+        # Combine intra + cross edges
+        edge_parts = []
+        if intra_edges.numel() > 0:
+            edge_parts.append(intra_edges)
+        if cross_edges.numel() > 0:
+            edge_parts.append(cross_edges)
+
+        if edge_parts:
+            all_edges = torch.cat(edge_parts, dim=0)
         else:
-            self.refinement_pos = torch.zeros((0, 3), device=self.device)
+            all_edges = torch.zeros((0, 2), dtype=torch.long, device=self.device)
 
-        # 5. build combined edges
-        self.combined_edges = build_combined_edges(
-            backbone_pos=self.backbone_pos,
-            refinement_pos=self.refinement_pos,
-            backbone_edges_local=self.backbone_edges,
-            n_backbone=self.n_backbone,
-            cfg_edges=self.edge_cfg,
-        )
+        # Step 6: remove isolated nodes (nodes with no edges)
+        if all_edges.numel() > 0 and selected.shape[0] > 0:
+            connected = torch.zeros(selected.shape[0], dtype=torch.bool, device=self.device)
+            connected[all_edges[:, 0]] = True
+            connected[all_edges[:, 1]] = True
 
-        # 6. combined → full index mapping
-        #    [bb_0, bb_1, ..., bb_{N_bb-1}, ref_0, ref_1, ..., ref_{N_ref-1}]
-        combined_full = torch.cat([
-            self.bb_idx_tensor,
-            ref_indices if ref_indices.numel() > 0 else torch.zeros(0, dtype=torch.long, device=self.device),
-        ])
-        self.combined_to_full = combined_full
+            # always keep backbone nodes even if isolated (they're the reference layer)
+            is_bb = self.backbone_mask[selected]
+            connected = connected | is_bb
 
-    # ---- graph assembly ---------------------------------------------------
+            if not connected.all():
+                # remap
+                keep_local = torch.where(connected)[0]
+                new_local = torch.full((selected.shape[0],), -1, dtype=torch.long, device=self.device)
+                new_local[keep_local] = torch.arange(keep_local.shape[0], device=self.device)
 
-    def get_combined_count(self) -> int:
-        return self.n_backbone + self.n_refinement
+                selected = selected[keep_local]
+
+                # remap edges
+                valid_edges = (new_local[all_edges[:, 0]] >= 0) & (new_local[all_edges[:, 1]] >= 0)
+                all_edges = all_edges[valid_edges]
+                all_edges = torch.stack([new_local[all_edges[:, 0]], new_local[all_edges[:, 1]]], dim=1)
+
+        self.selected_full_indices = selected
+        self.n_selected = selected.shape[0]
+        self.selected_edges = all_edges
+
+    # ---- graph data access -------------------------------------------
+
+    def get_selected_count(self) -> int:
+        return self.n_selected
 
     def gather_state(self, full_state: torch.Tensor) -> torch.Tensor:
-        """Extract state for the combined graph nodes from the full-grid state.
+        """Extract state for the selected subgraph from full-grid state.
 
         Args:
             full_state: [B, N_full, C] or [N_full, C].
-
-        Returns:
-            combined_state: [B, N_combined, C] or [N_combined, C].
         """
-        if self.combined_to_full is None:
-            # fallback: backbone only
+        idx = self.selected_full_indices
+        if idx is None:
             idx = self.bb_idx_tensor
-        else:
-            idx = self.combined_to_full
-
         if full_state.dim() == 3:
-            # batched
             return full_state[:, idx]
         return full_state[idx]
 
-    def get_combined_pos(self) -> torch.Tensor:
-        """Return [N_combined, 3] positions for the current combined graph."""
-        if self.n_refinement > 0 and self.refinement_pos is not None:
-            return torch.cat([self.backbone_pos, self.refinement_pos], dim=0)
-        return self.backbone_pos
+    def get_selected_pos(self) -> torch.Tensor:
+        """Return [N_sel, 3] positions for the current subgraph."""
+        idx = self.selected_full_indices
+        if idx is None:
+            idx = self.bb_idx_tensor
+        return self.fullres_pos[idx]
 
-    def get_combined_edges(self) -> torch.Tensor:
-        """Return [E, 2] edges for the current combined graph."""
-        if self.combined_edges is not None:
-            return self.combined_edges
+    def get_selected_edges(self) -> torch.Tensor:
+        """Return [E, 2] edges for the current subgraph."""
+        if self.selected_edges is not None:
+            return self.selected_edges
         return self.backbone_edges
 
-    # ---- writeback: combined prediction → full grid -----------------------
+    def get_selected_indices(self) -> torch.Tensor:
+        """Return [N_sel] full-grid indices for the current subgraph."""
+        if self.selected_full_indices is not None:
+            return self.selected_full_indices
+        return self.bb_idx_tensor
+
+    # ---- writeback: subgraph prediction → full grid ------------------
 
     def writeback(
         self,
-        combined_pred: torch.Tensor,
+        subgraph_pred: torch.Tensor,
         full_prev: torch.Tensor,
     ) -> torch.Tensor:
-        """Write predictions from the combined graph back to the full grid.
+        """Write predictions from the subgraph back to the full grid.
 
-        For nodes present in the combined graph, their predicted values are
-        directly placed.  For nodes absent (background, not in backbone),
-        inverse-distance weighted (IDW) interpolation from the combined graph
-        is used.
+        Direct copy for selected nodes; IDW interpolation for missing nodes.
 
         Args:
-            combined_pred: [B, N_combined, C] predicted state on combined graph.
-            full_prev:     [B, N_full, C] previous full-grid state (used as
-                           fallback / initialization).
+            subgraph_pred: [B, N_sel, C] predicted state on subgraph.
+            full_prev:     [B, N_full, C] previous full-grid state.
 
         Returns:
             full_pred: [B, N_full, C].
         """
-        method = self.wb_cfg.get("method", "idw")
-        B, _, C = combined_pred.shape
+        B, _, C = subgraph_pred.shape
         full_pred = full_prev.clone()
 
-        # direct copy for nodes in the combined graph
-        idx = self.combined_to_full if self.combined_to_full is not None else self.bb_idx_tensor
-        full_pred[:, idx] = combined_pred
+        idx = self.get_selected_indices()
+        full_pred[:, idx] = subgraph_pred
 
         # interpolate missing nodes
         all_indices = torch.arange(self.n_full, device=self.device)
@@ -698,54 +819,58 @@ class AdaptiveGraphManager:
         if missing_indices.numel() == 0:
             return full_pred
 
+        method = self.wb_cfg.get("method", "idw")
         if method == "idw":
             full_pred = self._idw_interpolate(
-                full_pred, combined_pred, idx, missing_indices, B, C,
+                full_pred, subgraph_pred, idx, missing_indices, B, C,
             )
-        # else: leave as full_prev (nearest-copy fallback)
 
         return full_pred
 
     def _idw_interpolate(
         self,
         full_pred: torch.Tensor,
-        combined_pred: torch.Tensor,
+        subgraph_pred: torch.Tensor,
         present_idx: torch.Tensor,
         missing_idx: torch.Tensor,
         B: int,
         C: int,
         chunk_size: int = 4096,
     ) -> torch.Tensor:
-        """Inverse-distance weighted interpolation for missing nodes.
-
-        For each missing node, finds its k nearest *present* nodes and computes
-        a weighted average of their predicted values.
-        """
+        """IDW interpolation for missing nodes."""
         power = self.wb_cfg.get("idw_power", 2.0)
         k = self.wb_cfg.get("idw_k_neighbors", 4)
 
-        combined_pos = self.get_combined_pos()  # [N_combined, 3]
-        missing_pos = self.fullres_pos[missing_idx]  # [N_missing, 3]
+        selected_pos = self.get_selected_pos()
+        missing_pos = self.fullres_pos[missing_idx]
         N_miss = missing_pos.shape[0]
-        k_use = min(k, combined_pos.shape[0])
+        k_use = min(k, selected_pos.shape[0])
 
         for start in range(0, N_miss, chunk_size):
             end = min(start + chunk_size, N_miss)
             dists = torch.cdist(
                 missing_pos[start:end].unsqueeze(0),
-                combined_pos.unsqueeze(0),
-            ).squeeze(0)  # [chunk, N_combined]
+                selected_pos.unsqueeze(0),
+            ).squeeze(0)
 
-            _, nn_idx = dists.topk(k_use, dim=-1, largest=False)  # [chunk, k]
-            nn_dists = torch.gather(dists, 1, nn_idx)             # [chunk, k]
+            _, nn_idx = dists.topk(k_use, dim=-1, largest=False)
+            nn_dists = torch.gather(dists, 1, nn_idx)
 
-            weights = 1.0 / (nn_dists.pow(power) + 1e-10)        # [chunk, k]
-            weights = weights / weights.sum(dim=-1, keepdim=True) # normalized
+            weights = 1.0 / (nn_dists.pow(power) + 1e-10)
+            weights = weights / weights.sum(dim=-1, keepdim=True)
 
-            # gather neighbor predictions and weighted-average
             for b in range(B):
-                neighbor_vals = combined_pred[b][nn_idx]          # [chunk, k, C]
-                interp = (neighbor_vals * weights.unsqueeze(-1)).sum(dim=1)  # [chunk, C]
+                neighbor_vals = subgraph_pred[b][nn_idx]
+                interp = (neighbor_vals * weights.unsqueeze(-1)).sum(dim=1)
                 full_pred[b, missing_idx[start:end]] = interp
 
         return full_pred
+
+    def scatter_back_to_subgraph(
+        self,
+        full_state: torch.Tensor,
+    ) -> torch.Tensor:
+        """For delayed writeback: gather updated state back onto the subgraph
+        from the full grid after a writeback.
+        """
+        return self.gather_state(full_state)
