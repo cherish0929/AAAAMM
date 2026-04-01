@@ -85,10 +85,10 @@ class AeroGtoPredictor:
             from src.physgto import Model
         elif model_name == "gto_res":
             from src.physgto_res import Model
-        elif model_name == "gto_lnn":
-            from src.gto_lnn import Model
-        
-        self.model = Model(
+        elif model_name == "gto_attnres_multi":
+            from src.physgto_attnres_multi import Model
+
+        common_kwargs = dict(
             space_size=self.args.model.get("space_size", 3),
             pos_enc_dim=self.args.model.get("pos_enc_dim", 5),
             cond_dim=cond_dim,
@@ -99,7 +99,14 @@ class AeroGtoPredictor:
             n_head=self.args.model.get("n_head", 4),
             n_token=self.args.model.get("n_token", 64),
             dt=self.args.model.get("dt", default_dt),
-        ).to(self.device)
+            use_memory=self.args.model.get("use_memory", True),
+            memory_dim=self.args.model.get("memory_dim", None),
+        )
+        if model_name == "gto_attnres_multi":
+            common_kwargs["n_fields"] = model_cfg.get("n_fields", model_cfg.get("in_dim", 2))
+            common_kwargs["cross_attn_heads"] = model_cfg.get("cross_attn_heads", 4)
+
+        self.model = Model(**common_kwargs).to(self.device)
 
         # 3. 加载权重
         if model_path is None:
@@ -126,13 +133,14 @@ class AeroGtoPredictor:
         file_id, start_idx = self.dataset.sample_keys[sample_idx]
         path = self.dataset.file_paths[file_id]
         meta = self.dataset.meta_cache[path]
-        
+
         # 2. 确定时间索引
         if start_idx is None: start_idx = 1
-        
-        # 计算对应的时间索引序列
-        time_indices = start_idx + np.arange(1, self.dataset.horizon + 1) * self.dataset.time_stride
-        indices = meta["indices"] # 这里直接使用 meta 中的索引 (如果是 cut dataset，这已经是裁剪后的索引)
+
+        # 计算未来目标的时间索引 (跳过 input_steps 个历史步)
+        input_steps = self.dataset.input_steps
+        time_indices = start_idx + np.arange(input_steps, input_steps + self.dataset.horizon) * self.dataset.time_stride
+        indices = meta["indices"]
         
         try:
             with h5py.File(path, 'r') as f:
@@ -155,30 +163,30 @@ class AeroGtoPredictor:
         """
         sample = self.dataset[sample_idx]
         use_amp, check_point = self.args.train.get("use_amp", False), self.args.train.get("check_point", False)
+
         # 增加 Batch 维度并移至 GPU
-        state_seq = sample["state"].unsqueeze(0).to(self.device)
+        hist_state = sample["hist_state"].unsqueeze(0).to(self.device)      # [1, input_steps, N, C]
+        target_state = sample["target_state"].unsqueeze(0).to(self.device)  # [1, horizon, N, C]
         node_pos = sample["node_pos"].unsqueeze(0).to(self.device)
         edges = sample["edges"].unsqueeze(0).to(self.device)
-        time_seq = sample["time_seq"].unsqueeze(0).to(self.device) 
+        future_time_seq = sample["future_time_seq"].unsqueeze(0).to(self.device)  # [1, horizon, 1]
+        hist_time = sample["hist_time"].unsqueeze(0).to(self.device)              # [1, input_steps-1, 1]
         conditions = sample["conditions"].unsqueeze(0).to(self.device).float()
-
-        # cond_idx = 50 if len(self.dataset) > 50 else 0
-        # conditions = self.dataset[cond_idx]["conditions"].unsqueeze(0).to(self.device).float()
-
         dt = sample["dt"]
 
-        state_0 = state_seq[:, 0] 
-        gt_seq = state_seq[:, 1:]
+        gt_seq = target_state  # [1, horizon, N, C]
 
-        print(f"[Predict] Running autoregressive inference...")
+        print(f"[Predict] Running autoregressive inference (input_steps={hist_state.shape[1]})...")
         with torch.no_grad():
             if use_amp:
                 with autocast("cuda", dtype=torch.bfloat16):
                     pred_seq = self.model.autoregressive(
-                        state_0, node_pos, edges, time_seq, conditions, dt, check_point=check_point)
+                        hist_state, node_pos, edges, future_time_seq,
+                        conditions, dt, check_point=check_point, hist_time=hist_time)
             else:
                 pred_seq = self.model.autoregressive(
-                        state_0, node_pos, edges, time_seq, conditions, dt, check_point=check_point)
+                    hist_state, node_pos, edges, future_time_seq,
+                    conditions, dt, check_point=check_point, hist_time=hist_time)
 
             pred_real = self.normalizer.denormalize(pred_seq)
             gt_real = self.normalizer.denormalize(gt_seq)

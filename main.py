@@ -12,7 +12,6 @@ from torch.optim import AdamW
 
 # load specific modules for LPBF project
 from src.dataset import AeroGtoDataset
-from src.dataset_2d import AeroGtoDataset2D
 from src.dataset_cut import CutAeroGtoDataset
 # from src.physgto import Model
 from src.train import train, validate
@@ -28,8 +27,8 @@ def get_dataloader(args, path_record, device_type):
             Datasetclass = CutAeroGtoDataset
         else:
             Datasetclass = AeroGtoDataset
-    elif space_dim == 2:
-        Datasetclass = AeroGtoDataset2D
+    # elif space_dim == 2:
+    #     Datasetclass = AeroGtoDataset2D
         
     # 构建数据集
     train_dataset = Datasetclass(
@@ -103,8 +102,8 @@ def get_model(args, device, cond_dim, default_dt):
         from src.physgto import Model
     elif model_name == "gto_res":
         from src.physgto_res import Model
-    elif model_name == "gto_lnn":
-        from src.gto_lnn import Model
+    # elif model_name == "gto_lnn":
+    #     from src.gto_lnn import Model
     elif model_name == "gto_attnres_multi":
         from src.physgto_attnres_multi import Model
 
@@ -119,6 +118,8 @@ def get_model(args, device, cond_dim, default_dt):
         n_head=model_cfg.get("n_head", 4),
         n_token=model_cfg.get("n_token", 64),
         dt=model_cfg.get("dt", default_dt),
+        use_memory=model_cfg.get("use_memory", True),
+        memory_dim=model_cfg.get("memory_dim", None),
     )
 
     if model_name == "gto_attnres_multi":
@@ -171,6 +172,9 @@ def main(args, path_logs, path_nn, path_record):
         file.write(f"{args.name}, #params: {params/1e6:.2f}M\n")
         file.write(f"EPOCH: {EPOCH}\n")
         file.write(f"Fields: {fields}\n")
+        file.write(f"input_steps: {args.data.get('input_steps', 1)}, "
+                   f"use_memory: {args.model.get('use_memory', True)}, "
+                   f"memory_dim: {args.model.get('memory_dim', 'enc_dim')}\n")
 
     # log_dir = f"{path_logs}/{args.name}"
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -255,6 +259,9 @@ def main(args, path_logs, path_nn, path_record):
         print(f"L2 details: {', '.join(l2_details)}")
         print(f"RMSE details: {', '.join(rmse_details)}")
         print(f"each time step loss: {each_t_l2.tolist()}")
+        # Per-timestep L2 to TensorBoard
+        for t_idx, t_l2 in enumerate(each_t_l2.tolist()):
+            writer.add_scalar(f'L2_per_step/train_t{t_idx}', t_l2, epoch)
         print(f"time pre train epoch/s:{training_time:.2f}, current_lr:{current_lr:.4e}")
         print("--------------")
         
@@ -300,6 +307,9 @@ def main(args, path_logs, path_nn, path_record):
             print(f"L2 details: {', '.join(test_l2_details)}")
             print(f"RMSE details: {', '.join(test_rmse_details)}")
             print(f"each time step loss: {test_each_t_l2.tolist()}")
+            # Per-timestep L2 to TensorBoard
+            for t_idx, t_l2 in enumerate(test_each_t_l2.tolist()):
+                writer.add_scalar(f'L2_per_step/test_t{t_idx}', t_l2, epoch)
             print(f"time pre test epoch/s:{val_time:.2f}")
             print("--------------")
             

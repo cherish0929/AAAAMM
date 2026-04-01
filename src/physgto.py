@@ -5,6 +5,35 @@ import numpy as np
 from torch_scatter import scatter_mean
 from torch.utils.checkpoint import checkpoint
 
+
+class LatentMemoryBlock(nn.Module):
+    """Node-wise GRU-style 门控 Memory 更新"""
+    def __init__(self, enc_dim, mem_dim=None):
+        super().__init__()
+        mem_dim = mem_dim or enc_dim
+        self.mem_dim = mem_dim
+        self.enc_dim = enc_dim
+        cat_dim = enc_dim + mem_dim
+        self.W_z = nn.Linear(cat_dim, mem_dim)
+        self.W_r = nn.Linear(cat_dim, mem_dim)
+        self.W_m = nn.Linear(enc_dim + mem_dim, mem_dim)
+        self.proj = nn.Linear(mem_dim, enc_dim) if mem_dim != enc_dim else nn.Identity()
+
+    def forward(self, h_enc, memory):
+        if memory is None:
+            memory = torch.zeros(
+                h_enc.shape[0], h_enc.shape[1], self.mem_dim,
+                device=h_enc.device, dtype=h_enc.dtype
+            )
+        cat = torch.cat([h_enc, memory], dim=-1)
+        z = torch.sigmoid(self.W_z(cat))
+        r = torch.sigmoid(self.W_r(cat))
+        cat_r = torch.cat([h_enc, r * memory], dim=-1)
+        m_cand = torch.tanh(self.W_m(cat_r))
+        mem_new = (1.0 - z) * memory + z * m_cand
+        h_fused = h_enc + self.proj(mem_new)
+        return h_fused, mem_new
+
 def get_edge_info(edges, node_pos):
     senders = torch.gather(node_pos, -2, edges[..., 0].unsqueeze(-1).expand(-1, -1, node_pos.shape[-1]))
     receivers = torch.gather(node_pos, -2, edges[..., 1].unsqueeze(-1).expand(-1, -1, node_pos.shape[-1]))
@@ -296,108 +325,140 @@ class Model(nn.Module):
                  n_head=4,
                  n_token=128,
                  dt:float =0.05,
-                 stepper_scheme="euler"
+                 stepper_scheme="euler",
+                 use_memory=True,
+                 memory_dim=None,
                  ):
         super(Model, self).__init__()
 
         self.dt = dt
         self.stepper_scheme = stepper_scheme
-
         self.pos_enc_dim = pos_enc_dim
+        self.use_memory = use_memory
+
         enc_s_dim = space_size + 2 * pos_enc_dim * space_size
         enc_t_dim = 1 + 2 * pos_enc_dim
         enc_c_dim = (1 + 2 * pos_enc_dim) * cond_dim
-        
+
         self.encoder = Encoder(
-            space_size = space_size, 
-            state_size = in_dim, 
+            space_size = space_size,
+            state_size = in_dim,
             enc_dim = enc_dim,
-            enc_t_dim = enc_t_dim, 
+            enc_t_dim = enc_t_dim,
             enc_c_dim = enc_c_dim
             )
-        
+
+        if self.use_memory:
+            mem_dim = memory_dim or enc_dim
+            self.memory_block = LatentMemoryBlock(enc_dim, mem_dim)
+            self.memory_dim = mem_dim
+        else:
+            self.memory_dim = 0
+
         self.mixer = Mixer(
-            N=N_block, 
-            enc_dim=enc_dim, 
-            n_head=n_head, 
-            n_token=n_token, 
+            N=N_block,
+            enc_dim=enc_dim,
+            n_head=n_head,
+            n_token=n_token,
             enc_s_dim=enc_s_dim
             )
-        
+
         self.decoder = Decoder(
-            N=N_block, 
-            enc_dim=enc_dim, 
+            N=N_block,
+            enc_dim=enc_dim,
             enc_s_dim=enc_s_dim,
             state_size=out_dim
             )
 
-    def forward(self, state_in, node_pos, edges, time_i, conditions, pos_enc = None, c_enc = None, dt=None):
-        
+    def forward_step(self, state_in, node_pos, edges, time_i, conditions,
+                     memory=None, pos_enc=None, c_enc=None, dt=None):
+        """单步预测 + memory 更新"""
         if pos_enc is None or c_enc is None:
             pos_enc = FourierEmbedding(node_pos, 0, self.pos_enc_dim)
             c_enc = FourierEmbedding(conditions, 0, self.pos_enc_dim)
-        
-        t_enc = FourierEmbedding(time_i, 0, self.pos_enc_dim) # 时间编码
 
+        t_enc = FourierEmbedding(time_i, 0, self.pos_enc_dim)
         edges_long = edges.long() if edges.dtype != torch.long else edges
+
         V, E = self.encoder(node_pos, state_in, t_enc, c_enc, edges_long)
-        
+
+        # Memory update
+        memory_new = None
+        if self.use_memory:
+            V, memory_new = self.memory_block(V, memory)
+
         V_all = self.mixer(V, E, edges_long, pos_enc)
-        
         v_pred = self.decoder(V_all, pos_enc)
-        
-        # if self.stepper_scheme == "euler":
-        if dt is None: dt = self.dt  # 没有输入用默认 dt
-        elif len(dt.shape) == 1: dt = dt.view(-1, 1, 1)
+
+        if dt is None: dt = self.dt
+        elif torch.is_tensor(dt) and len(dt.shape) == 1: dt = dt.view(-1, 1, 1)
         state_pred = state_in + dt * v_pred
 
+        return state_pred, memory_new
+
+    def forward(self, state_in, node_pos, edges, time_i, conditions, pos_enc=None, c_enc=None, dt=None):
+        """向后兼容"""
+        state_pred, _ = self.forward_step(
+            state_in, node_pos, edges, time_i, conditions,
+            memory=None, pos_enc=pos_enc, c_enc=c_enc, dt=dt
+        )
         return state_pred
 
     def autoregressive(self,
-                       state_in,
+                       hist_state,
                        node_pos,
                        edges,
-                       time_seq,
+                       future_time_seq,
                        conditions,
                        dt=None,
-                       check_point=False):
-
-
-        state_t = state_in
-        outputs = [state_in]
-
-        T = time_seq.shape[1]
-
+                       check_point=False,
+                       hist_time=None):
+        """两阶段自回归: warm-up + forecast"""
         pos_enc = FourierEmbedding(node_pos, 0, self.pos_enc_dim)
         c_enc = FourierEmbedding(conditions, 0, self.pos_enc_dim)
-        
-        for t in range(T):
-            time_i = time_seq[:, t]  # expect shape (bs, 1) or (bs,) depending on your caller
 
-            def custom_forward(s_t, t_i):
-                return self.forward(s_t, node_pos, edges, t_i, conditions, pos_enc, c_enc, dt)
-            
+        memory = None
+        input_steps = hist_state.shape[1]
+
+        # Phase 1: Warm-up
+        if self.use_memory and input_steps > 1 and hist_time is not None:
+            for s in range(input_steps - 1):
+                state_s = hist_state[:, s]
+                time_s = hist_time[:, s]
+                _, memory = self.forward_step(
+                    state_s, node_pos, edges, time_s, conditions,
+                    memory=memory, pos_enc=pos_enc, c_enc=c_enc, dt=dt
+                )
+
+        # Phase 2: Forecast
+        state_t = hist_state[:, -1]
+        T = future_time_seq.shape[1]
+        outputs = []
+
+        for t in range(T):
+            time_i = future_time_seq[:, t]
+
             if check_point:
-                if state_t.requires_grad == False and state_t.is_floating_point():
+                if not state_t.requires_grad and state_t.is_floating_point():
                     state_t.requires_grad_()
 
-                state_t = checkpoint(custom_forward, state_t, time_i, use_reentrant=False)
-            
+                def custom_forward(s_t, t_i, mem):
+                    return self.forward_step(
+                        s_t, node_pos, edges, t_i, conditions,
+                        memory=mem, pos_enc=pos_enc, c_enc=c_enc, dt=dt
+                    )
+                
+                state_pred, memory = checkpoint(custom_forward, state_t, time_i, memory, use_reentrant=False)
             else:
-                state_t = self.forward(state_t, node_pos, edges, time_i, conditions, pos_enc, c_enc, dt)
+                state_pred, memory = self.forward_step(
+                    state_t, node_pos, edges, time_i, conditions,
+                    memory=memory, pos_enc=pos_enc, c_enc=c_enc, dt=dt
+                )
 
-            outputs.append(state_t)
+            outputs.append(state_pred)
+            state_t = state_pred
 
-            # with torch.no_grad():
-            #     delta = outputs[-1][:, 0] - outputs[-2][:, 0]
-            #     mean_delta = delta.abs().mean().item() # 平均变化量
-            #     max_delta = delta.abs().max().item()   # 最大变化量 (关注局部剧烈变化)
-            #     l2_norm = torch.norm(delta).item()     # 整体变化的能量
-            #     print(f"Step {t:03d} Delta -> Mean: {mean_delta:.2e} | Max: {max_delta:.2e} | L2: {l2_norm:.2e}")
-        
-        outputs = torch.stack(outputs[1:], dim=1)
-        
-        return outputs
+        return torch.stack(outputs, dim=1)
 
 # 均匀化
 # 二维到三维演化

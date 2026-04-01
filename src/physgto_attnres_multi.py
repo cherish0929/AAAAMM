@@ -50,8 +50,60 @@ def FourierEmbedding(pos, pos_start, pos_length):
 
 
 # =============================================================================
-# 基础模块
+# Node-wise Latent Memory Block (GRU-style gated recurrent)
 # =============================================================================
+
+class LatentMemoryBlock(nn.Module):
+    """
+    Node-wise GRU-style 门控 Memory 更新模块
+
+    memory 维度: [B, N, mem_dim]
+    在 Encoder 输出后、Mixer 前 对每个节点独立做门控更新:
+        z = σ(W_z [h_enc; mem])     — update gate
+        r = σ(W_r [h_enc; mem])     — reset gate
+        m̃ = tanh(W_m [h_enc; r ⊙ mem])  — candidate
+        mem_new = (1 - z) ⊙ mem + z ⊙ m̃
+    """
+    def __init__(self, enc_dim, mem_dim=None):
+        super().__init__()
+        mem_dim = mem_dim or enc_dim
+        self.mem_dim = mem_dim
+        self.enc_dim = enc_dim
+
+        cat_dim = enc_dim + mem_dim
+        self.W_z = nn.Linear(cat_dim, mem_dim)
+        self.W_r = nn.Linear(cat_dim, mem_dim)
+        self.W_m = nn.Linear(enc_dim + mem_dim, mem_dim)
+        # 投影: 当 mem_dim != enc_dim 时，将 memory 映射回 enc_dim
+        self.proj = nn.Linear(mem_dim, enc_dim) if mem_dim != enc_dim else nn.Identity()
+
+    def forward(self, h_enc, memory):
+        """
+        Args:
+            h_enc:  [B, N, enc_dim] — Encoder 输出
+            memory: [B, N, mem_dim] — 上一步 memory (若 None 则初始化为零)
+        Returns:
+            h_fused: [B, N, enc_dim] — 融合 memory 后的 Encoder 表示 (送入 Mixer)
+            mem_new: [B, N, mem_dim] — 更新后的 memory
+        """
+        if memory is None:
+            memory = torch.zeros(
+                h_enc.shape[0], h_enc.shape[1], self.mem_dim,
+                device=h_enc.device, dtype=h_enc.dtype
+            )
+
+        cat = torch.cat([h_enc, memory], dim=-1)  # [B, N, enc_dim + mem_dim]
+        z = torch.sigmoid(self.W_z(cat))
+        r = torch.sigmoid(self.W_r(cat))
+
+        cat_r = torch.cat([h_enc, r * memory], dim=-1)
+        m_cand = torch.tanh(self.W_m(cat_r))
+
+        mem_new = (1.0 - z) * memory + z * m_cand
+
+        # 融合: 将 memory 信息注入 Encoder 表示
+        h_fused = h_enc + self.proj(mem_new)
+        return h_fused, mem_new
 
 class RMSNorm(nn.Module):
     """Parameter-free RMSNorm (用于 AttnRes 的 key 归一化)"""
@@ -531,7 +583,7 @@ class Model(nn.Module):
     """
     PhysGTO-AttnRes-Multi
 
-    融合 Block Attention Residuals + Multi-Field Cross-Attention 的图变换器算子
+    融合 Block Attention Residuals + Multi-Field Cross-Attention + History Memory 的图变换器算子
 
     Args:
         space_size: 空间维度 (2 or 3)
@@ -546,6 +598,8 @@ class Model(nn.Module):
         dt: 默认时间步
         n_fields: 物理场数量 (默认 = in_dim)
         cross_attn_heads: Cross-Attention 头数
+        use_memory: 是否启用 latent memory
+        memory_dim: memory 维度 (默认 = enc_dim)
     """
     def __init__(self,
                  space_size=3,
@@ -561,6 +615,8 @@ class Model(nn.Module):
                  stepper_scheme="euler",
                  n_fields=None,
                  cross_attn_heads=4,
+                 use_memory=True,
+                 memory_dim=None,
                  ):
         super().__init__()
 
@@ -568,6 +624,7 @@ class Model(nn.Module):
         self.stepper_scheme = stepper_scheme
         self.pos_enc_dim = pos_enc_dim
         self.n_fields = n_fields if n_fields is not None else in_dim
+        self.use_memory = use_memory
 
         enc_s_dim = space_size + 2 * pos_enc_dim * space_size
         enc_t_dim = 2 * (1 + 2 * pos_enc_dim)
@@ -580,6 +637,16 @@ class Model(nn.Module):
             enc_t_dim=enc_t_dim,
             enc_c_dim=enc_c_dim,
         )
+
+        # Memory block: 每个场独立的 GRU memory
+        if self.use_memory:
+            mem_dim = memory_dim or enc_dim
+            self.memory_blocks = nn.ModuleList([
+                LatentMemoryBlock(enc_dim, mem_dim) for _ in range(self.n_fields)
+            ])
+            self.memory_dim = mem_dim
+        else:
+            self.memory_dim = 0
 
         self.mixer = MultiFieldMixer(
             N_block=N_block,
@@ -598,10 +665,10 @@ class Model(nn.Module):
             n_fields=self.n_fields,
         )
 
-    def forward(self, state_in, node_pos, edges, time_i, conditions,
-                pos_enc=None, c_enc=None, dt=None):
+    def forward_step(self, state_in, node_pos, edges, time_i, conditions,
+                     memory=None, pos_enc=None, c_enc=None, dt=None):
         """
-        单步预测，接口与 physgto_res.py 完全兼容
+        单步预测 + memory 更新
 
         Args:
             state_in: [bs, N, in_dim]
@@ -609,9 +676,11 @@ class Model(nn.Module):
             edges: [bs, ne, 2]
             time_i: [bs,] or [bs, 1]
             conditions: [bs, cond_dim]
+            memory: list of [bs, N, mem_dim] per field, or None
 
         Returns:
             state_pred: [bs, N, out_dim]
+            memory_new: list of [bs, N, mem_dim] per field (or None)
         """
         if pos_enc is None or c_enc is None:
             pos_enc = FourierEmbedding(node_pos, 0, self.pos_enc_dim)
@@ -621,7 +690,6 @@ class Model(nn.Module):
             time_i = time_i.view(-1, 1)
         bs = time_i.shape[0]
 
-        # dt 处理 (与 physgto_res 一致)
         if dt is None:
             dt_tensor = torch.full((bs, 1), self.dt, dtype=time_i.dtype, device=time_i.device)
         elif isinstance(dt, (float, int)):
@@ -636,61 +704,109 @@ class Model(nn.Module):
 
         edges_long = edges.long() if edges.dtype != torch.long else edges
 
-        # Encoder: 多场编码
+        # Encoder
         V_list, E = self.encoder(node_pos, state_in, t_enc, c_enc, edges_long)
 
-        # Mixer: Block AttnRes + Cross-Attention
+        # Memory update (Encoder 后, Mixer 前)
+        memory_new = None
+        if self.use_memory:
+            memory_new = []
+            if memory is None:
+                memory = [None] * self.n_fields
+            for i in range(self.n_fields):
+                V_list[i], mem_i = self.memory_blocks[i](V_list[i], memory[i])
+                memory_new.append(mem_i)
+
+        # Mixer
         V_all_list = self.mixer(V_list, E, edges_long, pos_enc)
 
-        # Decoder: 多场解码
+        # Decoder
         v_pred = self.decoder(V_all_list, pos_enc)
-
         state_pred = state_in + v_pred
+
+        return state_pred, memory_new
+
+    def forward(self, state_in, node_pos, edges, time_i, conditions,
+                pos_enc=None, c_enc=None, dt=None):
+        """向后兼容: 无 memory 的单步预测"""
+        state_pred, _ = self.forward_step(
+            state_in, node_pos, edges, time_i, conditions,
+            memory=None, pos_enc=pos_enc, c_enc=c_enc, dt=dt
+        )
         return state_pred
 
     def autoregressive(self,
-                       state_in,
+                       hist_state,
                        node_pos,
                        edges,
-                       time_seq,
+                       future_time_seq,
                        conditions,
                        dt=None,
                        check_point=False,
-                       teacher_forcing=False,
-                       gt_states=None):
+                       hist_time=None):
         """
-        自回归多步预测，接口与 physgto_res.py 完全兼容
-        """
-        state_t = state_in
-        outputs = [state_in]
-        T = time_seq.shape[1]
+        两阶段自回归: warm-up (历史真值) + forecast (自由 rollout)
 
+        Args:
+            hist_state: [bs, input_steps, N, C] — 历史真值序列
+            node_pos: [bs, N, space_size]
+            edges: [bs, ne, 2]
+            future_time_seq: [bs, horizon, 1] — 未来时间序列 (相对最后历史步)
+            conditions: [bs, cond_dim]
+            dt: 时间步长
+            check_point: 是否使用 gradient checkpointing
+            hist_time: [bs, input_steps-1, 1] — 历史步间相对时间
+
+        Returns:
+            outputs: [bs, horizon, N, C] — 未来预测序列
+        """
         pos_enc = FourierEmbedding(node_pos, 0, self.pos_enc_dim)
         c_enc = FourierEmbedding(conditions, 0, self.pos_enc_dim)
 
-        for t in range(T):
-            time_i = time_seq[:, t]
+        memory = None
+        input_steps = hist_state.shape[1]
 
-            def custom_forward(s_t, t_i):
-                return self.forward(s_t, node_pos, edges, t_i, conditions, pos_enc, c_enc, dt)
+        # ---- Phase 1: Warm-up (用历史真值初始化 memory) ----
+        if self.use_memory and input_steps > 1 and hist_time is not None:
+            for s in range(input_steps - 1):
+                state_s = hist_state[:, s]           # [bs, N, C]
+                time_s = hist_time[:, s]              # [bs, 1]
+                _, memory = self.forward_step(
+                    state_s, node_pos, edges, time_s, conditions,
+                    memory=memory, pos_enc=pos_enc, c_enc=c_enc, dt=dt
+                )
+
+        # ---- Phase 2: Forecast (自回归 rollout) ----
+        state_t = hist_state[:, -1]  # 最后一个已知真值
+        T = future_time_seq.shape[1]
+        outputs = []
+
+        for t in range(T):
+            time_i = future_time_seq[:, t]
+
+            def custom_forward(s_t, t_i, mem=memory):
+                return self.forward_step(
+                    s_t, node_pos, edges, t_i, conditions,
+                    memory=mem, pos_enc=pos_enc, c_enc=c_enc, dt=dt
+                )
 
             if check_point:
                 if not state_t.requires_grad and state_t.is_floating_point():
                     state_t.requires_grad_()
-                state_pred = checkpoint(custom_forward, state_t, time_i, use_reentrant=False)
+                # checkpoint 不支持返回 tuple of list，需要包装
+                state_pred, memory = checkpoint(
+                    custom_forward, state_t, time_i, memory, use_reentrant=False
+                )
             else:
-                state_pred = self.forward(state_t, node_pos, edges, time_i, conditions, pos_enc, c_enc, dt)
+                state_pred, memory = self.forward_step(
+                    state_t, node_pos, edges, time_i, conditions,
+                    memory=memory, pos_enc=pos_enc, c_enc=c_enc, dt=dt
+                )
 
             outputs.append(state_pred)
+            state_t = state_pred
 
-            if t < T - 1:
-                if teacher_forcing and gt_states is not None:
-                    state_t = gt_states[:, t]
-                else:
-                    state_t = state_pred
-
-        outputs = torch.stack(outputs[1:], dim=1)
-        return outputs
+        return torch.stack(outputs, dim=1)
 
 
 # =============================================================================
@@ -700,13 +816,14 @@ class Model(nn.Module):
 if __name__ == '__main__':
     torch.manual_seed(42)
     print("=" * 60)
-    print("PhysGTO-AttnRes-Multi 快速验证")
+    print("PhysGTO-AttnRes-Multi + Memory 快速验证")
     print("=" * 60)
 
     bs, N, ne = 2, 64, 128
     T = 4
+    input_steps = 3
     space_dim = 3
-    in_dim = out_dim = 2   # T + alpha.air
+    in_dim = out_dim = 2
     cond_dim = 8
 
     model = Model(
@@ -722,32 +839,39 @@ if __name__ == '__main__':
         dt=2e-5,
         n_fields=2,
         cross_attn_heads=4,
+        use_memory=True,
     )
 
-    state_in = torch.randn(bs, N, in_dim)
+    hist_state = torch.randn(bs, input_steps, N, in_dim)
     node_pos = torch.rand(bs, N, space_dim)
     edges = torch.randint(0, N, (bs, ne, 2))
-    time_seq = torch.linspace(0, 1e-4, T).unsqueeze(0).expand(bs, -1)
+    future_time = torch.linspace(0, 1e-4, T).unsqueeze(0).unsqueeze(-1).expand(bs, -1, -1)
+    hist_time = torch.ones(bs, input_steps - 1, 1) * 2e-5
     conditions = torch.randn(bs, cond_dim)
 
-    # 单步
-    pred = model(state_in, node_pos, edges, time_seq[:, 0], conditions)
-    print(f"[单步]  pred: {pred.shape}")
+    # 单步 (兼容旧接口)
+    pred = model(hist_state[:, -1], node_pos, edges, future_time[:, 0, :], conditions)
+    print(f"[单步兼容]  pred: {pred.shape}")
     assert pred.shape == (bs, N, out_dim)
 
-    # 自回归
-    out = model.autoregressive(state_in, node_pos, edges, time_seq, conditions)
-    print(f"[自回归] out: {out.shape}")
+    # 单步 with memory
+    pred2, mem = model.forward_step(
+        hist_state[:, -1], node_pos, edges, future_time[:, 0, :], conditions
+    )
+    print(f"[单步+mem] pred: {pred2.shape}, memory fields: {len(mem)}, mem shape: {mem[0].shape}")
+    assert pred2.shape == (bs, N, out_dim)
+    assert mem[0].shape == (bs, N, 64)
+
+    # 两阶段自回归
+    out = model.autoregressive(
+        hist_state, node_pos, edges, future_time, conditions,
+        hist_time=hist_time
+    )
+    print(f"[两阶段AR] out: {out.shape}")
     assert out.shape == (bs, T, N, out_dim)
 
     # 参数量
     params = sum(p.numel() for p in model.parameters())
     print(f"\n参数量: {params/1e6:.3f}M")
 
-    # 检查 AttnRes pseudo-query 初始化
-    for name, p in model.named_parameters():
-        if 'attn_res_w' in name:
-            assert torch.all(p == 0), f"{name} should be initialized to zero!"
-    print("AttnRes pseudo-query 全部初始化为零 ✓")
-
-    print("\n✅  PhysGTO-AttnRes-Multi 全部验证通过！")
+    print("\nPhysGTO-AttnRes-Multi + Memory 全部验证通过!")

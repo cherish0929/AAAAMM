@@ -107,7 +107,7 @@ def _build_node_type(ds_shape: Tuple[int, int, int], y_divide=17) -> torch.Tenso
                 if y == 0: node_types[idx] = 1
                 elif y == ny - 1: node_types[idx] = 2
                 else:
-                    if x in (x, nx - 1) or z in (0, nz - 1):
+                    if x in (0, nx - 1) or z in (0, nz - 1):
                         if y <= y_divide: node_types[idx] = 1
                         else: node_types[idx] = 2
     return torch.from_numpy(node_types)
@@ -404,9 +404,19 @@ class AeroGtoDataset(Dataset):
         return len(self.sample_keys)
 
     def _load_window(self, path: str, indices: np.ndarray, start: int):
-        """读取 [start, start + horizon] 对应的状态与时间。"""
+        """读取 [start, start + input_steps + horizon] 对应的状态与时间。
+
+        返回:
+            hist_state: [input_steps, N, C]  — 历史真值序列
+            target_state: [horizon, N, C]    — 未来预测目标
+            hist_time: [input_steps]         — 历史绝对时间
+            future_time: [horizon]           — 未来绝对时间
+        """
         with h5py.File(path, "r") as f:
-            time_idx = start + np.arange(0, self.horizon + 1) * self.time_stride
+            # 总时间窗: input_steps 个历史步 + horizon 个未来步
+            total_window = self.input_steps + self.horizon
+            time_idx = start + np.arange(0, total_window) * self.time_stride
+
             channels = []
             for fname in self.fields:
                 fkey = f"state/{fname}"
@@ -415,7 +425,13 @@ class AeroGtoDataset(Dataset):
                 channels.append(d)
             state = np.stack(channels, axis=-1).astype(np.float32)
             time_all = f["time"][time_idx]
-        return state, time_all
+
+        hist_state = state[:self.input_steps]       # [input_steps, N, C]
+        target_state = state[self.input_steps:]      # [horizon, N, C]
+        hist_time = time_all[:self.input_steps]
+        future_time = time_all[self.input_steps:]
+
+        return hist_state, target_state, hist_time, future_time
 
     def __getitem__(self, idx):
         file_id, start_idx = self.sample_keys[idx]
@@ -425,21 +441,41 @@ class AeroGtoDataset(Dataset):
         if start_idx is None:
             start_idx = random.randint(1, meta["max_start"])
 
-        state_np, time_seq = self._load_window(path, meta["indices"], start_idx)
-        state = torch.from_numpy(state_np)  # [T, N, 4]
+        hist_np, target_np, hist_time_np, future_time_np = self._load_window(
+            path, meta["indices"], start_idx
+        )
+
+        hist_state = torch.from_numpy(hist_np)      # [input_steps, N, C]
+        target_state = torch.from_numpy(target_np)   # [horizon, N, C]
+
         if self.normalize:
-            state = self.normalizer.normalize(state)
+            hist_state = self.normalizer.normalize(hist_state)
+            target_state = self.normalizer.normalize(target_state)
             node_pos = self.scale_3D_pos(meta["node_pos"])
         else:
             node_pos = meta["node_pos"]
 
-        # 目标时间步（相对起始时刻）
-        rel_time = time_seq[1:] - time_seq[0]
-        time_tensor = torch.from_numpy(rel_time.astype(np.float32)).unsqueeze(-1)
+        # 历史时间序列（相邻步间隔）
+        hist_time = torch.from_numpy(hist_time_np.astype(np.float32))
+        # 未来时间序列（相对于最后一个历史步）
+        future_time = torch.from_numpy(
+            (future_time_np - hist_time_np[-1]).astype(np.float32)
+        ).unsqueeze(-1)  # [horizon, 1]
+
+        # 历史步间相对时间（第 i 步相对第 i-1 步）
+        if self.input_steps > 1:
+            hist_rel_time = torch.from_numpy(
+                np.diff(hist_time_np).astype(np.float32)
+            ).unsqueeze(-1)  # [input_steps-1, 1]
+        else:
+            hist_rel_time = torch.zeros(0, 1)
+
         sample = {
             "dt": meta['dt'] * self.time_stride,
-            "state": state,  # [1 + horizon, N, 4]
-            "time_seq": time_tensor,  # [horizon, 1]
+            "hist_state": hist_state,        # [input_steps, N, C]
+            "target_state": target_state,    # [horizon, N, C]
+            "hist_time": hist_rel_time,      # [input_steps-1, 1]
+            "future_time_seq": future_time,  # [horizon, 1]
             "node_pos": node_pos,
             "edges": meta["edges"],
             "node_type": meta["node_type"],

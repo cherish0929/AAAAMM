@@ -398,16 +398,17 @@ class CutAeroGtoDataset(Dataset):
         if start_idx is None:
             start_idx = random.randint(1, meta["max_start"])
 
-        time_idx = start_idx + np.arange(0, self.horizon + 1) * self.time_stride
+        total_window = self.input_steps + self.horizon
+        time_idx = start_idx + np.arange(0, total_window) * self.time_stride
         nx, ny, nz = meta["ds_shape"]
         num_channels = len(self.fields)
 
         with h5py.File(path, "r") as f:
             time_seq = f["time"][time_idx]
-            
+
             # 1. 计算当前特定时间窗口的 Bounding Box (从原文件主动读取判断条件)
             x_min, x_max, y_min, y_max, z_min, z_max = self._get_dynamic_bounds(f, time_idx, meta)
-            
+
             # 2. 读取模型真正需要的 fields 数据并直接装入 3D 张量
             channels_data = []
             for fname in self.fields:
@@ -426,34 +427,50 @@ class CutAeroGtoDataset(Dataset):
         nz_new = z_max - z_min + 1
         N_new = nx_new * ny_new * nz_new
 
-        state = torch.from_numpy(crop_state).reshape(-1, N_new, num_channels)
+        state_all = torch.from_numpy(crop_state).reshape(-1, N_new, num_channels)
         node_pos = torch.from_numpy(crop_pos).reshape(N_new, 3)
         node_type = torch.from_numpy(crop_type).reshape(N_new, 1)
 
-        # 5. 归一化 (位置依然使用全场极值)
+        # 5. 分割为 hist / target
+        hist_state = state_all[:self.input_steps]    # [input_steps, N, C]
+        target_state = state_all[self.input_steps:]   # [horizon, N, C]
+
+        # 6. 归一化
         if self.normalize:
-            state = self.normalizer.normalize(state)
-            pos_min_t = torch.from_numpy(meta["pos_min"]) # 全场极值
-            pos_max_t = torch.from_numpy(meta["pos_max"])
+            hist_state = self.normalizer.normalize(hist_state)
+            target_state = self.normalizer.normalize(target_state)
 
-            pos_min_r = node_pos.min(dim=0).values # 相对极值
+            pos_min_r = node_pos.min(dim=0).values
             pos_max_r = node_pos.max(dim=0).values
-
             node_pos = (node_pos - pos_min_r) / (pos_max_r - pos_min_r + 1e-8)
 
-        # 6. 生成新图边
+        # 7. 生成新图边
         edges = _build_grid_edges((nx_new, ny_new, nz_new), sample_ratio=self.edge_sample_ratio)
 
-        rel_time = time_seq[1:] - time_seq[0]
-        time_tensor = torch.from_numpy(rel_time.astype(np.float32)).unsqueeze(-1)
-        
+        # 时间处理
+        hist_time_np = time_seq[:self.input_steps]
+        future_time_np = time_seq[self.input_steps:]
+
+        future_time = torch.from_numpy(
+            (future_time_np - hist_time_np[-1]).astype(np.float32)
+        ).unsqueeze(-1)  # [horizon, 1]
+
+        if self.input_steps > 1:
+            hist_rel_time = torch.from_numpy(
+                np.diff(hist_time_np).astype(np.float32)
+            ).unsqueeze(-1)
+        else:
+            hist_rel_time = torch.zeros(0, 1)
+
         sample = {
             "dt": meta['dt'] * self.time_stride,
-            "state": state,          
-            "time_seq": time_tensor,  
-            "node_pos": node_pos, 
-            "edges": edges,          
-            "node_type": node_type,  
+            "hist_state": hist_state,
+            "target_state": target_state,
+            "hist_time": hist_rel_time,
+            "future_time_seq": future_time,
+            "node_pos": node_pos,
+            "edges": edges,
+            "node_type": node_type,
             "conditions": meta["conditions"],
             "ds_shape": [nx, ny, nz],
             "grid_shape": torch.Tensor([nx_new, ny_new, nz_new])

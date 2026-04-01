@@ -200,34 +200,41 @@ def train(args, model, train_dataloader, optim, device, normalizer):
     pbar = tqdm(train_dataloader, desc="  Train", unit="bt", leave=True, ncols=120, colour='green')
     for batch in pbar:
         dt = batch['dt'].to(device)
-        state = batch["state"].to(device)  # [1 + horizon, N, 4]
+        hist_state = batch["hist_state"].to(device)       # [B, input_steps, N, C]
+        target_state = batch["target_state"].to(device)   # [B, horizon, N, C]
         node_pos = batch["node_pos"].to(device)
         edges = batch["edges"].to(device)
-        time_seq = batch["time_seq"].to(device)
+        future_time_seq = batch["future_time_seq"].to(device)  # [B, horizon, 1]
+        hist_time = batch["hist_time"].to(device)         # [B, input_steps-1, 1]
         conditions = batch["conditions"].to(device).float()
         if weight_loss.get("gradient", False):
-            weight_loss["grid_shape"] = batch['grid_shape'].numpy() # 针对一个 batch 生效
+            weight_loss["grid_shape"] = batch['grid_shape'].numpy()
 
-        batch_num = state.shape[0]
+        batch_num = hist_state.shape[0]
 
         if use_amp:
-            with autocast(device_type="cuda", dtype=torch.bfloat16):   
-                predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
-                costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss)
-            
+            with autocast(device_type="cuda", dtype=torch.bfloat16):
+                predict_hat = model.autoregressive(
+                    hist_state, node_pos, edges, future_time_seq,
+                    conditions, dt, check_point, hist_time=hist_time
+                )
+                costs = get_train_loss(fields, predict_hat, target_state, normalizer, weight_loss)
+
             costs["loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optim.step()
             optim.zero_grad()
-                
-        else:
-            predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
 
-            costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss)
+        else:
+            predict_hat = model.autoregressive(
+                hist_state, node_pos, edges, future_time_seq,
+                conditions, dt, check_point, hist_time=hist_time
+            )
+            costs = get_train_loss(fields, predict_hat, target_state, normalizer, weight_loss)
             costs["loss"].backward()
             optim.step()
             optim.zero_grad()
-            
+
         agg["loss"] += costs["loss"].item() * batch_num
         agg["value_loss"] += costs["value_loss"].item() * batch_num
         agg["grad_loss"] += costs["grad_loss"].item() * batch_num
@@ -255,7 +262,7 @@ def train(args, model, train_dataloader, optim, device, normalizer):
 def validate(args, model, val_dataloader, device, normalizer, epoch):
     horizon = args.data.get("horizon_test", 1) if isinstance(args.data, dict) else getattr(args, "horizon_test", 1)
     fields = args.data.get("fields", ["T"])
-    use_amp, check_point = args.model.get("use_amp", False), args.model.get("check_point", False)
+    use_amp, check_point = args.train.get("use_amp", False), args.train.get("check_point", False)
     agg = {}
     for key in ["L2", "mean_l2", "RMSE"]:
         if key == "L2" or key == "RMSE":
@@ -278,21 +285,29 @@ def validate(args, model, val_dataloader, device, normalizer, epoch):
         pbar = tqdm(val_dataloader, desc="  Valid", unit="bt", leave=False, ncols=120, colour='yellow')
         for i, batch in enumerate(pbar):
             dt = batch['dt'].to(device)
-            state = batch["state"].to(device)
+            hist_state = batch["hist_state"].to(device)
+            target_state = batch["target_state"].to(device)
             node_pos = batch["node_pos"].to(device)
             edges = batch["edges"].to(device)
-            time_seq = batch["time_seq"].to(device)
+            future_time_seq = batch["future_time_seq"].to(device)
+            hist_time = batch["hist_time"].to(device)
             conditions = batch["conditions"].to(device).float()
 
-            batch_num = state.shape[0]
+            batch_num = hist_state.shape[0]
 
             if use_amp:
                 with autocast("cuda", dtype=torch.bfloat16):
-                    predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
-                    costs = get_val_loss(fields, predict_hat, state[:, 1:], normalizer)
+                    predict_hat = model.autoregressive(
+                        hist_state, node_pos, edges, future_time_seq,
+                        conditions, dt, check_point, hist_time=hist_time
+                    )
+                    costs = get_val_loss(fields, predict_hat, target_state, normalizer)
             else:
-                predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
-                costs = get_val_loss(fields, predict_hat, state[:, 1:], normalizer)
+                predict_hat = model.autoregressive(
+                    hist_state, node_pos, edges, future_time_seq,
+                    conditions, dt, check_point, hist_time=hist_time
+                )
+                costs = get_val_loss(fields, predict_hat, target_state, normalizer)
 
             for fname in fields:
                 agg[f"L2_{fname}"] += costs[f"L2_{fname}"].mean().item() * batch_num
@@ -300,17 +315,6 @@ def validate(args, model, val_dataloader, device, normalizer, epoch):
             agg["mean_l2"] += costs["mean_l2"].mean().item() * batch_num
             agg["each_l2"] += costs["each_l2"] * batch_num
             agg["num"] += batch_num
-            # 只保存 batch 中的第一个（任意一个）样本
-            # if i in viz_batch_indices:
-            #     # 随机选择一个样本进行可视化
-            #     sample_idx = random.randint(0, batch_num - 1)
-            #     pred_real = normalizer.denormalize(predict_hat)
-            #     gt_real = normalizer.denormalize(state[:, 1:])
-
-            #     from src.utils import save_vtk_result
-            #     save_vtk_result(save_dir=args.save_path, epoch=epoch, file_id=f"batch{i}_sample{sample_idx}",
-            #                     predictions=pred_real[sample_idx], ground_truths=gt_real[sample_idx], node_pos=node_pos[0], field_names=fields)
-
 
     for key, value in agg.items():
         if key != "each_l2" and key != "num":
