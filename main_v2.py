@@ -25,7 +25,7 @@ from pathlib import Path
 from datetime import datetime
 
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim import AdamW
 
@@ -41,7 +41,14 @@ from src.utils import set_seed, init_weights, parse_args, load_json_config
 # =============================================================================
 
 class EMA:
-    """Maintains an exponential moving average of model parameters."""
+    """Maintains an exponential moving average of model parameters.
+
+    IMPORTANT: call update() after every optimizer step (every batch),
+    not once per epoch.  With decay=0.999 the effective averaging window
+    is ~1000 steps.  If called only once per epoch (e.g. 192 batches/epoch),
+    after 100 epochs the shadow still retains >90% of the *initial* weights,
+    producing catastrophically bad inference.
+    """
     def __init__(self, model, decay=0.999):
         self.decay = decay
         self.shadow = {}
@@ -75,31 +82,38 @@ class EMA:
 # Warmup + CosineRestart Scheduler
 # =============================================================================
 
-class WarmupCosineRestartScheduler:
+class WarmupCosineScheduler:
     """
-    Linear warmup followed by CosineAnnealingWarmRestarts.
+    Linear warmup followed by CosineAnnealingLR (monotonic decay).
+
+    Previous WarmupCosineRestartScheduler used CosineAnnealingWarmRestarts which
+    caused lr to bounce back to near-initial values late in training (e.g. epoch
+    160+/200 with T_0=50, T_mult=2), preventing fine-grained convergence and
+    causing severe overfitting (test L2 14x worse than main.py baseline).
+
+    This version uses a single cosine decay after warmup, ensuring lr decreases
+    monotonically to eta_min by the end of training.
     """
-    def __init__(self, optimizer, warmup_epochs, T_0, T_mult=1, eta_min=1e-6):
+    def __init__(self, optimizer, warmup_epochs, total_epochs, eta_min=1e-6):
         self.optimizer = optimizer
         self.warmup_epochs = warmup_epochs
         self.base_lr = optimizer.param_groups[0]['lr']
         self.eta_min = eta_min
         self.current_epoch = 0
 
-        # Cosine scheduler (will be stepped after warmup)
-        self.cosine_scheduler = CosineAnnealingWarmRestarts(
-            optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min
+        # Cosine scheduler covers the post-warmup portion
+        self.cosine_scheduler = CosineAnnealingLR(
+            optimizer, T_max=max(1, total_epochs - warmup_epochs), eta_min=eta_min
         )
 
     def step(self):
         self.current_epoch += 1
         if self.current_epoch <= self.warmup_epochs:
-            # Linear warmup
             lr = self.base_lr * (self.current_epoch / self.warmup_epochs)
             for pg in self.optimizer.param_groups:
                 pg['lr'] = lr
         else:
-            self.cosine_scheduler.step(self.current_epoch - self.warmup_epochs)
+            self.cosine_scheduler.step()
 
     def get_last_lr(self):
         return [pg['lr'] for pg in self.optimizer.param_groups]
@@ -109,7 +123,7 @@ class WarmupCosineRestartScheduler:
 # Pushforward Training
 # =============================================================================
 
-def train_pushforward(args, model, train_dataloader, optim, device, normalizer, extra_steps):
+def train_pushforward(args, model, train_dataloader, optim, device, normalizer, extra_steps, ema=None):
     """
     Pushforward training: extend rollout beyond horizon_train by extra_steps.
     Only backpropagate through the extra steps (the model is already good at the original horizon).
@@ -193,6 +207,8 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
             optim.step()
             optim.zero_grad()
+            if ema is not None:
+                ema.update(model)
         else:
             predict_hat = model.autoregressive(
                 state[:, 0], node_pos, edges, time_seq[:, :T_pf], conditions, dt, check_point
@@ -216,6 +232,8 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
             optim.step()
             optim.zero_grad()
+            if ema is not None:
+                ema.update(model)
 
         agg["loss"] += costs["loss"].item() * batch_num
         agg["value_loss"] += costs["value_loss"].item() * batch_num
@@ -250,7 +268,7 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
 # Patched train function with configurable grad_loss_weight
 # =============================================================================
 
-def train_v2(args, model, train_dataloader, optim, device, normalizer):
+def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None):
     """train() with configurable grad_loss_weight instead of hardcoded 8.0"""
     from torch.amp import GradScaler, autocast
     from tqdm import tqdm
@@ -309,6 +327,8 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
             optim.step()
             optim.zero_grad()
+            if ema is not None:
+                ema.update(model)
         else:
             predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
             costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss, active_mask=active_mask)
@@ -318,6 +338,8 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
             optim.step()
             optim.zero_grad()
+            if ema is not None:
+                ema.update(model)
 
         # For logging, store the combined loss into costs
         costs["loss"] = loss
@@ -514,15 +536,13 @@ def main(args, path_logs, path_nn, path_record):
 
     if sched_type == "cosine_warmrestart":
         warmup_epochs = sched_cfg.get("warmup_epochs", 10)
-        T_0 = sched_cfg.get("T_0", 50)
-        T_mult = sched_cfg.get("T_mult", 2)
-        eta_min_ratio = sched_cfg.get("eta_min_ratio", 0.002)
+        eta_min_ratio = sched_cfg.get("eta_min_ratio", 0.05)
         eta_min = real_lr * eta_min_ratio
-        scheduler = WarmupCosineRestartScheduler(
+        scheduler = WarmupCosineScheduler(
             optimizer, warmup_epochs=warmup_epochs,
-            T_0=T_0, T_mult=T_mult, eta_min=eta_min
+            total_epochs=EPOCH, eta_min=eta_min
         )
-        print(f"Scheduler: WarmupCosineRestart (warmup={warmup_epochs}, T_0={T_0}, T_mult={T_mult}, eta_min={eta_min:.2e})")
+        print(f"Scheduler: WarmupCosine (warmup={warmup_epochs}, total={EPOCH}, eta_min={eta_min:.2e})")
     else:
         # Fallback: original behavior
         if EPOCH < 10:
@@ -590,17 +610,17 @@ def main(args, path_logs, path_nn, path_record):
         if use_pushforward:
             train_error = train_pushforward(
                 args, model, train_dataloader, optimizer, device, normalizer,
-                extra_steps=pf_extra
+                extra_steps=pf_extra, ema=ema
             )
         else:
             train_error = train_v2(
-                args, model, train_dataloader, optimizer, device, normalizer
+                args, model, train_dataloader, optimizer, device, normalizer,
+                ema=ema
             )
 
         end_time = time.time()
 
-        # Update EMA
-        ema.update(model)
+        # EMA is now updated per-batch inside train_v2/train_pushforward
 
         # Step scheduler
         scheduler.step()

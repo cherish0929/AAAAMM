@@ -571,7 +571,7 @@ if __name__ == "__main__":
     MODE = "test"
     NAME = "config/aerogto_HR_easypool_v0.json"
     # === 配置区域 ===
-    CONFIG_PATH = f"config/config_0401/main1_multi1_easypool.json" 
+    CONFIG_PATH = f"config/config_0402/main2_multi1_easypool.json" 
     
     FIELD_TO_PLOT = None   # ["T", "Ux", "Uy", "Uz", "alpha.air", "alpha.titanium", "gamma_liquid"] 
     SLICE_AXIS = "z"        # 'x', 'y', 'z'
@@ -581,9 +581,9 @@ if __name__ == "__main__":
     try:
         predictor = AeroGtoPredictor(CONFIG_PATH, MODE)
         if FIELD_TO_PLOT is None:
-            OUT_DIR = f"result/task_0326/{predictor.args.name}/{MODE}/batch"
+            OUT_DIR = f"result/mainn_multin/{predictor.args.name}/{MODE}/batch"
         else:
-            OUT_DIR = f"result/task_0326/{predictor.args.name}/{MODE}/{FIELD_TO_PLOT}"
+            OUT_DIR = f"result/mainn_multin/{predictor.args.name}/{MODE}/{FIELD_TO_PLOT}"
         os.makedirs(OUT_DIR, exist_ok=True)
     except Exception as e:
         print(f"初始化失败: {e}")
@@ -593,7 +593,7 @@ if __name__ == "__main__":
     
     # SAMPLE_IDX = random.randint(0, len(predictor.dataset)-1)    
     dataset_length = len(predictor.dataset); print(dataset_length)
-    sample_idxs = random.sample(range(0, dataset_length), 4)
+    sample_idxs = random.sample(range(0, dataset_length), 3)
     for sample_idx in sample_idxs:
         # print(predictor.dataset[50]["conditions"])
         # print(predictor.dataset[55]["conditions"])
