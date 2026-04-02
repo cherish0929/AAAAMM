@@ -115,7 +115,7 @@ def _build_node_type(ds_shape: Tuple[int, int, int], y_divide=17) -> torch.Tenso
                 elif y == ny - 1:
                     node_types[idx] = 2
                 else:
-                    if x in (x, nx - 1) or z in (0, nz - 1):
+                    if x in (0, nx - 1) or z in (0, nz - 1):
                         if y <= y_divide:
                             node_types[idx] = 1
                         else:
@@ -240,36 +240,28 @@ class AeroGtoDataset(Dataset):
     """
 
     def __init__(
-        self, data_cfg,
-        file_list: Iterable[str],
+        self, args,
         mode: str = "train",
-        fields: List['str'] = ['T'],
-        input_steps: int = 1,
-        horizon: int = 5,
-        time_stride: int = 1,
-        spatial_stride: Union[int, Tuple[int, int, int]] = 1,
-        normalize: bool = True,
-        samples_per_file: int = 32,
-        norm_cache: Optional[str] = None,
         mat_data=None,
     ):
         super().__init__()
         assert mode in {"train", "test"}, "mode 只能为 train 或 test"
+        data_cfg = args.data
         self.config = data_cfg
         self.mode = mode
-        self.fields = fields
-        self.input_steps = input_steps
-        self.horizon = horizon
-        self.time_stride = time_stride
-        self.spatial_stride = _normalize_stride(spatial_stride)
-        self.normalize = normalize
+        self.fields = data_cfg.get("fields", ["T"])
+        self.input_steps = data_cfg.get("input_steps", 1)
+        self.horizon = data_cfg.get(f"horizon_{mode}", 1)
+        self.time_stride = data_cfg.get("time_stride", 1)
+        self.spatial_stride = _normalize_stride(data_cfg.get("spatial_stride", 1))
+        self.normalize = data_cfg.get("normalize", True)
         self.mat_mean_and_std = mat_data
-        self.samples_per_file = samples_per_file
-        self.norm_cache = norm_cache
+        self.samples_per_file = data_cfg.get("samples_per_file", 32)
+        self.norm_cache = data_cfg.get("norm_cache")
 
-        self.mask_cfg = data_cfg.get("active_mask", None)
+        self.mask_cfg = args.train.get("weight_loss", None)
 
-        self.file_paths = _read_file_list(file_list)
+        self.file_paths = _read_file_list(data_cfg[f"{mode}_list"])
         self.meta_cache = {}
         self.sample_keys = []
         self.max_start_per_file = []
@@ -282,10 +274,10 @@ class AeroGtoDataset(Dataset):
             self.max_start_per_file.append(meta["max_start"])
 
             if mode == "train":
-                for _ in range(samples_per_file):
+                for _ in range(self.samples_per_file):
                     self.sample_keys.append((file_id, None))
             else:
-                step = max(1, horizon // 2)
+                step = max(1, self.horizon // 2)
                 for start in range(1, meta["max_start"] + 1, step):
                     self.sample_keys.append((file_id, start))
 
@@ -305,6 +297,11 @@ class AeroGtoDataset(Dataset):
 
         # 优化：初始化完成后，把 normalizer 的统计量 pin 到 CPU
         # __getitem__ 里直接用，不再反复 .to()
+        self._sync_norm_cache()
+
+    def _sync_norm_cache(self):
+        """将 normalizer 的统计量同步到 norm_mean / norm_std 缓存。
+        在 __init__ 及外部覆盖 normalizer 后必须调用。"""
         self.norm_mean = self.normalizer.mean  # shape [1, 1, C]
         self.norm_std = self.normalizer.std + self.normalizer.eps
 

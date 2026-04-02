@@ -29,9 +29,9 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, CosineAnnealin
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim import AdamW
 
-from src.dataset import AeroGtoDataset
+from src.dataset_fast import AeroGtoDataset
 from src.dataset_2d import AeroGtoDataset2D
-from src.dataset_cut import CutAeroGtoDataset
+from src.dataset_cut_fast import CutAeroGtoDataset
 from src.train import train, validate, get_train_loss, _init_region_agg, _accumulate_region, _finalize_region
 from src.utils import set_seed, init_weights, parse_args, load_json_config
 
@@ -369,35 +369,18 @@ def get_dataloader(args, path_record, device_type):
         Datasetclass = AeroGtoDataset2D
 
     train_dataset = Datasetclass(
-        data_cfg=data_cfg,
-        file_list=data_cfg["train_list"],
-        mode="train",
-        fields=data_cfg.get("fields", ["T"]),
-        input_steps=data_cfg.get("input_steps", 1),
-        horizon=data_cfg.get("horizon_train", 1),
-        time_stride=data_cfg.get("time_stride", 1),
-        spatial_stride=data_cfg.get("spatial_stride", 1),
-        normalize=data_cfg.get("normalize", True),
-        samples_per_file=data_cfg.get("samples_per_file", 32),
-        norm_cache=data_cfg.get("norm_cache"),
+        args=args,
+        mode="train"
     )
 
     test_dataset = Datasetclass(
-        data_cfg=data_cfg,
-        file_list=data_cfg["test_list"],
+        args=args,
         mode="test",
-        fields=data_cfg.get("fields", ["T"]),
-        input_steps=data_cfg.get("input_steps", 1),
-        horizon=data_cfg.get("horizon_test", 1),
-        time_stride=data_cfg.get("time_stride", 1),
-        spatial_stride=data_cfg.get("spatial_stride", 1),
-        normalize=data_cfg.get("normalize", True),
-        samples_per_file=data_cfg.get("samples_per_file", 32),
-        norm_cache=data_cfg.get("norm_cache"),
         mat_data=train_dataset.mat_mean_and_std if train_dataset.normalize else None
     )
 
     test_dataset.normalizer = train_dataset.normalizer
+    test_dataset._sync_norm_cache()  # 同步 norm_mean/norm_std 缓存
 
     pin_memory = True if "cuda" in device_type else False
 

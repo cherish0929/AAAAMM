@@ -79,36 +79,19 @@ class AeroGtoPredictor:
         print("[Init] Loading Train Dataset (for Normalizer)...")
         # 即使是 inference，通常也需要 TrainSet 的统计数据来做 Normalizer
         train_dataset = CutAeroGtoDataset(
-            data_cfg=data_cfg,
-            file_list=data_cfg["train_list"],
-            mode="train",
-            fields=data_cfg.get("fields", ["T"]),
-            input_steps=data_cfg.get("input_steps", 1),
-            horizon=data_cfg.get("horizon_test", 1),
-            time_stride=data_cfg.get("time_stride", 1),
-            spatial_stride=data_cfg.get("spatial_stride", 1),
-            normalize=data_cfg.get("normalize", True),
-            samples_per_file=data_cfg.get("samples_per_file", 32),
-            norm_cache=data_cfg.get("norm_cache"),
-        )
+            args=self.args,
+            mode="train")
 
         if mode == "test":
-            self.dataset = CutAeroGtoDataset(
-                data_cfg=data_cfg,
-                file_list=self.args.data["test_list"],
+            test_dataset = CutAeroGtoDataset(
+                args=self.args,
                 mode="test",
-                fields=self.args.data.get("fields", ["T"]),
-                input_steps=self.args.data.get("input_steps", 1),
-                horizon=self.args.data.get("horizon_test", 10),
-                time_stride=self.args.data.get("time_stride", 1),
-                spatial_stride=self.args.data.get("spatial_stride", 1),
-                normalize=self.args.data.get("normalize", True),
-                norm_cache=self.args.data.get("norm_cache"),
                 mat_data=train_dataset.mat_mean_and_std if train_dataset.normalize else None
             )
 
 
             self.dataset.normalizer = train_dataset.normalizer
+            self.dataset._sync_norm_cache()  # 同步 norm_mean/norm_std 缓存
         
         elif mode == "train":
             self.dataset = train_dataset

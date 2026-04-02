@@ -95,6 +95,7 @@ class AeroGtoPredictor:
             )
 
             self.dataset.normalizer = train_dataset.normalizer
+            self.dataset._sync_norm_cache()  # 同步 norm_mean/norm_std 缓存
         
         elif mode == "train":
             self.dataset = train_dataset

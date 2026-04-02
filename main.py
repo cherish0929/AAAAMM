@@ -12,9 +12,9 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.optim import AdamW
 
 # load specific modules for LPBF project
-from src.dataset import AeroGtoDataset
+from src.dataset_fast import AeroGtoDataset
 from src.dataset_2d import AeroGtoDataset2D
-from src.dataset_cut import CutAeroGtoDataset
+from src.dataset_cut_fast import CutAeroGtoDataset
 # from src.physgto import Model
 from src.train import train, validate
 from src.utils import set_seed, init_weights, parse_args, load_json_config
@@ -46,6 +46,7 @@ def get_dataloader(args, path_record, device_type):
     
     # 共享 Normalizer
     test_dataset.normalizer = train_dataset.normalizer
+    test_dataset._sync_norm_cache()  # 同步 norm_mean/norm_std 缓存
 
     # 构建 DataLoader
     pin_memory = True if "cuda" in device_type else False
@@ -108,6 +109,7 @@ def get_model(args, device, cond_dim, default_dt):
         n_head=model_cfg.get("n_head", 4),
         n_token=model_cfg.get("n_token", 64),
         dt=model_cfg.get("dt", default_dt),
+        stepper_scheme=model_cfg.get("stepper_scheme", "eular")
     )
 
     if model_name in ("gto_attnres_multi", "gto_attnres_multi_v2", "gto_res_attnres", "v3"):

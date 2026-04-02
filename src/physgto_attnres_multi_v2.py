@@ -506,7 +506,7 @@ class AttnResMixerBlock(nn.Module):
             V_in = torch.cat([h, s_enc], dim=-1)
             v, e = self.gnns[i](V_in, E_i, edges)
             E_i = E_i + e
-            partial = v  # partial_block 只累加子层输出
+            partial = h + v  # 保留完整残差（h 是 AttnRes 聚合结果）
 
             V_out.append(partial)
             E_out.append(E_i)
@@ -718,10 +718,11 @@ class Model(nn.Module):
         V_all_list = self.mixer(V_list, E, edges_long, pos_enc)
         v_pred = self.decoder(V_all_list, pos_enc)
 
-        with autocast(device_type="cuda", enabled=False):
-            state_pred = state_in.float() + v_pred.float() * dt_tensor.float()
+        # with autocast(device_type="cuda", enabled=False):
+        #     state_pred = state_in.float() + v_pred.float() * dt_tensor.float()
             
-        # state_pred = state_in + v_pred
+        state_pred = state_in + v_pred
+        
         return state_pred
 
     def autoregressive(self,

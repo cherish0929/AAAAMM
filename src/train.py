@@ -412,7 +412,7 @@ def train(args, model, train_dataloader, optim, device, normalizer):
 def validate(args, model, val_dataloader, device, normalizer, epoch):
     horizon = args.data.get("horizon_test", 1) if isinstance(args.data, dict) else getattr(args, "horizon_test", 1)
     fields = args.data.get("fields", ["T"])
-    use_amp, check_point = args.model.get("use_amp", False), args.model.get("check_point", False)
+    use_amp, check_point = args.train.get("use_amp", False), args.train.get("check_point", False)
     agg = {}
     for key in ["L2", "mean_l2", "RMSE"]:
         if key == "L2" or key == "RMSE":
