@@ -48,9 +48,9 @@ def compute_active_score(
     """Per-node activity score in [0, 1].
 
     Composed of three terms (all normalized to [0,1] before blending):
-      a) spatial gradient  – regular-grid 6-neighbor finite difference
-      b) temporal change   – |field_t - field_{t-1}|
-      c) physics triggers  – per-channel thresholding (e.g. high T, velocity mag)
+      a) spatial gradient   regular-grid 6-neighbor finite difference
+      b) temporal change    |field_t - field_{t-1}|
+      c) physics triggers   per-channel thresholding (e.g. high T, velocity mag)
 
     Uses regular cubic grid finite-difference instead of KNN gradient,
     exploiting the structured-grid nature of LPBF data.
@@ -88,6 +88,7 @@ def compute_active_score(
     score = (gradient_weight * spatial_grad
              + temporal_weight * temporal_change
              + physics_weight * physics_score)
+    
     return score.clamp(0.0, 1.0)
 
 
@@ -211,13 +212,14 @@ def zone_first_sample(
     core_keep_ratio: float = 1.0,
     ring_keep_ratio: float = 0.5,
     background_extra_ratio: float = 0.0,
+    bg_backbone_keep_ratio: float = 1.0,
 ) -> torch.Tensor:
     """Zone-priority sampling — zone determines keep ratio, not backbone status.
 
     Logic:
       - core (zone==2):  keep core_keep_ratio of ALL core nodes (backbone or not)
       - ring  (zone==1):  keep ring_keep_ratio of ALL ring nodes
-      - background (zone==0): keep ONLY backbone nodes (coarse reference layer)
+      - background (zone==0): keep backbone nodes (subsampled by bg_backbone_keep_ratio)
         optionally keep background_extra_ratio of non-backbone background nodes
 
     Returns:
@@ -248,10 +250,15 @@ def zone_first_sample(
         else:
             selected.append(ring_all)
 
-    # ---- background zone: only backbone nodes ----
+    # ---- background zone: backbone nodes (with optional subsampling) ----
     bg_backbone = torch.where((zone_full == 0) & backbone_mask)[0]
     if bg_backbone.numel() > 0:
-        selected.append(bg_backbone)
+        if bg_backbone_keep_ratio < 1.0:
+            n_keep = max(1, int(bg_backbone.numel() * bg_backbone_keep_ratio))
+            perm = torch.randperm(bg_backbone.numel(), device=device)[:n_keep]
+            selected.append(bg_backbone[perm])
+        else:
+            selected.append(bg_backbone)
 
     # optional: small fraction of non-backbone background for smoothness
     if background_extra_ratio > 0.0:
@@ -326,6 +333,59 @@ def build_stencil_edges(
     Returns:
         edges: [E, 2] long tensor in LOCAL indexing (0-based within selected_indices).
     """
+    return _build_stencil_edges_impl(
+        selected_indices, zone_labels, grid_shape, backbone_mask,
+        bg_stencil, ring_stencil, core_stencil,
+        compressed=False,
+    )
+
+
+def build_stencil_edges_compressed(
+    selected_indices: torch.Tensor,
+    zone_labels: torch.Tensor,
+    grid_shape: Tuple[int, int, int],
+    backbone_mask: torch.Tensor,
+    core_max_neighbors: int = 12,
+    ring_max_neighbors: int = 8,
+    bg_keep_ratio: float = 0.7,
+) -> torch.Tensor:
+    """Compressed stencil edge builder with per-zone neighbor budgets.
+
+    Edge strategy per zone:
+      - core:  keep nearest 6 + random sample from remaining 26-neighbors
+               up to core_max_neighbors total (~10-12)
+      - ring:  keep nearest 6 + extend up to ring_max_neighbors (~8-10)
+      - background: keep 6-neighbors, randomly drop (1 - bg_keep_ratio)
+
+    All edges are canonicalized (i < j) and deduplicated.
+
+    Returns:
+        edges: [E, 2] long tensor in LOCAL indexing, canonical (src < dst).
+    """
+    return _build_stencil_edges_impl(
+        selected_indices, zone_labels, grid_shape, backbone_mask,
+        bg_stencil=6, ring_stencil=18, core_stencil=26,
+        compressed=True,
+        core_max_neighbors=core_max_neighbors,
+        ring_max_neighbors=ring_max_neighbors,
+        bg_keep_ratio=bg_keep_ratio,
+    )
+
+
+def _build_stencil_edges_impl(
+    selected_indices: torch.Tensor,
+    zone_labels: torch.Tensor,
+    grid_shape: Tuple[int, int, int],
+    backbone_mask: torch.Tensor,
+    bg_stencil: int = 6,
+    ring_stencil: int = 18,
+    core_stencil: int = 26,
+    compressed: bool = False,
+    core_max_neighbors: int = 12,
+    ring_max_neighbors: int = 8,
+    bg_keep_ratio: float = 0.7,
+) -> torch.Tensor:
+    """Shared implementation for both original and compressed stencil edges."""
     nx, ny, nz = grid_shape
     device = selected_indices.device
     N_sel = selected_indices.shape[0]
@@ -338,30 +398,26 @@ def build_stencil_edges(
     ring_offsets = stencil_map.get(ring_stencil, _STENCIL_18)
     core_offsets = stencil_map.get(core_stencil, _STENCIL_26)
 
-    # Build lookup: full_grid_flat_idx -> local index in selected_indices
-    # Use a dense tensor for O(1) lookup (memory: N_full ints, acceptable)
     N_full = nx * ny * nz
     full_to_local = torch.full((N_full,), -1, dtype=torch.long, device=device)
     full_to_local[selected_indices] = torch.arange(N_sel, device=device)
 
-    # Convert flat indices to (x, y, z) coordinates
-    sel_np = selected_indices  # keep on device
-    sel_x = sel_np % nx
-    sel_y = (sel_np // nx) % ny
-    sel_z = sel_np // (nx * ny)
+    sel_x = selected_indices % nx
+    sel_y = (selected_indices // nx) % ny
+    sel_z = selected_indices // (nx * ny)
 
-    # Zone of each selected node
     sel_zone = zone_labels[selected_indices]
 
-    # Prepare offset tensors for each stencil level
     def _offsets_tensor(offsets_list):
-        return torch.tensor(offsets_list, dtype=torch.long, device=device)  # [K, 3]
+        return torch.tensor(offsets_list, dtype=torch.long, device=device)
 
-    bg_off_t = _offsets_tensor(bg_offsets)      # [6, 3]
-    ring_off_t = _offsets_tensor(ring_offsets)   # [18, 3]
-    core_off_t = _offsets_tensor(core_offsets)   # [26, 3]
+    bg_off_t = _offsets_tensor(bg_offsets)
+    ring_off_t = _offsets_tensor(ring_offsets)
+    core_off_t = _offsets_tensor(core_offsets)
 
-    # Vectorized edge construction per zone level
+    # For compressed mode: 6-neighbor offsets (faces only) as the guaranteed base
+    base6_off_t = _offsets_tensor(_STENCIL_6)
+
     edge_list = []
 
     for zone_val, off_t in [(0, bg_off_t), (1, ring_off_t), (2, core_off_t)]:
@@ -369,37 +425,51 @@ def build_stencil_edges(
         if not mask.any():
             continue
 
-        local_ids = torch.where(mask)[0]  # local indices of this zone
+        local_ids = torch.where(mask)[0]
         n_zone = local_ids.shape[0]
         K = off_t.shape[0]
 
-        # coordinates of these nodes: [n_zone]
         zx = sel_x[local_ids]
         zy = sel_y[local_ids]
         zz = sel_z[local_ids]
 
-        # neighbor coords: [n_zone, K]
-        nb_x = zx.unsqueeze(1) + off_t[:, 0].unsqueeze(0)  # [n_zone, K]
+        nb_x = zx.unsqueeze(1) + off_t[:, 0].unsqueeze(0)
         nb_y = zy.unsqueeze(1) + off_t[:, 1].unsqueeze(0)
         nb_z = zz.unsqueeze(1) + off_t[:, 2].unsqueeze(0)
 
-        # boundary check
         valid = ((nb_x >= 0) & (nb_x < nx) &
                  (nb_y >= 0) & (nb_y < ny) &
                  (nb_z >= 0) & (nb_z < nz))
 
-        # compute flat indices for valid neighbors
-        nb_flat = nb_z * (nx * ny) + nb_y * nx + nb_x  # [n_zone, K]
-        nb_flat = nb_flat.clamp(0, N_full - 1)  # safe clamp for invalid
+        nb_flat = nb_z * (nx * ny) + nb_y * nx + nb_x
+        nb_flat = nb_flat.clamp(0, N_full - 1)
 
-        # check if neighbor is in selected set
-        nb_local = full_to_local[nb_flat]  # [n_zone, K], -1 if not selected
+        nb_local = full_to_local[nb_flat]
         in_selected = (nb_local >= 0) & valid
 
-        # build source indices (local)
-        src_local = local_ids.unsqueeze(1).expand(-1, K)  # [n_zone, K]
+        if compressed:
+            # --- Compressed mode: per-zone neighbor budget ---
+            if zone_val == 2:  # core
+                # Keep base 6-neighbors unconditionally, sample extras up to budget
+                in_selected = _budget_sample_neighbors(
+                    local_ids, sel_x, sel_y, sel_z, off_t, base6_off_t,
+                    in_selected, nb_local, core_max_neighbors, nx, ny, nz,
+                    N_full, full_to_local, device,
+                )
+            elif zone_val == 1:  # ring
+                in_selected = _budget_sample_neighbors(
+                    local_ids, sel_x, sel_y, sel_z, off_t, base6_off_t,
+                    in_selected, nb_local, ring_max_neighbors, nx, ny, nz,
+                    N_full, full_to_local, device,
+                )
+            elif zone_val == 0:  # background
+                # Random drop from 6-neighbors
+                if bg_keep_ratio < 1.0 and in_selected.any():
+                    drop_mask = torch.rand(in_selected.shape, device=device) > bg_keep_ratio
+                    in_selected = in_selected & (~drop_mask)
 
-        # extract valid edges
+        src_local = local_ids.unsqueeze(1).expand(-1, K)
+
         src_edges = src_local[in_selected]
         dst_edges = nb_local[in_selected]
 
@@ -408,12 +478,170 @@ def build_stencil_edges(
 
     if edge_list:
         edges = torch.cat(edge_list, dim=0)
-        # remove self-loops (shouldn't happen with nonzero offsets, but safety)
+        # remove self-loops
         mask = edges[:, 0] != edges[:, 1]
         edges = edges[mask]
+
+        if compressed:
+            # canonicalize and deduplicate
+            edges = canonicalize_and_dedup_edges(edges)
+
         return edges
 
     return torch.zeros((0, 2), dtype=torch.long, device=device)
+
+
+def _budget_sample_neighbors(
+    local_ids: torch.Tensor,
+    sel_x: torch.Tensor,
+    sel_y: torch.Tensor,
+    sel_z: torch.Tensor,
+    full_off_t: torch.Tensor,
+    base6_off_t: torch.Tensor,
+    in_selected: torch.Tensor,
+    nb_local: torch.Tensor,
+    max_neighbors: int,
+    nx: int, ny: int, nz: int,
+    N_full: int,
+    full_to_local: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """Apply neighbor budget: keep all base-6 neighbors, sample from extras.
+
+    For each node, guarantees its 6-face-neighbors (if they exist in the
+    selected set), then randomly samples from the remaining stencil neighbors
+    up to max_neighbors total.
+
+    Returns:
+        Modified in_selected mask [n_zone, K].
+    """
+    n_zone = local_ids.shape[0]
+    K_full = full_off_t.shape[0]
+
+    # Identify which of the K_full offsets are base-6
+    # (match by offset value)
+    is_base6 = torch.zeros(K_full, dtype=torch.bool, device=device)
+    for i in range(K_full):
+        for j in range(base6_off_t.shape[0]):
+            if (full_off_t[i] == base6_off_t[j]).all():
+                is_base6[i] = True
+                break
+
+    # base6 mask: [n_zone, K_full]
+    base6_mask = is_base6.unsqueeze(0).expand(n_zone, -1)
+    extra_mask = ~base6_mask
+
+    # base-6 edges (always keep)
+    base_edges = in_selected & base6_mask
+
+    # count base-6 per node
+    base_count = base_edges.sum(dim=1)  # [n_zone]
+
+    # extra candidates
+    extra_candidates = in_selected & extra_mask
+
+    # budget remaining per node
+    budget = (max_neighbors - base_count).clamp(min=0)  # [n_zone]
+
+    # For each node, randomly sample from extras up to budget
+    extra_count = extra_candidates.sum(dim=1)  # [n_zone]
+    needs_trim = extra_count > budget
+
+    if needs_trim.any():
+        # Vectorized random sampling: assign random priorities, keep top-budget
+        rand_scores = torch.rand(n_zone, K_full, device=device)
+        rand_scores[~extra_candidates] = -1.0  # ensure non-candidates rank lowest
+
+        # For nodes that need trimming, zero out lowest-priority extras
+        # Sort by random score per row, keep top-budget
+        trim_ids = torch.where(needs_trim)[0]
+        for idx in trim_ids:
+            b = int(budget[idx].item())
+            if b <= 0:
+                extra_candidates[idx] = False
+                continue
+            row_scores = rand_scores[idx]
+            row_cands = extra_candidates[idx]
+            cand_indices = torch.where(row_cands)[0]
+            if cand_indices.numel() > b:
+                cand_scores = row_scores[cand_indices]
+                _, topk_local = cand_scores.topk(b)
+                keep_set = cand_indices[topk_local]
+                new_row = torch.zeros(K_full, dtype=torch.bool, device=device)
+                new_row[keep_set] = True
+                extra_candidates[idx] = new_row
+
+    # Combine base + trimmed extras
+    result = base_edges | extra_candidates
+    return result
+
+
+def canonicalize_and_dedup_edges(edges: torch.Tensor) -> torch.Tensor:
+    """Canonicalize edges to (min, max) ordering and remove duplicates.
+
+    Converts all edges to undirected (i < j) and removes duplicates.
+
+    Args:
+        edges: [E, 2] long tensor.
+
+    Returns:
+        deduped: [E', 2] long tensor with E' <= E, all edges have src < dst.
+    """
+    if edges.numel() == 0:
+        return edges
+
+    # Canonicalize: ensure src < dst
+    src = edges[:, 0]
+    dst = edges[:, 1]
+    canon_src = torch.min(src, dst)
+    canon_dst = torch.max(src, dst)
+    canon = torch.stack([canon_src, canon_dst], dim=1)
+
+    # Deduplicate using unique
+    canon_deduped = torch.unique(canon, dim=0)
+    return canon_deduped
+
+
+def enforce_edge_budget(
+    edges: torch.Tensor,
+    zone_labels_selected: torch.Tensor,
+    max_edges_ratio: float = 4.0,
+    num_nodes: int = 0,
+) -> torch.Tensor:
+    """Enforce a global edge budget: max_edges ≈ max_edges_ratio * num_nodes.
+
+    Priority deletion order: background edges first, then ring, then core.
+
+    Args:
+        edges:                [E, 2] canonical edges (src < dst).
+        zone_labels_selected: [N_sel] zone labels for the selected nodes.
+        max_edges_ratio:      max edges per node ratio.
+        num_nodes:            number of selected nodes.
+
+    Returns:
+        trimmed: [E', 2] edges with E' <= max_edges.
+    """
+    if edges.numel() == 0:
+        return edges
+
+    max_edges = int(max_edges_ratio * max(num_nodes, 1))
+    if edges.shape[0] <= max_edges:
+        return edges
+
+    # Classify each edge by zone: use max(zone_src, zone_dst)
+    # Higher zone = more important
+    src_zone = zone_labels_selected[edges[:, 0]]
+    dst_zone = zone_labels_selected[edges[:, 1]]
+    edge_zone = torch.max(src_zone, dst_zone)  # 0=bg, 1=ring, 2=core
+
+    # Assign deletion priority: bg=0 (delete first), ring=1, core=2 (delete last)
+    # Sort by priority ascending, keep first max_edges
+    # Add random jitter within same priority for fair sampling
+    priority = edge_zone.float() + torch.rand(edges.shape[0], device=edges.device) * 0.9
+    _, keep_idx = priority.topk(max_edges, largest=True)
+    keep_idx = keep_idx.sort().values  # maintain order
+
+    return edges[keep_idx]
 
 
 # ===================================================================
@@ -611,6 +839,7 @@ class AdaptiveGraphManager:
         self.az_cfg = cfg.get("active_zone", {})
         self.edge_cfg = cfg.get("edges", {})
         self.wb_cfg = cfg.get("writeback", {})
+        self.compress_cfg = cfg.get("compression", {})
 
         # physics trigger config: parse from active_zone config
         self._physics_triggers = self._parse_physics_triggers()
@@ -652,8 +881,10 @@ class AdaptiveGraphManager:
         """Rebuild the subgraph: zone-first scoring → sampling → stencil edges.
 
         All tensors are [N_full, C] on device, in normalized space.
+        Supports compressed mode via 'compression' config section.
         """
         gt_blend = self.get_gt_blend(epoch)
+        use_compressed = self.compress_cfg.get("enabled", False)
 
         # Step 1: compute activity score (uses regular-grid finite difference)
         score = compute_active_score(
@@ -683,18 +914,31 @@ class AdaptiveGraphManager:
             core_keep_ratio=self.az_cfg.get("core_keep_ratio", 1.0),
             ring_keep_ratio=self.az_cfg.get("ring_keep_ratio", 0.5),
             background_extra_ratio=self.az_cfg.get("background_extra_ratio", 0.0),
+            bg_backbone_keep_ratio=self.az_cfg.get("bg_backbone_keep_ratio", 1.0),
         )
 
-        # Step 4: build stencil edges within the selected subgraph
-        intra_edges = build_stencil_edges(
-            selected_indices=selected,
-            zone_labels=zone,
-            grid_shape=self.fullres_grid_shape,
-            backbone_mask=self.backbone_mask,
-            bg_stencil=self.edge_cfg.get("bg_stencil", 6),
-            ring_stencil=self.edge_cfg.get("ring_stencil", 18),
-            core_stencil=self.edge_cfg.get("core_stencil", 26),
-        )
+        # Step 4: build edges
+        if use_compressed:
+            # Compressed stencil edges with per-zone neighbor budgets
+            intra_edges = build_stencil_edges_compressed(
+                selected_indices=selected,
+                zone_labels=zone,
+                grid_shape=self.fullres_grid_shape,
+                backbone_mask=self.backbone_mask,
+                core_max_neighbors=self.compress_cfg.get("core_max_neighbors", 12),
+                ring_max_neighbors=self.compress_cfg.get("ring_max_neighbors", 8),
+                bg_keep_ratio=self.compress_cfg.get("bg_edge_keep_ratio", 0.7),
+            )
+        else:
+            intra_edges = build_stencil_edges(
+                selected_indices=selected,
+                zone_labels=zone,
+                grid_shape=self.fullres_grid_shape,
+                backbone_mask=self.backbone_mask,
+                bg_stencil=self.edge_cfg.get("bg_stencil", 6),
+                ring_stencil=self.edge_cfg.get("ring_stencil", 18),
+                core_stencil=self.edge_cfg.get("core_stencil", 26),
+            )
 
         # Step 5: cross-layer edges (fine→coarse parent-child mapping)
         N_full = self.n_full
@@ -715,14 +959,32 @@ class AdaptiveGraphManager:
         if intra_edges.numel() > 0:
             edge_parts.append(intra_edges)
         if cross_edges.numel() > 0:
+            if use_compressed:
+                # Canonicalize cross edges too
+                cross_edges = canonicalize_and_dedup_edges(cross_edges)
             edge_parts.append(cross_edges)
 
         if edge_parts:
             all_edges = torch.cat(edge_parts, dim=0)
+            if use_compressed:
+                # Final global dedup (intra already deduped, cross already deduped,
+                # but there may be overlap between them)
+                all_edges = canonicalize_and_dedup_edges(all_edges)
         else:
             all_edges = torch.zeros((0, 2), dtype=torch.long, device=self.device)
 
-        # Step 6: remove isolated nodes (nodes with no edges)
+        # Step 6: enforce global edge budget (compressed mode only)
+        if use_compressed and all_edges.numel() > 0:
+            sel_zone = zone[selected]
+            max_edges_ratio = self.compress_cfg.get("max_edges_ratio", 4.0)
+            all_edges = enforce_edge_budget(
+                edges=all_edges,
+                zone_labels_selected=sel_zone,
+                max_edges_ratio=max_edges_ratio,
+                num_nodes=selected.shape[0],
+            )
+
+        # Step 7: remove isolated nodes (nodes with no edges)
         if all_edges.numel() > 0 and selected.shape[0] > 0:
             connected = torch.zeros(selected.shape[0], dtype=torch.bool, device=self.device)
             connected[all_edges[:, 0]] = True

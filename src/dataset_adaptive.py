@@ -174,7 +174,8 @@ class AdaptiveGraphDataset(Dataset):
                 for _ in range(samples_per_file):
                     self.sample_keys.append((file_id, None))
             else:
-                step = max(1, horizon // 2)
+                # step = max(1, horizon // 2)
+                step = 20
                 for start in range(1, meta["max_start"] + 1, step):
                     self.sample_keys.append((file_id, start))
 

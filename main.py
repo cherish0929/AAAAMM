@@ -346,7 +346,7 @@ def main(args, path_logs, path_nn, path_record):
                 torch.save(checkpoint, f"{path_nn}/{args.name}_best.pt")
 
         # Regular Save
-        if (epoch+1) % 50 == 0 or (epoch+1) == EPOCH:
+        if (epoch+1) % 15 == 0 or (epoch+1) == EPOCH:
             if args.if_save:
                 checkpoint = {
                     'epoch': epoch + 1,
