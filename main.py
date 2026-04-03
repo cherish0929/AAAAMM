@@ -178,6 +178,7 @@ def main(args, path_logs, path_nn, path_record):
 
         if 'epoch' in checkpoint:
             start_epoch = checkpoint['epoch']
+            start_epoch = 150
             print(f"Resuming from epoch {start_epoch}")
         
         if 'best_val_error' in checkpoint:

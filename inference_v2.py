@@ -521,7 +521,7 @@ class AeroGtoPredictor:
 if __name__ == "__main__":
     MODE = "test"
     # === 配置区域 ===
-    CONFIG_PATH = f"config/velocity_v3.json" 
+    CONFIG_PATH = f"config/history/velocity_v6.json" 
     
     FIELD_TO_PLOT = None   
     SLICE_AXIS = "z"        # 'x', 'y', 'z'
@@ -529,7 +529,7 @@ if __name__ == "__main__":
     INTERFACE_FIELD = "alpha.air" 
 
     try:
-        predictor = AeroGtoPredictor(CONFIG_PATH, MODE)
+        predictor = AeroGtoPredictor(CONFIG_PATH, MODE, device_str="cpu")
         if FIELD_TO_PLOT is None:
             OUT_DIR = f"result/inference_results/{predictor.args.name}/{MODE}/batch"
         else:
@@ -542,7 +542,7 @@ if __name__ == "__main__":
         sys.exit(1)
     
     print(len(predictor.dataset))
-    SAMPLE_IDX = 24
+    SAMPLE_IDX = 35
 
     results = predictor.predict_rollout(sample_idx=SAMPLE_IDX, interface_field=INTERFACE_FIELD)
     

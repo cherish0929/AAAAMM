@@ -251,7 +251,8 @@ class AeroGtoDataset(Dataset):
                     self.sample_keys.append((file_id, None))  # None 表示随机起点
             else:
                 # 测试阶段均匀取样，覆盖全序列
-                step = max(1, self.horizon // 2)
+                # step = max(1, self.horizon // 2)
+                step = max(1, 20)
                 for start in range(1, meta["max_start"] + 1, step):
                     self.sample_keys.append((file_id, start))
 
@@ -503,7 +504,6 @@ class AeroGtoDataset(Dataset):
         gas_mask = alpha_t > 0.6
 
         solid_mask = (alpha_t < 1e-4) | (gamma_t < 1e-4) # 固相区域
-
 
         # 不再在 dataset 中裁剪物理场，改为训练过程中不计算相应区域的 loss
         velocity_dead_zone = 1e-3
