@@ -283,6 +283,20 @@ class CutAeroGtoDataset(Dataset):
                 np.ones(num_channels, dtype=np.float32)
             )
 
+        # 优化：初始化完成后，把 normalizer 的统计量 pin 到 CPU
+        # __getitem__ 里直接用，不再反复 .to()
+        self._sync_norm_cache()
+
+    def _sync_norm_cache(self):
+        """将 normalizer 的统计量同步到 norm_mean / norm_std 缓存。
+        在 __init__ 及外部覆盖 normalizer 后必须调用。
+
+        注意：CutAeroGtoDataset 的 node_pos 每次 __getitem__ 动态裁剪，
+        无法像 AeroGtoDataset 那样预缓存 node_pos_scaled。
+        """
+        self.norm_mean = self.normalizer.mean  # shape [1, 1, C]
+        self.norm_std = self.normalizer.std + self.normalizer.eps
+
     def _load_normalizer(self) -> ChannelNormalizer:
         field_stats_config = {
             "T":              (5.2999e+02, 4.5454e+02),
@@ -445,7 +459,8 @@ class CutAeroGtoDataset(Dataset):
         active_mask = build_active_mask(state, self.fields, self.mask_cfg)
 
         if self.normalize:
-            state = self.normalizer.normalize(state)
+            # 优化：直接用预先固定的 CPU tensor 做广播，避免 .to(device) 调用
+            state = (state - self.norm_mean) / self.norm_std
             pos_min_r = node_pos.min(dim=0).values
             pos_max_r = node_pos.max(dim=0).values
             node_pos = (node_pos - pos_min_r) / (pos_max_r - pos_min_r + 1e-8)

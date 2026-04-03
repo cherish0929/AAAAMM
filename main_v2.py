@@ -552,7 +552,7 @@ def main(args, path_logs, path_nn, path_record):
         print(f"Scheduler: CosineAnnealingLR (T_max={EPOCH})")
 
     # ---- EMA ----
-    ema = EMA(model, decay=0.999)
+    ema = EMA(model, decay=0.998)
     print("EMA enabled (decay=0.999)")
 
     # ---- Pushforward config ----

@@ -327,12 +327,14 @@ class AttnResMixerBlock(nn.Module):
             for _ in range(n_fields)
         ])
 
-        # Cross-field attention (双向: field_i → field_j 和 field_j → field_i)
-        # 使用 Projection-Inspired 方式，避免 O(N²) 复杂度
-        self.cross_attns = nn.ModuleList([
-            FieldCrossAttention(enc_dim, n_heads=cross_attn_heads, n_token=n_token)
-            for _ in range(n_fields)  # cross_attns[i] 让 field_i attend to 其他场
-        ])
+        # Cross-field attention (only when multiple fields exist)
+        if n_fields > 1:
+            self.cross_attns = nn.ModuleList([
+                FieldCrossAttention(enc_dim, n_heads=cross_attn_heads, n_token=n_token)
+                for _ in range(n_fields)
+            ])
+        else:
+            self.cross_attns = None
 
         # Per-field Attention
         self.ln1s = nn.ModuleList([nn.LayerNorm(enc_dim) for _ in range(n_fields)])
@@ -396,20 +398,19 @@ class AttnResMixerBlock(nn.Module):
             V_out.append(partial)
             E_out.append(E_i)
 
-        # ---- Step 2: Cross-Field Attention ----
-        # 对 n_fields=2: V_0 attend to V_1, V_1 attend to V_0
-        V_cross = []
-        for i in range(self.n_fields):
-            # 聚合来自其他所有场的信息
-            other_fields = [V_out[j] for j in range(self.n_fields) if j != i]
-            # 对于 2 场，only 1 other; 对于更多场可以 concatenate 或逐个做
-            if len(other_fields) == 1:
-                cross_info = self.cross_attns[i](V_out[i], other_fields[0])
-            else:
-                # 多场：concatenate 其他场的 token 序列
-                other_cat = torch.cat(other_fields, dim=-2)  # [bs, N*(n_fields-1), enc_dim]
-                cross_info = self.cross_attns[i](V_out[i], other_cat)
-            V_cross.append(V_out[i] + cross_info)
+        # ---- Step 2: Cross-Field Attention (skipped for single field) ----
+        if self.n_fields > 1:
+            V_cross = []
+            for i in range(self.n_fields):
+                other_fields = [V_out[j] for j in range(self.n_fields) if j != i]
+                if len(other_fields) == 1:
+                    cross_info = self.cross_attns[i](V_out[i], other_fields[0])
+                else:
+                    other_cat = torch.cat(other_fields, dim=-2)
+                    cross_info = self.cross_attns[i](V_out[i], other_cat)
+                V_cross.append(V_out[i] + cross_info)
+        else:
+            V_cross = V_out
 
         # ---- Step 3: Per-field Attention with AttnRes ----
         V_attn = []
@@ -757,4 +758,46 @@ if __name__ == '__main__':
             assert torch.all(p == 0), f"{name} should be initialized to zero!"
     print("AttnRes pseudo-query 全部初始化为零 ✓")
 
-    print("\n✅  PhysGTO-AttnRes-Multi 全部验证通过！")
+    print("\n✅  PhysGTO-AttnRes-Multi 双场验证通过！")
+
+    # ---- 单场测试 ----
+    print(f"\n{'─'*40}")
+    print("  Testing n_fields=1 (single field)")
+    print(f"{'─'*40}")
+
+    model1 = Model(
+        space_size=space_dim,
+        pos_enc_dim=3,
+        cond_dim=cond_dim,
+        N_block=2,
+        in_dim=1,
+        out_dim=1,
+        enc_dim=64,
+        n_head=4,
+        n_token=32,
+        dt=2e-5,
+        n_fields=1,
+        cross_attn_heads=4,
+    )
+
+    state_in_1 = torch.randn(bs, N, 1)
+    pred1 = model1(state_in_1, node_pos, edges, time_seq[:, 0], conditions)
+    print(f"[单步]  pred: {pred1.shape}")
+    assert pred1.shape == (bs, N, 1)
+
+    out1 = model1.autoregressive(state_in_1, node_pos, edges, time_seq, conditions)
+    print(f"[自回归] out: {out1.shape}")
+    assert out1.shape == (bs, T, N, 1)
+
+    model1.train()
+    out1_ck = model1.autoregressive(state_in_1, node_pos, edges, time_seq, conditions, check_point=True)
+    loss1 = out1_ck.sum()
+    loss1.backward()
+    print(f"[checkpoint] backward pass ✓")
+
+    params1 = sum(p.numel() for p in model1.parameters())
+    print(f"参数量: {params1/1e6:.3f}M (no cross-attention modules)")
+    assert not hasattr(model1.mixer.blocks[0], 'cross_attns') or model1.mixer.blocks[0].cross_attns is None
+    print("Cross-attention correctly skipped for n_fields=1 ✓")
+
+    print("\n✅  PhysGTO-AttnRes-Multi 单场 + 双场全部验证通过！")
