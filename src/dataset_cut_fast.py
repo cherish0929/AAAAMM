@@ -253,7 +253,7 @@ class CutAeroGtoDataset(Dataset):
         self.meta_cache = {}
         self.sample_keys = []
         self.max_start_per_file = []
-        self.dt_scale = 5000 if self.config.get("dt_scale", False) else 1
+        self.time_ref = 2e-5 if self.config.get("dt_scale", False) else 1
         self.edge_sample_ratio = self.config.get("edge_sample_ratio", 1.0)
 
         for file_id, path in enumerate(self.file_paths):
@@ -272,7 +272,7 @@ class CutAeroGtoDataset(Dataset):
         example_meta = next(iter(self.meta_cache.values()))
         self.cond_dim = example_meta["conditions"].shape[-1]
         self.node_num = example_meta["node_pos_3d"].size
-        self.dt = example_meta["dt"] * self.dt_scale
+        self.dt = example_meta["dt"] / self.time_ref
         num_channels = len(self.fields)
 
         if self.normalize and self.mode == "train":
@@ -467,13 +467,26 @@ class CutAeroGtoDataset(Dataset):
 
         edges = _build_grid_edges((nx_new, ny_new, nz_new), sample_ratio=self.edge_sample_ratio)
 
+        # 裁剪后的坐标范围 + 网格间隔，共9项
+        pos_min_crop = crop_pos.reshape(-1, 3).min(axis=0)  # [3]
+        pos_max_crop = crop_pos.reshape(-1, 3).max(axis=0)  # [3]
+        n_arr = np.array([nx_new, ny_new, nz_new], dtype=np.float32)
+        spacing = (pos_max_crop - pos_min_crop) / np.maximum(n_arr - 1, 1)
+        spatial_inform = torch.from_numpy(
+            np.concatenate([
+                np.stack([pos_min_crop, pos_max_crop], axis=1).flatten(),  # [xmin,xmax,ymin,ymax,zmin,zmax]
+                spacing,  # [dx, dy, dz]
+                np.array([self.time_ref], dtype=np.float32),  # 时间参考值
+            ]).astype(np.float32)
+        )  # shape [10]
+
         rel_time = time_seq[1:] - time_seq[0]
         time_tensor = torch.from_numpy(rel_time.astype(np.float32)).unsqueeze(-1)
 
         sample = {
-            "dt":         meta['dt'] * self.time_stride * self.dt_scale,
+            "dt":         meta['dt'] * self.time_stride / self.time_ref,
             "state":      state,
-            "time_seq":   time_tensor * self.dt_scale,
+            "time_seq":   time_tensor / self.time_ref,
             "node_pos":   node_pos,
             "edges":      edges,
             "node_type":  node_type,
@@ -481,6 +494,7 @@ class CutAeroGtoDataset(Dataset):
             "ds_shape":   [nx, ny, nz],
             "cut_shape":  [nx_new, ny_new, nz_new],
             "grid_shape": torch.Tensor([nx_new, ny_new, nz_new]),
+            "spatial_inform": spatial_inform,
         }
         if active_mask is not None:
             sample["active_mask"] = active_mask

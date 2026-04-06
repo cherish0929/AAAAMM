@@ -256,7 +256,7 @@ class AeroGtoDataset(Dataset):
         self.meta_cache = {}
         self.sample_keys = []
         self.max_start_per_file = []
-        self.dt_scale = 5000 if self.config.get("dt_scale", False) else 1
+        self.time_ref = 2e-5 if self.config.get("dt_scale", False) else 1
         self.edge_sample_ratio = self.config.get("edge_sample_ratio", 1.0)
 
         for file_id, path in enumerate(self.file_paths):
@@ -276,7 +276,7 @@ class AeroGtoDataset(Dataset):
         example_meta = next(iter(self.meta_cache.values()))
         self.cond_dim = example_meta["conditions"].shape[-1]
         self.node_num = example_meta["node_pos"].shape[0]
-        self.dt = example_meta["dt"] * self.dt_scale
+        self.dt = example_meta["dt"] / self.time_ref
         num_channels = len(self.fields)
         
         if self.normalize and self.mode == "train":
@@ -356,8 +356,13 @@ class AeroGtoDataset(Dataset):
         with h5py.File(path, "r") as f:
             # 网格尺寸与下采样索引
             block = f["mesh/block"][0].astype(int)
+            bound = f["mesh/bound"][:].astype(np.float32)  # [3, 2] 不同维度的坐标范围
             grid_shape = (block[0] + 1, block[1] + 1, block[2] + 1)  # 点的数量
             indices, ds_shape = _compute_downsample_indices(grid_shape, self.spatial_stride)
+
+            spatial_inform = torch.from_numpy(
+                np.concatenate([bound.flatten(), np.array(ds_shape, dtype=np.float32), np.array([self.time_ref], dtype=np.float32)])
+            )  # shape [10]: 6项坐标范围 + 3项下采样后网格数量 + 1项时间参考值
 
             point_all = f["point"][:]
             point = point_all[indices]
@@ -391,6 +396,7 @@ class AeroGtoDataset(Dataset):
             "node_pos": node_pos,
             "edges": edges,
             "node_type": node_type,
+            "spatial_inform": spatial_inform,
             "conditions": conditions,
             "dt": dt,
             "max_start": max_start,
@@ -436,14 +442,15 @@ class AeroGtoDataset(Dataset):
         rel_time = time_seq[1:] - time_seq[0]
         time_tensor = torch.from_numpy(rel_time.astype(np.float32)).unsqueeze(-1)
         sample = {
-            "dt": meta['dt'] * self.time_stride * self.dt_scale,
+            "dt": meta['dt'] * self.time_stride / self.time_ref,
             "state": state,  # [1 + horizon, N, 4]
-            "time_seq": time_tensor * self.dt_scale,  # [horizon, 1]
+            "time_seq": time_tensor / self.time_ref,  # [horizon, 1]
             "node_pos": node_pos,
             "edges": meta["edges"],
             "node_type": meta["node_type"],
             "conditions": meta["conditions"],
-            "grid_shape": torch.tensor(list(meta["ds_shape"]))
+            "grid_shape": torch.tensor(list(meta["ds_shape"])),
+            "spatial_inform": meta["spatial_inform"],
         }
         if active_mask is not None:
             sample["active_mask"] = active_mask

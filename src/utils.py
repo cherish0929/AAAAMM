@@ -110,6 +110,106 @@ def build_active_mask(state_raw, fields, mask_cfg):
     return mask
 
 
+def collate_variable_nodes(batch: list) -> dict:
+    """DataLoader collate_fn for samples with varying node counts across files.
+
+    Tensors indexed by nodes (N dim) are padded to the max N in the batch.
+    Edges are offset per sample so node indices remain correct after stacking.
+
+    Padded positions:
+      - state, node_pos, node_type, active_mask → padded with 0
+      - edges                                   → offset added per sample, no padding needed (concat)
+
+    Returns a dict where:
+      - state:       [B, T, N_max, C]
+      - node_pos:    [B, N_max, 3]
+      - node_type:   [B, N_max, 1]
+      - edges:       [B, E_max, 2]  (padded with -1 rows)
+      - node_mask:   [B, N_max]     bool, True for real nodes
+      - conditions:  [B, cond_dim]
+      - time_seq:    [B, horizon, 1]
+      - grid_shape:  [B, 3]
+      - spatial_inform: [B, 9]  (if present)
+      - active_mask: [B, T, N_max, C]  (if present)
+      - dt, scalar values stacked as [B]
+    """
+    # --- collect sizes ---
+    node_counts = [s["node_pos"].shape[0] for s in batch]
+    edge_counts = [s["edges"].shape[0] for s in batch]
+    N_max = max(node_counts)
+    E_max = max(edge_counts)
+    B = len(batch)
+
+    # --- keys that need node-dim padding (dim that equals N) ---
+    # state: [T, N, C]  → pad dim 1
+    # node_pos: [N, 3]  → pad dim 0
+    # node_type: [N, 1] → pad dim 0
+    # active_mask: [T, N, C] → pad dim 1
+
+    def pad_node_dim(tensor, N_max, node_dim):
+        """Zero-pad `tensor` along `node_dim` to length N_max."""
+        pad_size = N_max - tensor.shape[node_dim]
+        if pad_size == 0:
+            return tensor
+        pad_shape = list(tensor.shape)
+        pad_shape[node_dim] = pad_size
+        return torch.cat([tensor, torch.zeros(pad_shape, dtype=tensor.dtype)], dim=node_dim)
+
+    # --- node_mask ---
+    node_mask = torch.zeros(B, N_max, dtype=torch.bool)
+    for i, n in enumerate(node_counts):
+        node_mask[i, :n] = True
+
+    # --- state ---
+    state_list = [pad_node_dim(s["state"], N_max, node_dim=1) for s in batch]
+    state = torch.stack(state_list, dim=0)  # [B, T, N_max, C]
+
+    # --- node_pos ---
+    node_pos_list = [pad_node_dim(s["node_pos"], N_max, node_dim=0) for s in batch]
+    node_pos = torch.stack(node_pos_list, dim=0)  # [B, N_max, 3]
+
+    # --- node_type ---
+    node_type_list = [pad_node_dim(s["node_type"], N_max, node_dim=0) for s in batch]
+    node_type = torch.stack(node_type_list, dim=0)  # [B, N_max, 1]
+
+    # --- edges: keep per-sample local indices, pad short rows with -1 ---
+    edge_list = []
+    for i, s in enumerate(batch):
+        e = s["edges"].long()
+        pad_rows = E_max - e.shape[0]
+        if pad_rows > 0:
+            e = torch.cat([e, torch.full((pad_rows, 2), -1, dtype=torch.long)], dim=0)
+        edge_list.append(e)
+    edges = torch.stack(edge_list, dim=0)  # [B, E_max, 2]
+
+    # --- scalar / fixed-size tensors ---
+    conditions = torch.stack([s["conditions"] for s in batch], dim=0)
+    time_seq   = torch.stack([s["time_seq"]   for s in batch], dim=0)
+    grid_shape = torch.stack([s["grid_shape"] for s in batch], dim=0)
+    dt         = torch.tensor([s["dt"]        for s in batch], dtype=torch.float32)
+
+    out = {
+        "state":      state,
+        "node_pos":   node_pos,
+        "node_type":  node_type,
+        "node_mask":  node_mask,
+        "edges":      edges,
+        "conditions": conditions,
+        "time_seq":   time_seq,
+        "grid_shape": grid_shape,
+        "dt":         dt,
+    }
+
+    if "spatial_inform" in batch[0]:
+        out["spatial_inform"] = torch.stack([s["spatial_inform"] for s in batch], dim=0)
+
+    if "active_mask" in batch[0]:
+        am_list = [pad_node_dim(s["active_mask"], N_max, node_dim=1) for s in batch]
+        out["active_mask"] = torch.stack(am_list, dim=0)
+
+    return out
+
+
 def load_json_config(path: str):
     """加载JSON配置并转为SimpleNamespace，便于点号访问。"""
     with open(path, "r") as f:

@@ -137,6 +137,7 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
     check_point = args.train.get("check_point", False)
     weight_loss = args.train.get("weight_loss", {"enable": False})
     grad_loss_weight = args.train.get("grad_loss_weight", 8.0)
+    model_name = args.model.get("name", "PhysGTO")
 
     agg = {}
     for key in ["loss", "L2", "mean_l2", "RMSE"]:
@@ -153,6 +154,7 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
 
     model.train()
     normalizer.to(device)
+    scaler = GradScaler('cuda') if use_amp else None
 
     from tqdm import tqdm
     pbar = tqdm(train_dataloader, desc="  Train(PF)", unit="bt", leave=True, ncols=120, colour='cyan')
@@ -163,6 +165,8 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
         node_pos = batch["node_pos"].to(device)
         edges = batch["edges"].to(device)
         time_seq = batch["time_seq"].to(device)
+        if model_name == "PhysGTO_v2":
+            spatial_inform = batch["spatial_inform"].to(device)
         conditions = batch["conditions"].to(device).float()
         if weight_loss.get("gradient", False):
             weight_loss["grid_shape"] = batch['grid_shape'].numpy()
@@ -183,9 +187,14 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
 
         if use_amp:
             with autocast(device_type="cuda", dtype=torch.bfloat16):
-                predict_hat = model.autoregressive(
-                    state[:, 0], node_pos, edges, time_seq[:, :T_pf], conditions, dt, check_point
-                )
+                if model_name == "PhysGTO_v2":
+                    predict_hat = model.autoregressive(
+                    state[:, 0], node_pos, edges, time_seq[:, :T_pf], spatial_inform, conditions, dt, check_point
+                    )
+                else:
+                    predict_hat = model.autoregressive(
+                        state[:, 0], node_pos, edges, time_seq[:, :T_pf], conditions, dt, check_point
+                    )
                 # Loss on original horizon
                 costs = get_train_loss(fields, predict_hat[:, :base_horizon], state[:, 1:base_horizon+1], normalizer, weight_loss, active_mask=base_mask)
                 loss_base = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
@@ -203,16 +212,27 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
                 else:
                     total_loss = loss_base
 
-            total_loss.backward()
+            if not torch.isfinite(total_loss):
+                optim.zero_grad()
+                continue
+
+            scaler.scale(total_loss).backward()
+            scaler.unscale_(optim)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
-            optim.step()
+            scaler.step(optim)
+            scaler.update()
             optim.zero_grad()
             if ema is not None:
                 ema.update(model)
         else:
-            predict_hat = model.autoregressive(
-                state[:, 0], node_pos, edges, time_seq[:, :T_pf], conditions, dt, check_point
-            )
+            if model_name == "PhysGTO_v2":
+                predict_hat = model.autoregressive(
+                state[:, 0], node_pos, edges, time_seq[:, :T_pf], spatial_inform, conditions, dt, check_point
+                )
+            else:
+                predict_hat = model.autoregressive(
+                    state[:, 0], node_pos, edges, time_seq[:, :T_pf], conditions, dt, check_point
+                )
             costs = get_train_loss(fields, predict_hat[:, :base_horizon], state[:, 1:base_horizon+1], normalizer, weight_loss, active_mask=base_mask)
             loss_base = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
 
@@ -227,6 +247,10 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
                 total_loss = loss_base + 0.5 * loss_pf
             else:
                 total_loss = loss_base
+
+            if not torch.isfinite(total_loss):
+                optim.zero_grad()
+                continue
 
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
@@ -279,6 +303,7 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
     check_point = args.train.get("check_point", False)
     weight_loss = args.train.get("weight_loss", {"enable": False})
     grad_loss_weight = args.train.get("grad_loss_weight", 8.0)
+    model_name = args.model.get("name", "PhysGTO")
 
     agg = {}
     for key in ["loss", "L2", "mean_l2", "RMSE"]:
@@ -295,6 +320,7 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
 
     model.train()
     normalizer.to(device)
+    scaler = GradScaler('cuda') if use_amp else None
 
     pbar = tqdm(train_dataloader, desc="  Train", unit="bt", leave=True, ncols=120, colour='green')
     for batch in pbar:
@@ -303,6 +329,8 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
         node_pos = batch["node_pos"].to(device)
         edges = batch["edges"].to(device)
         time_seq = batch["time_seq"].to(device)
+        if model_name == "PhysGTO_v2":
+            spatial_inform = batch["spatial_inform"].to(device)
         conditions = batch["conditions"].to(device).float()
         if weight_loss.get("gradient", False):
             weight_loss["grid_shape"] = batch['grid_shape'].numpy()
@@ -318,22 +346,43 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
 
         if use_amp:
             with autocast(device_type="cuda", dtype=torch.bfloat16):
-                predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
+                if model_name == "PhysGTO_v2":
+                    predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point)
+                else:
+                    predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
+
                 costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss, active_mask=active_mask)
 
             # Use configurable grad_loss_weight
             loss = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
-            loss.backward()
+
+            # NaN guard: skip batch if loss is NaN/Inf
+            if not torch.isfinite(loss):
+                optim.zero_grad()
+                continue
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optim)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
-            optim.step()
+            scaler.step(optim)
+            scaler.update()
             optim.zero_grad()
             if ema is not None:
                 ema.update(model)
         else:
-            predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
+            if model_name == "PhysGTO_v2":
+                predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point)
+            else:
+                predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
+
             costs = get_train_loss(fields, predict_hat, state[:, 1:], normalizer, weight_loss, active_mask=active_mask)
 
             loss = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
+
+            if not torch.isfinite(loss):
+                optim.zero_grad()
+                continue
+
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
             optim.step()
@@ -440,6 +489,8 @@ def get_model(args, device, cond_dim, default_dt):
 
     if model_name == "PhysGTO":
         from src.physgto import Model
+    elif model_name == "PhysGTO_v2":
+        from src.physgto_v2 import Model
     elif model_name == "gto_res":
         from src.physgto_res import Model
     elif model_name == "gto_lnn":
