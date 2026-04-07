@@ -372,7 +372,7 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
 
         active_mask = batch.get("active_mask")
         if active_mask is not None:
-            active_mask = active_mask[:, 1:].to(device)
+            active_mask = active_mask[:, 1:horizon + 1].to(device)
             if not has_region:
                 _init_region_agg(agg, fields)
                 has_region = True
