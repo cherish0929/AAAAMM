@@ -480,6 +480,15 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
 # DataLoader (same as main.py)
 # =============================================================================
 
+def _worker_init_fn(worker_id, base_seed):
+    """固定每个 DataLoader worker 的随机种子，确保 shuffle 顺序可复现。"""
+    import random as _random
+    seed = base_seed + worker_id
+    np.random.seed(seed)
+    _random.seed(seed)
+    torch.manual_seed(seed)
+
+
 def get_dataloader(args, path_record, device_type, pf_extra_max=0):
     data_cfg = args.data
     model_cfg = args.model
@@ -513,12 +522,24 @@ def get_dataloader(args, path_record, device_type, pf_extra_max=0):
 
     pin_memory = True if "cuda" in device_type else False
 
+    seed = getattr(args, "seed", None)
+    if seed is not None:
+        g = torch.Generator()
+        g.manual_seed(seed)
+        dl_kwargs = dict(
+            generator=g,
+            worker_init_fn=lambda wid: _worker_init_fn(wid, seed),
+        )
+    else:
+        dl_kwargs = {}
+
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=data_cfg['train'].get("batchsize", 1),
         shuffle=True,
         num_workers=data_cfg['train'].get("num_workers", 0),
         pin_memory=pin_memory,
+        **dl_kwargs,
     )
 
     test_dataloader = DataLoader(
