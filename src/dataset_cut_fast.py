@@ -247,7 +247,7 @@ class CutAeroGtoDataset(Dataset):
         self.norm_cache = data_cfg.get("norm_cache")
         self.margin = margin
 
-        self.mask_cfg = args.train.get("weight_loss", None)
+        self.mask_cfg = args.train.get("weight_loss", {"field": ["T", "alpha.air"], "threshold": [800, [0.4, 0.6]]}) # 临时
 
         self.file_paths = _read_file_list(data_cfg[f"{mode}_list"])
         self.meta_cache = {}
