@@ -119,6 +119,16 @@ class WarmupCosineScheduler:
     def get_last_lr(self):
         return [pg['lr'] for pg in self.optimizer.param_groups]
 
+    def state_dict(self):
+        return {
+            "current_epoch": self.current_epoch,
+            "cosine_scheduler": self.cosine_scheduler.state_dict(),
+        }
+
+    def load_state_dict(self, state):
+        self.current_epoch = state["current_epoch"]
+        self.cosine_scheduler.load_state_dict(state["cosine_scheduler"])
+
 
 # =============================================================================
 # Pushforward Training
@@ -162,10 +172,10 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
 
     for batch in pbar:
         dt = batch['dt'].to(device)
-        state = batch["state"].to(device)
+        state_cpu = batch["state"]           # [B, T+1, N, C] — stay on CPU until T_pf known
         node_pos = batch["node_pos"].to(device)
         edges = batch["edges"].to(device)
-        time_seq = batch["time_seq"].to(device)
+        time_seq_cpu = batch["time_seq"]     # [B, T, 1] — stay on CPU until T_pf known
         if model_name == "PhysGTO_v2":
             spatial_inform = batch["spatial_inform"].to(device)
         conditions = batch["conditions"].to(device).float()
@@ -179,9 +189,13 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
                 _init_region_agg(agg, fields)
                 has_region = True
 
-        batch_num = state.shape[0]
-        T_total = time_seq.shape[1]
+        batch_num = state_cpu.shape[0]
+        T_total = time_seq_cpu.shape[1]
         T_pf = min(base_horizon + extra_steps, T_total)
+
+        # Transfer only needed slices to device
+        state = state_cpu[:, :T_pf + 1].to(device)
+        time_seq = time_seq_cpu[:, :T_pf].to(device)
 
         # Slice active_mask for base horizon
         base_mask = active_mask[:, :base_horizon] if active_mask is not None else None
@@ -190,12 +204,10 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
             with autocast(device_type="cuda", dtype=torch.bfloat16):
                 if model_name == "PhysGTO_v2":
                     predict_hat = model.autoregressive(
-                    state[:, 0], node_pos, edges, time_seq[:, :T_pf], spatial_inform, conditions, dt, check_point
-                    )
+                        state[:, 0], node_pos, edges, time_seq[:, :T_pf], spatial_inform, conditions, dt, check_point)
                 else:
                     predict_hat = model.autoregressive(
-                        state[:, 0], node_pos, edges, time_seq[:, :T_pf], conditions, dt, check_point
-                    )
+                        state[:, 0], node_pos, edges, time_seq[:, :T_pf], conditions, dt, check_point)
                 # Loss on original horizon
                 costs = get_train_loss(fields, predict_hat[:, :base_horizon], state[:, 1:base_horizon+1], normalizer, weight_loss, active_mask=base_mask)
                 loss_base = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
@@ -224,14 +236,8 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
             if _skip:
                 optim.zero_grad()
                 del predict_hat, costs, loss_base, total_loss
-                if 'costs_pf' in dir(): del costs_pf, loss_pf
+                if 'costs_pf' in locals(): del costs_pf, loss_pf
                 torch.cuda.empty_cache()
-                continue
-
-            # Loss spike guard: 跳过 loss 突然超过历史均值 10 倍的 batch
-            _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
-            if _cur_avg is not None and total_loss.item() > 10 * _cur_avg:
-                optim.zero_grad()
                 continue
 
             scaler.scale(total_loss).backward()
@@ -277,14 +283,8 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
             if _skip:
                 optim.zero_grad()
                 del predict_hat, costs, loss_base, total_loss
-                if 'costs_pf' in dir(): del costs_pf, loss_pf
+                if 'costs_pf' in locals(): del costs_pf, loss_pf
                 torch.cuda.empty_cache()
-                continue
-
-            # Loss spike guard
-            _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
-            if _cur_avg is not None and total_loss.item() > 10 * _cur_avg:
-                optim.zero_grad()
                 continue
 
             total_loss.backward()
@@ -360,10 +360,10 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
     pbar = tqdm(train_dataloader, desc="  Train", unit="bt", leave=True, ncols=120, colour='green')
     for batch in pbar:
         dt = batch['dt'].to(device)
-        state = batch["state"].to(device)
+        state = batch["state"][:, :horizon + 1].to(device)
         node_pos = batch["node_pos"].to(device)
         edges = batch["edges"].to(device)
-        time_seq = batch["time_seq"].to(device)
+        time_seq = batch["time_seq"][:, :horizon].to(device)
         if model_name == "PhysGTO_v2":
             spatial_inform = batch["spatial_inform"].to(device)
         conditions = batch["conditions"].to(device).float()
@@ -405,12 +405,6 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
                 torch.cuda.empty_cache()
                 continue
 
-            # Loss spike guard: 跳过 loss 突然超过历史均值 10 倍的 batch
-            _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
-            if _cur_avg is not None and loss.item() > 10 * _cur_avg:
-                optim.zero_grad()
-                continue
-
             scaler.scale(loss).backward()
             scaler.unscale_(optim)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
@@ -441,12 +435,6 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
                 optim.zero_grad()
                 del predict_hat, costs, loss
                 torch.cuda.empty_cache()
-                continue
-
-            # Loss spike guard
-            _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
-            if _cur_avg is not None and loss.item() > 10 * _cur_avg:
-                optim.zero_grad()
                 continue
 
             loss.backward()
@@ -492,7 +480,7 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
 # DataLoader (same as main.py)
 # =============================================================================
 
-def get_dataloader(args, path_record, device_type):
+def get_dataloader(args, path_record, device_type, pf_extra_max=0):
     data_cfg = args.data
     model_cfg = args.model
     space_dim = model_cfg.get("space_size", 3)
@@ -504,6 +492,10 @@ def get_dataloader(args, path_record, device_type):
             Datasetclass = AeroGtoDataset
     elif space_dim == 2:
         Datasetclass = AeroGtoDataset2D
+
+    # Inject pf_extra_max into data_cfg so train dataset can load extra time steps
+    if pf_extra_max > 0:
+        data_cfg["horizon_pf_extra"] = pf_extra_max
 
     train_dataset = Datasetclass(
         args=args,
@@ -622,8 +614,18 @@ def main(args, path_logs, path_nn, path_record):
     real_lr = float(args.train["lr"])
     fields = args.data.get("fields", ["T"])
 
+    # ---- Pushforward config (parsed early to size the dataset) ----
+    pf_cfg = args.train.get("pushforward", {"enable": False})
+    pf_enable = pf_cfg.get("enable", False)
+    pf_start = pf_cfg.get("start_epoch", 80)
+    pf_extra_max = pf_cfg.get("extra_steps", 3)
+    pf_ramp = pf_cfg.get("ramp_epochs", 40)
+
     # Dataloader & normalizer
-    train_dataloader, test_dataloader, normalizer, cond_dim, default_dt = get_dataloader(args, path_record, device_str)
+    train_dataloader, test_dataloader, normalizer, cond_dim, default_dt = get_dataloader(
+        args, path_record, device_str,
+        pf_extra_max=pf_extra_max if pf_enable else 0
+    )
 
     # Model
     model, checkpoint = get_model(args, device, cond_dim, default_dt)
@@ -670,14 +672,8 @@ def main(args, path_logs, path_nn, path_record):
 
     # ---- EMA ----
     ema = EMA(model, decay=0.998)
-    print("EMA enabled (decay=0.999)")
+    print("EMA enabled (decay=0.998)")
 
-    # ---- Pushforward config ----
-    pf_cfg = args.train.get("pushforward", {"enable": False})
-    pf_enable = pf_cfg.get("enable", False)
-    pf_start = pf_cfg.get("start_epoch", 80)
-    pf_extra_max = pf_cfg.get("extra_steps", 3)
-    pf_ramp = pf_cfg.get("ramp_epochs", 40)
     if pf_enable:
         print(f"Pushforward: ON (start={pf_start}, extra_max={pf_extra_max}, ramp={pf_ramp})")
 
@@ -707,7 +703,7 @@ def main(args, path_logs, path_nn, path_record):
     with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
         file.write(f"Optimizer: AdamW (lr={real_lr}, wd={weight_decay})\n")
         file.write(f"Scheduler: {sched_type}\n")
-        file.write(f"EMA: decay=0.999\n")
+        file.write(f"EMA: decay=0.998\n")
         file.write(f"Pushforward: enable={pf_enable}\n")
         file.write(f"grad_loss_weight: {args.train.get('grad_loss_weight', 8.0)}\n")
 
@@ -885,6 +881,7 @@ def main(args, path_logs, path_nn, path_record):
                     'state_dict': model.state_dict(),
                     'ema_shadow': ema.shadow,
                     'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
                     'best_val_error': best_val_error,
                     'config': args
                 }
@@ -899,6 +896,7 @@ def main(args, path_logs, path_nn, path_record):
                     'state_dict': model.state_dict(),
                     'ema_shadow': ema.shadow,
                     'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
                     'learning_rate': current_lr,
                     'best_val_error': best_val_error,
                 }

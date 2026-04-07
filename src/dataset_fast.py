@@ -252,6 +252,7 @@ class AeroGtoDataset(Dataset):
         self.fields = data_cfg.get("fields", ["T"])
         self.input_steps = data_cfg.get("input_steps", 1)
         self.horizon = data_cfg.get(f"horizon_{mode}", 1)
+        self.pf_extra = data_cfg.get("horizon_pf_extra", 0) if mode == "train" else 0
         self.time_stride = data_cfg.get("time_stride", 1)
         self.spatial_stride = _normalize_stride(data_cfg.get("spatial_stride", 1))
         self.normalize = data_cfg.get("normalize", True)
@@ -407,7 +408,7 @@ class AeroGtoDataset(Dataset):
             time_all = f["time"][:]
             dt = np.float32(np.mean(np.diff(time_all)))
             total_steps = len(time_all)
-            max_start = total_steps - (self.input_steps + self.horizon * self.time_stride)
+            max_start = total_steps - (self.input_steps + (self.horizon + self.pf_extra) * self.time_stride)
             if max_start < 0:
                 raise ValueError(f"时间窗口超出范围，total_steps={total_steps}")
 
@@ -429,7 +430,7 @@ class AeroGtoDataset(Dataset):
 
     def _load_window(self, path: str, indices: np.ndarray, start: int):
         with h5py.File(path, "r") as f:
-            time_idx = start + np.arange(0, self.horizon + 1) * self.time_stride
+            time_idx = start + np.arange(0, self.horizon + self.pf_extra + 1) * self.time_stride
             channels = []
             for fname in self.fields:
                 fkey = f"state/{fname}"

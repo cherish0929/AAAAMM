@@ -239,6 +239,7 @@ class CutAeroGtoDataset(Dataset):
         self.fields = data_cfg.get("fields", ["T"])
         self.input_steps = data_cfg.get("input_steps", 1)
         self.horizon = data_cfg.get(f"horizon_{mode}", 1)
+        self.pf_extra = data_cfg.get("horizon_pf_extra", 0) if mode == "train" else 0
         self.time_stride = data_cfg.get("time_stride", 1)
         self.spatial_stride = _normalize_stride(data_cfg.get("spatial_stride", 1))
         self.normalize = data_cfg.get("normalize", True)
@@ -347,7 +348,7 @@ class CutAeroGtoDataset(Dataset):
             time_all = f["time"][:]
             dt = np.float32(np.mean(np.diff(time_all)))
             total_steps = len(time_all)
-            max_start = total_steps - (self.input_steps + self.horizon * self.time_stride)
+            max_start = total_steps - (self.input_steps + (self.horizon + self.pf_extra) * self.time_stride)
 
         return {
             "indices":      indices,
@@ -411,7 +412,7 @@ class CutAeroGtoDataset(Dataset):
         if start_idx is None:
             start_idx = random.randint(1, meta["max_start"])
 
-        time_idx = start_idx + np.arange(0, self.horizon + 1) * self.time_stride
+        time_idx = start_idx + np.arange(0, self.horizon + self.pf_extra + 1) * self.time_stride
         nx, ny, nz = meta["ds_shape"]
         num_channels = len(self.fields)
         indices = meta["indices"]

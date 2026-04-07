@@ -23,6 +23,8 @@ def _build_model(model_cfg, cond_dim, default_dt, device):
 
     if model_name == "PhysGTO":
         from src.physgto import Model
+    elif model_name == "PhysGTO_v2":
+        from src.physgto_v2 import Model
     elif model_name == "gto_res":
         from src.physgto_res import Model
     elif model_name == "gto_lnn":
@@ -172,6 +174,7 @@ class AeroGtoPredictor:
         执行自回归预测，并准备绘图所需的所有数据
         """
         sample = self.dataset[sample_idx]
+        model_name = self.args.model.get("name", "PhysGTO")
         
         use_amp, check_point = self.args.train.get("use_amp", False), self.args.train.get("check_point", False)
         # 增加 Batch 维度并移至 GPU
@@ -179,6 +182,8 @@ class AeroGtoPredictor:
         node_pos = sample["node_pos"].unsqueeze(0).to(self.device)
         edges = sample["edges"].unsqueeze(0).to(self.device)
         time_seq = sample["time_seq"].unsqueeze(0).to(self.device) 
+        if model_name == "PhysGTO_v2":
+            spatial_inform = sample["spatial_inform"].unsqueeze(0).to(self.device)
         conditions = sample["conditions"].unsqueeze(0).to(self.device).float()
         
         # [保留用户逻辑] 使用第50个样本的 conditions (可能是为了测试泛化或者固定工况)
@@ -194,10 +199,18 @@ class AeroGtoPredictor:
         with torch.no_grad():
             if use_amp:
                 with autocast("cuda", dtype=torch.bfloat16):
-                    pred_seq = self.model.autoregressive(
-                        state_0, node_pos, edges, time_seq, conditions, dt, check_point=check_point)
+                    if model_name == "PhysGTO_v2":
+                        pred_seq = self.model.autoregressive(
+                            state_0, node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point=check_point)
+                    else:
+                        pred_seq = self.model.autoregressive(
+                            state_0, node_pos, edges, time_seq, conditions, dt, check_point=check_point)
             else:
-                pred_seq = self.model.autoregressive(
+                if model_name == "PhysGTO_v2":
+                    pred_seq = self.model.autoregressive(
+                        state_0, node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point=check_point)
+                else:
+                    pred_seq = self.model.autoregressive(
                         state_0, node_pos, edges, time_seq, conditions, dt, check_point=check_point)
 
             pred_real = self.normalizer.denormalize(pred_seq)
@@ -571,7 +584,7 @@ if __name__ == "__main__":
     MODE = "test"
     NAME = "config/aerogto_HR_easypool_v0.json"
     # === 配置区域 ===
-    CONFIG_PATH = f"config/config_0403/main2_multi1_easypool_airti.json" 
+    CONFIG_PATH = f"config/main2_easypool_GTO2_0406.json" 
     
     FIELD_TO_PLOT = None   # ["T", "Ux", "Uy", "Uz", "alpha.air", "alpha.titanium", "gamma_liquid"] 
     SLICE_AXIS = "z"        # 'x', 'y', 'z'
