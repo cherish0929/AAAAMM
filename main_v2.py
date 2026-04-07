@@ -664,7 +664,7 @@ def main(args, path_logs, path_nn, path_record):
         print(f"Scheduler: WarmupCosine (warmup={warmup_epochs}, total={EPOCH}, eta_min={eta_min:.2e})")
     else:
         # Fallback: original behavior
-        if EPOCH < 10:
+        if EPOCH < 50:
             scheduler = CosineAnnealingLR(optimizer, T_max=EPOCH, eta_min=real_lr)
         else:
             scheduler = CosineAnnealingLR(optimizer, T_max=EPOCH, eta_min=real_lr / 20.0)

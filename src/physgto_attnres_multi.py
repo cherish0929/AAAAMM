@@ -648,7 +648,7 @@ class Model(nn.Module):
         # Decoder: 多场解码
         v_pred = self.decoder(V_all_list, pos_enc)
 
-        if self.stepper_scheme == "eular":
+        if self.stepper_scheme == "euler":
             with autocast(device_type="cuda", enabled=False):
                 state_pred = state_in.float() + v_pred.float() * dt_tensor.float()
         else:

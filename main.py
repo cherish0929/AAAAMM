@@ -109,7 +109,7 @@ def get_model(args, device, cond_dim, default_dt):
         n_head=model_cfg.get("n_head", 4),
         n_token=model_cfg.get("n_token", 64),
         dt=model_cfg.get("dt", default_dt),
-        stepper_scheme=model_cfg.get("stepper_scheme", "eular")
+        stepper_scheme=model_cfg.get("stepper_scheme", "euler")
     )
 
     if model_name in ("gto_attnres_multi", "gto_attnres_multi_v2", "gto_res_attnres", "v3"):
