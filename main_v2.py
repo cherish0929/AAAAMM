@@ -57,18 +57,19 @@ class EMA:
             if param.requires_grad:
                 self.shadow[name] = param.data.clone()
 
+    @torch.no_grad()
     def update(self, model):
         for name, param in model.named_parameters():
             if param.requires_grad:
-                new_avg = (1.0 - self.decay) * param.data + self.decay * self.shadow[name]
-                self.shadow[name] = new_avg.clone()
+                # 原位更新，避免每次 update 都 clone 一份新张量
+                self.shadow[name].mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
 
     def apply_shadow(self, model):
         """Replace model params with EMA shadow (for evaluation)."""
         for name, param in model.named_parameters():
             if param.requires_grad:
-                self.backup[name] = param.data.clone()
-                param.data = self.shadow[name]
+                self.backup[name] = param.data
+                param.data = self.shadow[name].clone()
 
     def restore(self, model):
         """Restore original model params after evaluation."""
@@ -212,8 +213,19 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
                 else:
                     total_loss = loss_base
 
+            # NaN guard / Loss spike guard: 跳过异常 batch，并释放计算图显存
+            _skip = False
             if not torch.isfinite(total_loss):
+                _skip = True
+            else:
+                _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
+                if _cur_avg is not None and total_loss.item() > 10 * _cur_avg:
+                    _skip = True
+            if _skip:
                 optim.zero_grad()
+                del predict_hat, costs, loss_base, total_loss
+                if 'costs_pf' in dir(): del costs_pf, loss_pf
+                torch.cuda.empty_cache()
                 continue
 
             scaler.scale(total_loss).backward()
@@ -248,8 +260,19 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
             else:
                 total_loss = loss_base
 
+            # NaN guard / Loss spike guard
+            _skip = False
             if not torch.isfinite(total_loss):
+                _skip = True
+            else:
+                _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
+                if _cur_avg is not None and total_loss.item() > 10 * _cur_avg:
+                    _skip = True
+            if _skip:
                 optim.zero_grad()
+                del predict_hat, costs, loss_base, total_loss
+                if 'costs_pf' in dir(): del costs_pf, loss_pf
+                torch.cuda.empty_cache()
                 continue
 
             total_loss.backward()
@@ -356,9 +379,18 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
             # Use configurable grad_loss_weight
             loss = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
 
-            # NaN guard: skip batch if loss is NaN/Inf
+            # NaN guard / Loss spike guard: 跳过异常 batch，并释放计算图显存
+            _skip = False
             if not torch.isfinite(loss):
+                _skip = True
+            else:
+                _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
+                if _cur_avg is not None and loss.item() > 10 * _cur_avg:
+                    _skip = True
+            if _skip:
                 optim.zero_grad()
+                del predict_hat, costs, loss
+                torch.cuda.empty_cache()
                 continue
 
             scaler.scale(loss).backward()
@@ -379,8 +411,18 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
 
             loss = costs["value_loss"] + grad_loss_weight * costs["grad_loss"]
 
+            # NaN guard / Loss spike guard
+            _skip = False
             if not torch.isfinite(loss):
+                _skip = True
+            else:
+                _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
+                if _cur_avg is not None and loss.item() > 10 * _cur_avg:
+                    _skip = True
+            if _skip:
                 optim.zero_grad()
+                del predict_hat, costs, loss
+                torch.cuda.empty_cache()
                 continue
 
             loss.backward()
@@ -752,9 +794,11 @@ def main(args, path_logs, path_nn, path_record):
             start_time = time.time()
 
             # Apply EMA weights for evaluation
+            torch.cuda.empty_cache()
             ema.apply_shadow(model)
             test_error = validate(args, model, test_dataloader, device, normalizer, epoch + 1)
             ema.restore(model)
+            torch.cuda.empty_cache()
 
             end_time = time.time()
             val_time = (end_time - start_time)

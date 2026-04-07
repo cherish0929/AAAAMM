@@ -110,6 +110,180 @@ def compute_spatial_gradient_3d(tensor_field, grid_shape):
     
     return grad_x, grad_y, grad_z
 
+
+# ---- 场类型判定 ----
+
+def _is_vof_field(field_name: str) -> bool:
+    """判断是否为体积分数场（Volume-of-Fluid）。
+    以 'alpha' 或 'gamma' 开头的场视为体积分数场。"""
+    return field_name.startswith("alpha") or field_name.startswith("gamma")
+
+
+# ---- 构建空间权重 mask ----
+
+def _build_weight_mask(fld_gt_real, thresh, bw, fw):
+    """
+    根据真实值和阈值构建空间权重 mask。
+    Args:
+        fld_gt_real: [B, T, N, 1] 反归一化后的真实值
+        thresh: float 或 [low, high] 列表
+        bw: float, 背景区域权重
+        fw: float, 聚焦区域权重
+    Returns:
+        weight_mask: [B, T, N, 1]，均值归一化后的权重
+    """
+    with torch.no_grad():
+        if isinstance(thresh, list):
+            condition = (fld_gt_real > thresh[0]) & (fld_gt_real < thresh[1])
+            weight_mask = torch.where(condition, fw, bw)
+        else:
+            weight_mask = torch.where(fld_gt_real > thresh, fw, bw)
+        weight_mask = weight_mask / torch.mean(weight_mask)
+    return weight_mask
+
+
+# ---- 单场 value loss 计算 ----
+
+def _compute_weighted_value_loss(fld_pred, fld_gt, fld_gt_real, thresh, bw, fw, is_vof):
+    """
+    计算单个场的加权 value loss。
+    Args:
+        fld_pred, fld_gt: [B, T, N, 1] 归一化后的预测和标签
+        fld_gt_real: [B, T, N, 1] 反归一化后的真实标签（用于构建 weight mask）
+        thresh: float 或 [low, high]
+        bw, fw: float, base/focus 权重
+        is_vof: bool, 是否为体积分数场
+    Returns:
+        (loss_tensor, weight_mask):
+            loss_tensor: [B, T, N, 1] element-wise 加权损失
+            weight_mask: [B, T, N, 1] 空间权重（供梯度损失复用）
+    """
+    weight_mask = _build_weight_mask(fld_gt_real, thresh, bw, fw)
+
+    if is_vof:
+        # Weighted Huber Loss：对小误差保持 MSE 灵敏度，对大误差用线性避免梯度爆炸
+        error = fld_pred - fld_gt
+        abs_error = torch.abs(error)
+        with torch.no_grad():
+            # 自适应 delta：取当前 batch 误差中位数，clamp 防止退化
+            delta = torch.clamp(torch.median(abs_error), min=1e-3)
+        huber = torch.where(
+            abs_error <= delta,
+            0.5 * error ** 2,
+            delta * (abs_error - 0.5 * delta)
+        )
+        loss_tensor = huber * weight_mask
+    else:
+        # 普通场：加权 MSE
+        squared_error = (fld_pred - fld_gt) ** 2
+        loss_tensor = squared_error * weight_mask
+
+    return loss_tensor, weight_mask
+
+
+# ---- 单场梯度损失计算 ----
+
+def _adapt_mask_to_gradient(weight_mask, grid_shape, axis):
+    """
+    将空间 weight_mask 从 [B, T, N, 1] 适配到梯度差分后的维度。
+    差分沿 axis 方向会少一个元素，取相邻元素的最大值作为梯度位置的权重。
+    Args:
+        weight_mask: [B, T, N, 1]
+        grid_shape: numpy array, 形如 [[Nx, Ny, Nz]]
+        axis: 'x' | 'y' | 'z'
+    Returns:
+        适配后的 weight_mask，shape 与对应方向的梯度张量一致
+    """
+    B, T, N, C = weight_mask.shape
+    Nx, Ny, Nz = int(grid_shape[0][0]), int(grid_shape[0][1]), int(grid_shape[0][2])
+    # 还原为 3D: [B, T, Nz, Ny, Nx, C]
+    grid_mask = weight_mask.view(B, T, Nz, Ny, Nx, C)
+
+    if axis == 'x':
+        # 差分沿 Nx，取相邻 max
+        return torch.max(grid_mask[:, :, :, :, 1:, :], grid_mask[:, :, :, :, :-1, :])
+    elif axis == 'y':
+        return torch.max(grid_mask[:, :, :, 1:, :, :], grid_mask[:, :, :, :-1, :, :])
+    elif axis == 'z':
+        return torch.max(grid_mask[:, :, 1:, :, :, :], grid_mask[:, :, :-1, :, :, :])
+    else:
+        raise ValueError(f"未知 axis: {axis}")
+
+
+def _compute_gradient_loss(fld_pred, fld_gt, grid_shape, gw, is_vof, weight_cfg, weight_mask=None):
+    """
+    计算单个场的空间梯度损失。
+    Args:
+        fld_pred, fld_gt: [B, T, N, 1] 归一化值
+        grid_shape: numpy array
+        gw: float, 该场的梯度权重系数
+        is_vof: bool
+        weight_cfg: dict, 完整的 weight_loss 配置
+        weight_mask: [B, T, N, 1] 可选，来自 value loss 的空间权重
+    Returns:
+        loss: scalar tensor
+    """
+    pred_gx, pred_gy, pred_gz = compute_spatial_gradient_3d(fld_pred, grid_shape)
+    gt_gx, gt_gy, gt_gz = compute_spatial_gradient_3d(fld_gt, grid_shape)
+
+    if is_vof:
+        mode = weight_cfg.get("grad_weight_mode", "mask")
+
+        if mode == "adaptive":
+            # 用 GT 梯度幅值作为权重：梯度越大 → 界面越锋利 → 权重越高
+            loss_g = 0
+            for pred_g, gt_g in [(pred_gx, gt_gx), (pred_gy, gt_gy), (pred_gz, gt_gz)]:
+                with torch.no_grad():
+                    gt_mag = torch.abs(gt_g)
+                    # 归一化：w = 1 + |∇gt| / mean(|∇gt|)，确保平坦区权重≥1
+                    w = 1.0 + gt_mag / (torch.mean(gt_mag) + 1e-8)
+                    w = w / torch.mean(w)  # 总体均值归一化，保持 loss 量级稳定
+                loss_g = loss_g + torch.mean(w * (pred_g - gt_g) ** 2)
+
+        else:  # mode == "mask"
+            if weight_mask is not None:
+                # 将 weight_mask 适配到差分后的维度
+                wmx = _adapt_mask_to_gradient(weight_mask, grid_shape, 'x')
+                wmy = _adapt_mask_to_gradient(weight_mask, grid_shape, 'y')
+                wmz = _adapt_mask_to_gradient(weight_mask, grid_shape, 'z')
+
+                loss_g = (torch.mean(wmx * (pred_gx - gt_gx) ** 2)
+                          + torch.mean(wmy * (pred_gy - gt_gy) ** 2)
+                          + torch.mean(wmz * (pred_gz - gt_gz) ** 2))
+            else:
+                # fallback: 无 weight_mask 时退化为普通 MSE
+                loss_g = (F.mse_loss(pred_gx, gt_gx)
+                          + F.mse_loss(pred_gy, gt_gy)
+                          + F.mse_loss(pred_gz, gt_gz))
+    else:
+        # 普通场：纯 MSE 梯度损失
+        loss_g = (F.mse_loss(pred_gx, gt_gx)
+                  + F.mse_loss(pred_gy, gt_gy)
+                  + F.mse_loss(pred_gz, gt_gz))
+
+    return loss_g * gw
+
+
+# ---- 预留损失函数（默认关闭） ----
+
+def _compute_laplacian_loss(fld_pred, fld_gt, grid_shape, lw):
+    """
+    二阶空间梯度（拉普拉斯算子）损失 — 预留接口。
+    TODO: 实现二阶差分并计算损失
+    """
+    raise NotImplementedError("Laplacian loss 尚未实现，请在配置中设置 laplacian: false")
+
+
+def _compute_sharpness_loss(fld_pred, fld_gt_real, thresh, sw):
+    """
+    界面锐利度损失 — 预留接口。
+    TODO: 鼓励界面区域的预测值趋向 0 或 1
+    """
+    raise NotImplementedError("Sharpness loss 尚未实现，请在配置中设置 sharpness: false")
+
+
+# ---- 主训练损失函数 ----
+
 def get_train_loss(fields, predict_hat, label_gt, normalizer, weight_cfg: dict, active_mask=None):
     """返回loss张量及监控指标（其余转为float）。"""
     num_channels = float(len(fields))
@@ -120,69 +294,110 @@ def get_train_loss(fields, predict_hat, label_gt, normalizer, weight_cfg: dict, 
         "loss": 0,
         'mean_l2': 0
         }
-    
+
     pred_fp32 = predict_hat.float()
     label_fp32 = label_gt.float()
     with torch.no_grad():
         pred_real = normalizer.denormalize(pred_fp32)
         label_real = normalizer.denormalize(label_fp32)
 
+    # ---- value loss ----
+    weight_masks = {}  # 缓存各场的 weight_mask，供梯度损失复用
+
     if weight_cfg.get("enable", False):
         error_list = []
-        weight_field = weight_cfg.get("field")
+        weight_field = weight_cfg.get("field", [])
         thresholds = weight_cfg.get("threshold", [])
         bws = weight_cfg.get("base_weight", [])
         fws = weight_cfg.get("focus_weight", [])
+
         for idx, fld in enumerate(fields):
-            fld_pred, fld_gt = pred_fp32[..., idx:idx+1], label_fp32[..., idx:idx+1]
-            squared_error = (fld_pred - fld_gt) ** 2
+            fld_pred = pred_fp32[..., idx:idx+1]
+            fld_gt = label_fp32[..., idx:idx+1]
 
             if fld in weight_field:
                 i = weight_field.index(fld)
-                thresh, bw, fw = thresholds[i], float(bws[i]), float(fws[i])
-                fld_gt_real = label_real[..., idx:idx+1] # [B, T, N, 1]
-                with torch.no_grad():
-                    if isinstance(thresh, list):
-                        condition = (fld_gt_real > thresh[0]) & (fld_gt_real < thresh[1])
-                        weight_mask = torch.where(condition, fw, bw)
-                    else:
-                        weight_mask = torch.where(fld_gt_real > thresh, fw, bw)
-                    
-                    weight_mask = weight_mask / torch.mean(weight_mask)
-                
-                weighted_squared_error = squared_error * weight_mask
-                error_list.append(weighted_squared_error)
+                thresh = thresholds[i]
+                bw, fw = float(bws[i]), float(fws[i])
+                fld_gt_real = label_real[..., idx:idx+1]
+                is_vof = _is_vof_field(fld)
+
+                loss_tensor, w_mask = _compute_weighted_value_loss(
+                    fld_pred, fld_gt, fld_gt_real, thresh, bw, fw, is_vof
+                )
+                error_list.append(loss_tensor)
+                weight_masks[fld] = w_mask
             else:
-                error_list.append(squared_error)
-            
+                error_list.append((fld_pred - fld_gt) ** 2)
+
         error_map = torch.cat(error_list, dim=-1)
         losses["value_loss"] = torch.mean(error_map)
-        
     else:
         losses["value_loss"] = F.mse_loss(pred_fp32, label_fp32)
 
+    # ---- gradient loss ----
     if weight_cfg.get("gradient", False):
         grad_loss_total = 0
         grad_weights = weight_cfg.get("grad_weight", {})
         grid_shape = weight_cfg.get("grid_shape", None)
+
         for idx, fld in enumerate(fields):
             if fld in grad_weights:
                 gw = float(grad_weights[fld])
+                is_vof = _is_vof_field(fld)
                 fld_pred_g = pred_fp32[..., idx:idx+1]
                 fld_gt_g = label_fp32[..., idx:idx+1]
-                pred_gx, pred_gy, pred_gz = compute_spatial_gradient_3d(fld_pred_g, grid_shape)
-                gt_gx, gt_gy, gt_gz       = compute_spatial_gradient_3d(fld_gt_g, grid_shape)
-                # 梯度的纯 MSE
-                loss_gx = F.mse_loss(pred_gx, gt_gx, reduction='mean')
-                loss_gy = F.mse_loss(pred_gy, gt_gy, reduction='mean')
-                loss_gz = F.mse_loss(pred_gz, gt_gz, reduction='mean')
 
-                loss_g = loss_gx + loss_gy + loss_gz
-                grad_loss_total += loss_g * gw
+                loss_g = _compute_gradient_loss(
+                    fld_pred_g, fld_gt_g, grid_shape, gw,
+                    is_vof, weight_cfg, weight_mask=weight_masks.get(fld)
+                )
+                grad_loss_total = grad_loss_total + loss_g
+
         losses["grad_loss"] = grad_loss_total
-        
-    losses["loss"] = losses["value_loss"] + 8.0 * losses["grad_loss"]
 
+    # ---- 预留: laplacian / sharpness loss ----
+    if weight_cfg.get("laplacian", False):
+        lap_weights = weight_cfg.get("laplacian_weight", {})
+        grid_shape = weight_cfg.get("grid_shape", None)
+        lap_total = 0
+        for idx, fld in enumerate(fields):
+            if _is_vof_field(fld) and fld in lap_weights:
+                lw = float(lap_weights[fld])
+                lap_total = lap_total + _compute_laplacian_loss(
+                    pred_fp32[..., idx:idx+1], label_fp32[..., idx:idx+1],
+                    grid_shape, lw
+                )
+        losses["laplacian_loss"] = lap_total
+
+    if weight_cfg.get("sharpness", False):
+        sharp_weights = weight_cfg.get("sharpness_weight", {})
+        thresholds = weight_cfg.get("threshold", [])
+        weight_field = weight_cfg.get("field", [])
+        sharp_total = 0
+        for idx, fld in enumerate(fields):
+            if _is_vof_field(fld) and fld in sharp_weights:
+                sw = float(sharp_weights[fld])
+                i = weight_field.index(fld) if fld in weight_field else None
+                thresh = thresholds[i] if i is not None else [0.1, 0.9]
+                sharp_total = sharp_total + _compute_sharpness_loss(
+                    pred_fp32[..., idx:idx+1], label_real[..., idx:idx+1],
+                    thresh, sw
+                )
+        losses["sharpness_loss"] = sharp_total
+
+    # ---- 总 loss 合成 ----
+    grad_multiplier = float(weight_cfg.get("grad_loss_multiplier", 8.0))
+    losses["loss"] = losses["value_loss"] + grad_multiplier * losses["grad_loss"]
+
+    if "laplacian_loss" in losses:
+        lap_multiplier = float(weight_cfg.get("laplacian_loss_multiplier", 0.05))
+        losses["loss"] = losses["loss"] + lap_multiplier * losses["laplacian_loss"]
+    if "sharpness_loss" in losses:
+        sharp_multiplier = float(weight_cfg.get("sharpness_loss_multiplier", 0.2))
+        losses["loss"] = losses["loss"] + sharp_multiplier * losses["sharpness_loss"]
+
+    # ---- 监控指标（不参与反向传播） ----
     with torch.no_grad():
         rmse = _rmse(pred_real, label_real)
         inactive_mask = (~active_mask) if active_mask is not None else None

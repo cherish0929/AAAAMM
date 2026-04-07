@@ -9,4 +9,5 @@ config
 *.sh
 *.json
 *.pdf
+.claude
 __pycache__
