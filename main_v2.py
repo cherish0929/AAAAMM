@@ -228,6 +228,12 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
                 torch.cuda.empty_cache()
                 continue
 
+            # Loss spike guard: 跳过 loss 突然超过历史均值 10 倍的 batch
+            _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
+            if _cur_avg is not None and total_loss.item() > 10 * _cur_avg:
+                optim.zero_grad()
+                continue
+
             scaler.scale(total_loss).backward()
             scaler.unscale_(optim)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
@@ -273,6 +279,12 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
                 del predict_hat, costs, loss_base, total_loss
                 if 'costs_pf' in dir(): del costs_pf, loss_pf
                 torch.cuda.empty_cache()
+                continue
+
+            # Loss spike guard
+            _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
+            if _cur_avg is not None and total_loss.item() > 10 * _cur_avg:
+                optim.zero_grad()
                 continue
 
             total_loss.backward()
@@ -393,6 +405,12 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
                 torch.cuda.empty_cache()
                 continue
 
+            # Loss spike guard: 跳过 loss 突然超过历史均值 10 倍的 batch
+            _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
+            if _cur_avg is not None and loss.item() > 10 * _cur_avg:
+                optim.zero_grad()
+                continue
+
             scaler.scale(loss).backward()
             scaler.unscale_(optim)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.train.get("grad_clip", 1.0))
@@ -423,6 +441,12 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
                 optim.zero_grad()
                 del predict_hat, costs, loss
                 torch.cuda.empty_cache()
+                continue
+
+            # Loss spike guard
+            _cur_avg = agg["loss"] / agg["num"] if agg["num"] > 0 else None
+            if _cur_avg is not None and loss.item() > 10 * _cur_avg:
+                optim.zero_grad()
                 continue
 
             loss.backward()
