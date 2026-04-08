@@ -1,0 +1,688 @@
+# -*- coding: utf-8 -*-
+"""
+inference_air.py — 针对体积分数 (VOF) 场的专用推理脚本
+============================================================
+自动检测配置中所有体积分数场 (alpha.*, gamma.*, *frac*)，
+支持单物理场和多物理场配置，逐 VOF 场分别计算指标和生成可视化。
+
+核心关注点：界面 (alpha ≈ 0.5) 的预测精度，而非全场数值。
+
+可视化内容 (每个 VOF 场独立生成):
+  1. 界面对比图：差异发散色图 + GT/Pred 0.5 等值线 + 分歧区域高亮
+  2. GT / Pred VOF 场填充等值线 (并排对比)
+  3. 界面附近误差热图 (仅展示界面区域的绝对误差)
+  4. 打印每个样本的 loss / L2 / RMSE / IoU / Dice 等指标
+============================================================
+"""
+
+import os
+import sys
+import random
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from scipy.interpolate import griddata
+from scipy.ndimage import gaussian_filter
+import imageio
+from tqdm import tqdm
+from pathlib import Path
+import h5py
+from torch.amp import autocast
+
+from src.dataset_fast import AeroGtoDataset
+from src.utils import load_json_config, set_seed
+
+
+# ────────────────────────────────────────────
+#  Metrics (复用 train.py 的相对 L2 / RMSE)
+# ────────────────────────────────────────────
+
+def _relative_l2(pred, target):
+    error = pred - target
+    norm_error = torch.norm(error, dim=-2) / (torch.norm(target, dim=-2) + 1e-6)
+    return torch.mean(norm_error, dim=-1).mean(dim=-1)  # [B]
+
+
+def _rmse(pred, target):
+    diff = pred - target
+    mse = torch.mean(diff ** 2)
+    return torch.sqrt(mse)
+
+
+def _each_step_l2(pred, target):
+    """按时间步计算相对 L2, 返回 [T]"""
+    T = target.shape[1]
+    losses = torch.zeros(T, device=pred.device)
+    for t in range(T):
+        error = pred[:, t] - target[:, t]
+        norm_error = torch.norm(error, dim=-2) / (torch.norm(target[:, t], dim=-2) + 1e-6)
+        losses[t] = norm_error.mean()
+    return losses
+
+
+def _interface_iou(pred_np, gt_np, threshold=0.5):
+    """
+    界面 IoU: 将 alpha 二值化后计算交并比。
+    IoU 衡量"气相区域"重合度，与界面位置直接相关。
+    """
+    pred_bin = (pred_np >= threshold).astype(bool)
+    gt_bin = (gt_np >= threshold).astype(bool)
+    intersection = np.logical_and(pred_bin, gt_bin).sum()
+    union = np.logical_or(pred_bin, gt_bin).sum()
+    if union == 0:
+        return 1.0
+    return intersection / union
+
+
+def _interface_dice(pred_np, gt_np, threshold=0.5):
+    """Dice coefficient"""
+    pred_bin = (pred_np >= threshold).astype(bool)
+    gt_bin = (gt_np >= threshold).astype(bool)
+    intersection = np.logical_and(pred_bin, gt_bin).sum()
+    total = pred_bin.sum() + gt_bin.sum()
+    if total == 0:
+        return 1.0
+    return 2.0 * intersection / total
+
+
+def _interface_band_mae(pred_np, gt_np, band_lo=0.2, band_hi=0.8):
+    """
+    仅在界面带 (band_lo < gt < band_hi) 内的 MAE.
+    这直接衡量界面附近的预测误差。
+    """
+    mask = (gt_np >= band_lo) & (gt_np <= band_hi)
+    if mask.sum() == 0:
+        return 0.0
+    return np.mean(np.abs(pred_np[mask] - gt_np[mask]))
+
+
+# ────────────────────────────────────────────
+#  Model builder (与 inference_v1 相同)
+# ────────────────────────────────────────────
+
+def _build_model(model_cfg, cond_dim, default_dt, device):
+    model_name = model_cfg.get("name", "PhysGTO")
+
+    if model_name == "PhysGTO":
+        from src.physgto import Model
+    elif model_name == "gto_res":
+        from src.physgto_res import Model
+    elif model_name == "gto_lnn":
+        from src.gto_lnn import Model
+    elif model_name == "gto_attnres_multi":
+        from src.physgto_attnres_multi import Model
+    elif model_name == "gto_attnres_multi_v2":
+        from src.physgto_attnres_multi_v2 import Model
+    elif model_name == "gto_res_attnres":
+        from src.physgto_res_attnres import Model
+    else:
+        raise ValueError(f"Unknown model name: {model_name}")
+
+    kwargs = dict(
+        space_size=model_cfg.get("space_size", 3),
+        pos_enc_dim=model_cfg.get("pos_enc_dim", 5),
+        cond_dim=cond_dim,
+        N_block=model_cfg.get("N_block", 4),
+        in_dim=model_cfg.get("in_dim", 4),
+        out_dim=model_cfg.get("out_dim", 4),
+        enc_dim=model_cfg.get("enc_dim", 128),
+        n_head=model_cfg.get("n_head", 4),
+        n_token=model_cfg.get("n_token", 64),
+        dt=model_cfg.get("dt", default_dt),
+    )
+
+    if model_name in ("gto_attnres_multi", "gto_attnres_multi_v2", "gto_res_attnres"):
+        kwargs["n_fields"] = model_cfg.get("n_fields", model_cfg.get("in_dim", 2))
+        kwargs["cross_attn_heads"] = model_cfg.get("cross_attn_heads", 4)
+
+    if model_name in ("gto_attnres_multi_v2", "gto_res_attnres"):
+        kwargs["attn_res_mode"] = model_cfg.get("attn_res_mode", "block_inter")
+
+    return Model(**kwargs).to(device)
+
+
+# ════════════════════════════════════════════
+#  AirFieldPredictor
+# ════════════════════════════════════════════
+
+class AirFieldPredictor:
+    """专门针对 alpha.air 等 VOF 场的推理和可视化工具"""
+
+    def __init__(self, config_path, mode="test", model_path=None, device_str="cuda"):
+        self.args = load_json_config(config_path)
+        self.device = torch.device(device_str if torch.cuda.is_available() else "cpu")
+        print(f"[Init] Device: {self.device}")
+
+        data_cfg = self.args.data
+        model_cfg = self.args.model
+
+        # 1. 数据集
+        print("[Init] Loading Train Dataset (for Normalizer)...")
+        train_dataset = AeroGtoDataset(args=self.args, mode="train")
+
+        if mode == "test":
+            self.dataset = AeroGtoDataset(
+                args=self.args, mode="test",
+                mat_data=train_dataset.mat_mean_and_std if train_dataset.normalize else None
+            )
+            self.dataset.normalizer = train_dataset.normalizer
+            self.dataset._sync_norm_cache()
+        else:
+            self.dataset = train_dataset
+
+        self.fields = self.dataset.fields
+        print(f"[Init] Fields: {self.fields}")
+
+        # 自动检测所有体积分数场 (alpha.*, gamma.*, *frac*)
+        self.vof_fields = self._find_vof_fields()
+        if not self.vof_fields:
+            print("[Warn] No VOF field detected; falling back to index 0")
+            self.vof_fields = [(self.fields[0], 0)]
+        print(f"[Init] VOF fields for analysis: {self.vof_fields}")
+
+        # 2. 模型
+        print("[Init] Building Model...")
+        cond_dim = self.args.model.get("cond_dim") or self.dataset.cond_dim
+        default_dt = self.args.model.get("dt", self.dataset.dt)
+        self.model = _build_model(model_cfg, cond_dim, default_dt, self.device)
+
+        # 3. 权重
+        if model_path is None:
+            save_root = Path(self.args.save_path)
+            model_path = save_root / "nn" / f"{self.args.name}_best.pt"
+
+        print(f"[Init] Loading weights: {model_path}")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Weight file not found: {model_path}")
+
+        checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+        if "ema_shadow" in checkpoint:
+            print("[Init] Using EMA shadow weights.")
+            ema_shadow = checkpoint["ema_shadow"]
+            state_dict = self.model.state_dict()
+            for name in ema_shadow:
+                if name in state_dict:
+                    state_dict[name] = ema_shadow[name]
+            self.model.load_state_dict(state_dict, strict=False)
+        else:
+            state_dict = checkpoint.get("state_dict", checkpoint)
+            self.model.load_state_dict(state_dict, strict=False)
+
+        self.model.eval()
+        self.normalizer = self.dataset.normalizer
+        self.normalizer.to(self.device)
+
+    # ──────────────────────────────
+    #  VOF field detection
+    # ──────────────────────────────
+
+    def _find_vof_fields(self):
+        """Return list of (field_name, channel_index) for all volume-fraction fields."""
+        vof_keywords = ("alpha", "gamma", "frac")
+        result = []
+        for i, fname in enumerate(self.fields):
+            if any(kw in fname.lower() for kw in vof_keywords):
+                result.append((fname, i))
+        return result
+
+    # ──────────────────────────────
+    #  推理 + 指标计算
+    # ──────────────────────────────
+
+    def predict_and_evaluate(self, sample_idx):
+        """
+        对单个样本执行推理，返回 result dict 和 metrics dict。
+        result["pred"] / result["gt"] 为 [T, N, C] 全通道数据。
+        metrics["per_field"] 为每个 VOF 场的详细指标。
+        """
+        sample = self.dataset[sample_idx]
+        use_amp = self.args.train.get("use_amp", False)
+        check_point = self.args.train.get("check_point", False)
+
+        state_seq = sample["state"].unsqueeze(0).to(self.device)
+        node_pos = sample["node_pos"].unsqueeze(0).to(self.device)
+        edges = sample["edges"].unsqueeze(0).to(self.device)
+        time_seq = sample["time_seq"].unsqueeze(0).to(self.device)
+        conditions = sample["conditions"].unsqueeze(0).to(self.device).float()
+        dt = sample["dt"]
+
+        state_0 = state_seq[:, 0]
+        gt_seq = state_seq[:, 1:]  # [1, T, N, C]
+
+        with torch.no_grad():
+            if use_amp:
+                with autocast("cuda", dtype=torch.bfloat16):
+                    pred_seq = self.model.autoregressive(
+                        state_0, node_pos, edges, time_seq, conditions, dt, check_point=check_point)
+            else:
+                pred_seq = self.model.autoregressive(
+                    state_0, node_pos, edges, time_seq, conditions, dt, check_point=check_point)
+
+            pred_real = self.normalizer.denormalize(pred_seq)
+            gt_real = self.normalizer.denormalize(gt_seq)
+
+        # ---- 全局指标 ----
+        metrics = {}
+        metrics["MSE_normalized"] = torch.mean((pred_seq - gt_seq) ** 2).item()
+
+        # ---- 逐 VOF 场指标 ----
+        per_field = {}
+        for field_name, idx in self.vof_fields:
+            fm = {}
+            pred_ch = pred_real[..., idx:idx + 1]  # [1, T, N, 1]
+            gt_ch = gt_real[..., idx:idx + 1]
+
+            fm["relative_L2"] = _relative_l2(pred_ch, gt_ch).item()
+            fm["RMSE"] = _rmse(pred_ch, gt_ch).item()
+            fm["each_step_L2"] = _each_step_l2(pred_ch, gt_ch).cpu().numpy()
+
+            pred_np = pred_real[0, :, :, idx].cpu().numpy()  # [T, N]
+            gt_np = gt_real[0, :, :, idx].cpu().numpy()
+
+            T = pred_np.shape[0]
+            ious, dices, band_maes = [], [], []
+            for t in range(T):
+                ious.append(_interface_iou(pred_np[t], gt_np[t]))
+                dices.append(_interface_dice(pred_np[t], gt_np[t]))
+                band_maes.append(_interface_band_mae(pred_np[t], gt_np[t]))
+
+            fm["IoU_per_step"] = np.array(ious)
+            fm["Dice_per_step"] = np.array(dices)
+            fm["band_MAE_per_step"] = np.array(band_maes)
+            fm["mean_IoU"] = np.mean(ious)
+            fm["mean_Dice"] = np.mean(dices)
+            fm["mean_band_MAE"] = np.mean(band_maes)
+
+            per_field[field_name] = fm
+
+        metrics["per_field"] = per_field
+
+        # 获取物理坐标
+        file_id, _ = self.dataset.sample_keys[sample_idx]
+        path = self.dataset.file_paths[file_id]
+        meta = self.dataset.meta_cache[path]
+        raw_coords = meta["node_pos"]
+        if isinstance(raw_coords, torch.Tensor):
+            raw_coords = raw_coords.cpu().numpy()
+
+        result = {
+            "pred": pred_real[0].cpu().numpy(),   # [T, N, C] (全通道 denormalized)
+            "gt": gt_real[0].cpu().numpy(),       # [T, N, C]
+            "coords": raw_coords,                 # [N, 3]
+        }
+
+        return result, metrics
+
+    def print_metrics(self, sample_idx, metrics):
+        """打印单个样本的详细指标 (支持多 VOF 场)"""
+        print(f"\n{'='*60}")
+        print(f"  Sample {sample_idx} -- Metrics Summary")
+        print(f"{'='*60}")
+        print(f"  MSE (norm):        {metrics['MSE_normalized']:.4e}")
+
+        for field_name, fm in metrics["per_field"].items():
+            print(f"\n  --- {field_name} ---")
+            print(f"  Relative L2:       {fm['relative_L2']:.4e}")
+            print(f"  RMSE:              {fm['RMSE']:.4e}")
+            print(f"  Mean IoU:          {fm['mean_IoU']:.4f}")
+            print(f"  Mean Dice:         {fm['mean_Dice']:.4f}")
+            print(f"  Mean Band MAE:     {fm['mean_band_MAE']:.4e}")
+            print(f"  Per-step L2:       {[f'{v:.4e}' for v in fm['each_step_L2']]}")
+            print(f"  Per-step IoU:      {[f'{v:.4f}' for v in fm['IoU_per_step']]}")
+            print(f"  Per-step Dice:     {[f'{v:.4f}' for v in fm['Dice_per_step']]}")
+            print(f"  Per-step BandMAE:  {[f'{v:.4e}' for v in fm['band_MAE_per_step']]}")
+        print(f"{'='*60}\n")
+
+    # ──────────────────────────────
+    #  切片辅助
+    # ──────────────────────────────
+
+    def _build_slice_mask(self, coords, axis, slice_pos=None, min_points=32):
+        axis_id = {'x': 0, 'y': 1, 'z': 2}[axis]
+        axis_values = coords[:, axis_id]
+        if slice_pos is None:
+            slice_pos = 0.5 * (np.nanmin(axis_values) + np.nanmax(axis_values))
+
+        axis_span = max(np.nanmax(axis_values) - np.nanmin(axis_values), 1e-12)
+        thickness = max(axis_span * 2e-3, 1e-8)
+        mask = np.abs(axis_values - slice_pos) <= thickness
+
+        for _ in range(8):
+            if np.sum(mask) >= min_points:
+                break
+            thickness *= 1.8
+            mask = np.abs(axis_values - slice_pos) <= thickness
+
+        if np.sum(mask) < min_points:
+            dist = np.abs(axis_values - slice_pos)
+            k = min(len(dist), max(min_points, int(0.03 * len(dist))))
+            idx = np.argpartition(dist, k - 1)[:k]
+            mask = np.zeros_like(dist, dtype=bool)
+            mask[idx] = True
+
+        return mask, slice_pos
+
+    def _interp_grid(self, pts_x, pts_y, vals, Xi, Yi, method="linear"):
+        if vals is None:
+            return None
+        points = np.column_stack([pts_x, pts_y])
+        values = np.asarray(vals)
+
+        Z = None
+        for m in [method, "linear", "nearest"]:
+            try:
+                Z = griddata(points, values, (Xi, Yi), method=m)
+            except Exception:
+                Z = None
+            if Z is not None and not np.all(np.isnan(Z)):
+                break
+
+        if Z is None:
+            return None
+        if np.isnan(Z).any():
+            try:
+                Z_near = griddata(points, values, (Xi, Yi), method="nearest")
+                Z = np.where(np.isnan(Z), Z_near, Z)
+            except Exception:
+                pass
+        return Z
+
+    def _smooth(self, Z, sigma):
+        if Z is None or sigma is None or sigma <= 0:
+            return Z
+        if np.all(np.isnan(Z)):
+            return Z
+        nan_mask = np.isnan(Z)
+        fill = np.nanmedian(Z)
+        if not np.isfinite(fill):
+            fill = 0.0
+        Z_fill = np.where(nan_mask, fill, Z)
+        Z_s = gaussian_filter(Z_fill, sigma=sigma, mode="nearest")
+        Z_s[nan_mask] = np.nan
+        return Z_s
+
+    # ──────────────────────────────
+    #  核心可视化: 界面对比
+    # ──────────────────────────────
+
+    def plot_interface(self, result, time_step, field_name=None, field_idx=None,
+                       axis="z", slice_pos=None,
+                       res=320, save_path=None, return_array=False,
+                       smooth_sigma=0.5):
+        """
+        绘制 4 个子图 (针对指定的 VOF 场):
+          1. 界面对比: 差异发散色图 + GT/Pred 0.5 等值线 + 分歧区域高亮
+          2. GT alpha 填充 + 0.5 等值线
+          3. Pred alpha 填充 + GT 0.5 等值线叠加对比
+          4. 界面附近的误差热图 (仅 0.1 < alpha < 0.9 区域)
+        """
+        # 默认选第一个 VOF 场
+        if field_name is None:
+            field_name, field_idx = self.vof_fields[0]
+        elif field_idx is None:
+            field_idx = self.fields.index(field_name)
+
+        coords = result["coords"]
+        pred_data = result["pred"][time_step, :, field_idx]  # [N]
+        gt_data = result["gt"][time_step, :, field_idx]
+
+        # 切片
+        mask, slice_pos = self._build_slice_mask(coords, axis, slice_pos)
+
+        if axis == 'x':
+            pts_x, pts_y = coords[mask, 1], coords[mask, 2]
+            xlabel, ylabel = 'Y (m)', 'Z (m)'
+        elif axis == 'y':
+            pts_x, pts_y = coords[mask, 0], coords[mask, 2]
+            xlabel, ylabel = 'X (m)', 'Z (m)'
+        else:
+            pts_x, pts_y = coords[mask, 0], coords[mask, 1]
+            xlabel, ylabel = 'X (m)', 'Y (m)'
+
+        if np.sum(mask) < 4 or len(np.unique(pts_x)) < 2 or len(np.unique(pts_y)) < 2:
+            print(f"[Error] Too few points ({np.sum(mask)}) for slice")
+            return None
+
+        xi = np.linspace(pts_x.min(), pts_x.max(), res)
+        yi = np.linspace(pts_y.min(), pts_y.max(), res)
+        Xi, Yi = np.meshgrid(xi, yi)
+
+        Zi_gt_raw = self._interp_grid(pts_x, pts_y, gt_data[mask], Xi, Yi, method="linear")
+        Zi_pred_raw = self._interp_grid(pts_x, pts_y, pred_data[mask], Xi, Yi, method="linear")
+        if Zi_gt_raw is None or Zi_pred_raw is None:
+            print("[Error] Interpolation failed.")
+            return None
+
+        Zi_gt = np.clip(self._smooth(Zi_gt_raw, sigma=smooth_sigma), 0, 1)
+        Zi_pred = np.clip(self._smooth(Zi_pred_raw, sigma=smooth_sigma), 0, 1)
+
+        extent = (xi.min(), xi.max(), yi.min(), yi.max())
+        imshow_args = dict(extent=extent, origin='lower', aspect='equal')
+
+        # ──────── 绘图 ────────
+        plt.rcParams.update({
+            "font.family": "DejaVu Sans",
+            "font.size": 10,
+            "axes.titlesize": 13,
+            "axes.labelsize": 10,
+            "axes.facecolor": "#f8f8f8",
+            "figure.facecolor": "white",
+        })
+
+        fig, axes = plt.subplots(1, 4, figsize=(26, 6), constrained_layout=True)
+
+        # ─── Panel 1: 界面对比图 (核心面板) ───
+        # 背景: pred - gt 差异发散色图
+        diff_field = Zi_pred - Zi_gt
+        abs_diff = np.abs(diff_field)
+        diff_bound = max(np.nanpercentile(abs_diff, 97), 0.02)
+
+        axes[0].imshow(diff_field, cmap='RdBu_r', vmin=-diff_bound, vmax=diff_bound,
+                       interpolation='bicubic', **imshow_args)
+
+        # 分歧区域高亮: GT 和 Pred 在 0.5 阈值上分类不一致的区域
+        gt_above = Zi_gt >= 0.5
+        pred_above = Zi_pred >= 0.5
+        disagree = (gt_above != pred_above).astype(float)
+        disagree_masked = np.where(disagree > 0.5, 1.0, np.nan)
+        axes[0].imshow(disagree_masked, cmap='Oranges', vmin=0, vmax=2,
+                       alpha=0.45, interpolation='nearest', **imshow_args)
+
+        # GT 等值线 (0.5) — 蓝实线 (粗)
+        axes[0].contour(Xi, Yi, Zi_gt, levels=[0.5],
+                        colors='#1f77b4', linewidths=3.0, linestyles='-')
+        # Pred 等值线 (0.5) — 红虚线 (粗)
+        axes[0].contour(Xi, Yi, Zi_pred, levels=[0.5],
+                        colors='#d62728', linewidths=3.0, linestyles='--')
+
+        axes[0].set_title("Interface Comparison", fontweight='bold')
+        legend_lines = [
+            Line2D([0], [0], color='#1f77b4', lw=3, ls='-',  label='GT (0.5)'),
+            Line2D([0], [0], color='#d62728', lw=3, ls='--', label='Pred (0.5)'),
+            Line2D([0], [0], color='#e8871e', lw=6, ls='-',  alpha=0.45, label='Mismatch'),
+        ]
+        axes[0].legend(handles=legend_lines, loc='upper right', framealpha=0.85, fontsize=9)
+
+        # ─── Panel 2: GT field 填充 ───
+        im1 = axes[1].imshow(Zi_gt, cmap='RdYlBu_r', vmin=0, vmax=1,
+                             interpolation='bicubic', **imshow_args)
+        axes[1].contour(Xi, Yi, Zi_gt, levels=[0.5], colors='white', linewidths=2.0)
+        axes[1].set_title(f"GT {field_name}")
+        cb1 = plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.03)
+        cb1.set_label(field_name)
+
+        # ─── Panel 3: Pred field 填充 ───
+        im2 = axes[2].imshow(Zi_pred, cmap='RdYlBu_r', vmin=0, vmax=1,
+                             interpolation='bicubic', **imshow_args)
+        axes[2].contour(Xi, Yi, Zi_pred, levels=[0.5], colors='white', linewidths=2.0)
+        # 叠加 GT 0.5 contour 用于对比
+        axes[2].contour(Xi, Yi, Zi_gt, levels=[0.5], colors='#1f77b4',
+                        linewidths=1.5, linestyles='--', alpha=0.8)
+        axes[2].set_title(f"Pred {field_name}")
+        cb2 = plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.03)
+        cb2.set_label(field_name)
+        legend_pred = [
+            Line2D([0], [0], color='white',   lw=2, ls='-',  label='Pred 0.5'),
+            Line2D([0], [0], color='#1f77b4', lw=1.5, ls='--', label='GT 0.5'),
+        ]
+        axes[2].legend(handles=legend_pred, loc='upper right', framealpha=0.85, fontsize=9)
+
+        # ─── Panel 4: 界面附近误差热图 ───
+        abs_err = np.abs(Zi_pred - Zi_gt)
+        interface_region = (Zi_gt > 0.1) & (Zi_gt < 0.9)
+        err_masked = np.where(interface_region, abs_err, np.nan)
+
+        err_vmax = np.nanpercentile(err_masked, 99) if np.any(interface_region) else 0.1
+        err_vmax = max(err_vmax, 0.01)
+
+        im3 = axes[3].imshow(err_masked, cmap='inferno', vmin=0, vmax=err_vmax,
+                             interpolation='bicubic', **imshow_args)
+        # 叠加 GT / Pred 0.5 等值线
+        axes[3].contour(Xi, Yi, Zi_gt, levels=[0.5], colors='cyan', linewidths=2.0, linestyles='-')
+        axes[3].contour(Xi, Yi, Zi_pred, levels=[0.5], colors='lime', linewidths=2.0, linestyles='--')
+        # 分歧区域边界
+        if np.any(disagree > 0.5):
+            axes[3].contour(Xi, Yi, disagree, levels=[0.5], colors='yellow',
+                            linewidths=1.0, linestyles=':', alpha=0.7)
+        axes[3].set_title("Interface Error (|Pred-GT|)")
+        cb3 = plt.colorbar(im3, ax=axes[3], fraction=0.046, pad=0.03, extend='max')
+        cb3.set_label(f"|Pred - GT| ({field_name})")
+        legend_err = [
+            Line2D([0], [0], color='cyan', lw=2, ls='-',  label='GT 0.5'),
+            Line2D([0], [0], color='lime', lw=2, ls='--', label='Pred 0.5'),
+        ]
+        axes[3].legend(handles=legend_err, loc='upper right', framealpha=0.85, fontsize=9)
+
+        for ax in axes:
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(ylabel)
+            ax.ticklabel_format(style='sci', scilimits=(-1, 1), axis='both')
+            ax.set_aspect('equal', adjustable='box')
+
+        fig.suptitle(f"{field_name} -- Step {time_step}", fontsize=14, fontweight='bold')
+
+        if return_array:
+            import io
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=120)
+            plt.close(fig)
+            buf.seek(0)
+            img = imageio.v2.imread(buf)
+            buf.close()
+            return img
+
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"[Saved] {save_path}")
+            plt.close(fig)
+        else:
+            plt.show()
+
+    # ──────────────────────────────
+    #  GIF 生成
+    # ──────────────────────────────
+
+    def generate_gif(self, result, field_name=None, field_idx=None,
+                     axis="z", slice_pos=None, gif_path="result/air_rollout.gif", res=280):
+        if field_name is None:
+            field_name, field_idx = self.vof_fields[0]
+        elif field_idx is None:
+            field_idx = self.fields.index(field_name)
+
+        print(f"[GIF] Generating interface animation for {field_name}...")
+        frames = []
+        horizon = result["pred"].shape[0]
+
+        for t in tqdm(range(horizon), desc="Rendering"):
+            img = self.plot_interface(
+                result, time_step=t, field_name=field_name, field_idx=field_idx,
+                axis=axis, slice_pos=slice_pos,
+                res=res, return_array=True
+            )
+            if img is not None:
+                frames.append(img)
+
+        if frames:
+            imageio.mimsave(gif_path, frames, fps=8, loop=0)
+            print(f"[GIF] Saved to {gif_path}")
+        else:
+            print("[GIF] No frames generated.")
+
+    # ──────────────────────────────
+    #  汇总多样本指标
+    # ──────────────────────────────
+
+    def print_summary(self, all_metrics):
+        """汇总打印多个样本的平均指标 (按 VOF 场分别汇总)"""
+        n = len(all_metrics)
+        print(f"\n{'#'*60}")
+        print(f"  SUMMARY over {n} samples")
+        print(f"{'#'*60}")
+
+        # 全局指标
+        mse_vals = [m["MSE_normalized"] for m in all_metrics]
+        print(f"  {'MSE_normalized':20s}:  mean={np.mean(mse_vals):.4e}  std={np.std(mse_vals):.4e}")
+
+        # 逐 VOF 场指标
+        field_names = list(all_metrics[0]["per_field"].keys())
+        metric_keys = ["relative_L2", "RMSE", "mean_IoU", "mean_Dice", "mean_band_MAE"]
+        for fname in field_names:
+            print(f"\n  --- {fname} ---")
+            for k in metric_keys:
+                vals = [m["per_field"][fname][k] for m in all_metrics]
+                print(f"    {k:20s}:  mean={np.mean(vals):.4e}  std={np.std(vals):.4e}  "
+                      f"min={np.min(vals):.4e}  max={np.max(vals):.4e}")
+        print(f"{'#'*60}\n")
+
+
+# ════════════════════════════════════════════
+#  Main
+# ════════════════════════════════════════════
+
+if __name__ == "__main__":
+    MODE = "test"
+    CONFIG_PATH = "config/config_alpha_air/easypool_air_3-7_enhanced.json"
+    SLICE_AXIS = "z"
+    SLICE_POS = None
+    NUM_SAMPLES = 3  # 随机选取的样本数
+
+    try:
+        predictor = AirFieldPredictor(CONFIG_PATH, MODE)
+        OUT_DIR = f"result_air/interface_eval/{predictor.args.name}/{MODE}"
+        os.makedirs(OUT_DIR, exist_ok=True)
+    except Exception as e:
+        print(f"Init failed: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+    dataset_length = len(predictor.dataset)
+    print(f"Dataset size: {dataset_length}")
+
+    sample_idxs = random.sample(range(dataset_length), min(NUM_SAMPLES, dataset_length))
+    all_metrics = []
+
+    for sample_idx in sample_idxs:
+        print(f"\n>>> Inference on sample {sample_idx} ...")
+
+        # 1. 推理 + 指标 (单次前向传播，返回所有通道)
+        result, metrics = predictor.predict_and_evaluate(sample_idx)
+        predictor.print_metrics(sample_idx, metrics)
+        all_metrics.append(metrics)
+
+        # 2. 对每个 VOF 场分别生成 GIF
+        for field_name, field_idx in predictor.vof_fields:
+            safe_name = field_name.replace(".", "_")
+            gif_path = os.path.join(OUT_DIR, f"interface_s{sample_idx}_{safe_name}.gif")
+            predictor.generate_gif(
+                result,
+                field_name=field_name,
+                field_idx=field_idx,
+                axis=SLICE_AXIS,
+                slice_pos=SLICE_POS,
+                gif_path=gif_path
+            )
+
+    # 3. 汇总
+    predictor.print_summary(all_metrics)

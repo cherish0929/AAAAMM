@@ -21,8 +21,11 @@ import os
 import time
 import copy
 import math
+import traceback
+import sys
 from pathlib import Path
 from datetime import datetime
+from tqdm import tqdm
 
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -34,6 +37,43 @@ from src.dataset_2d import AeroGtoDataset2D
 from src.dataset_cut_fast import CutAeroGtoDataset
 from src.train import train, validate, get_train_loss, _init_region_agg, _accumulate_region, _finalize_region
 from src.utils import set_seed, init_weights, parse_args, load_json_config
+
+
+# =============================================================================
+# Error logging helpers
+# =============================================================================
+
+def _write_error(path_record, args_name, exc, context="", config_path=""):
+    """Write exception info to both training_log.txt and a dedicated bug.txt."""
+    timestamp = time.asctime(time.localtime(time.time()))
+    tb_str = traceback.format_exc()
+
+    # ---- training_log.txt (brief) ----
+    try:
+        log_path = f"{path_record}/{args_name}_training_log.txt"
+        with open(log_path, "a") as f:
+            f.write(f"\n{'='*20} ERROR {'='*20}\n")
+            f.write(f"Time: {timestamp}\n")
+            if context:
+                f.write(f"Context: {context}\n")
+            f.write(f"{tb_str}\n")
+    except Exception:
+        pass  # avoid recursive error
+
+    # ---- bug.txt (detailed) ----
+    try:
+        bug_path = f"{path_record}/bug.txt"
+        with open(bug_path, "a") as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"Time      : {timestamp}\n")
+            f.write(f"Config    : {config_path}\n")
+            f.write(f"Run name  : {args_name}\n")
+            if context:
+                f.write(f"Context   : {context}\n")
+            f.write(f"Exception : {type(exc).__name__}: {exc}\n")
+            f.write(f"Traceback :\n{tb_str}\n")
+    except Exception:
+        pass
 
 
 # =============================================================================
@@ -167,7 +207,8 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
     normalizer.to(device)
     scaler = GradScaler('cuda') if use_amp else None
 
-    from tqdm import tqdm
+    _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3")
+
     pbar = tqdm(train_dataloader, desc="  Train(PF)", unit="bt", leave=True, ncols=120, colour='cyan')
 
     for batch in pbar:
@@ -176,7 +217,7 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
         node_pos = batch["node_pos"].to(device)
         edges = batch["edges"].to(device)
         time_seq_cpu = batch["time_seq"]     # [B, T, 1] — stay on CPU until T_pf known
-        if model_name == "PhysGTO_v2":
+        if _use_spatial:
             spatial_inform = batch["spatial_inform"].to(device)
         conditions = batch["conditions"].to(device).float()
         if weight_loss.get("gradient", False):
@@ -202,7 +243,7 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
 
         if use_amp:
             with autocast(device_type="cuda", dtype=torch.bfloat16):
-                if model_name == "PhysGTO_v2":
+                if _use_spatial:
                     predict_hat = model.autoregressive(
                         state[:, 0], node_pos, edges, time_seq[:, :T_pf], spatial_inform, conditions, dt, check_point)
                 else:
@@ -249,9 +290,9 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
             if ema is not None:
                 ema.update(model)
         else:
-            if model_name == "PhysGTO_v2":
+            if _use_spatial:
                 predict_hat = model.autoregressive(
-                state[:, 0], node_pos, edges, time_seq[:, :T_pf], spatial_inform, conditions, dt, check_point
+                    state[:, 0], node_pos, edges, time_seq[:, :T_pf], spatial_inform, conditions, dt, check_point
                 )
             else:
                 predict_hat = model.autoregressive(
@@ -330,7 +371,6 @@ def train_pushforward(args, model, train_dataloader, optim, device, normalizer, 
 def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None):
     """train() with configurable grad_loss_weight instead of hardcoded 8.0"""
     from torch.amp import GradScaler, autocast
-    from tqdm import tqdm
 
     horizon = args.data.get("horizon_train", 1) if isinstance(args.data, dict) else getattr(args, "horizon_train", 1)
     fields = args.data.get("fields", ["T"])
@@ -357,6 +397,8 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
     normalizer.to(device)
     scaler = GradScaler('cuda') if use_amp else None
 
+    _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3")
+
     pbar = tqdm(train_dataloader, desc="  Train", unit="bt", leave=True, ncols=120, colour='green')
     for batch in pbar:
         dt = batch['dt'].to(device)
@@ -364,7 +406,7 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
         node_pos = batch["node_pos"].to(device)
         edges = batch["edges"].to(device)
         time_seq = batch["time_seq"][:, :horizon].to(device)
-        if model_name == "PhysGTO_v2":
+        if _use_spatial:
             spatial_inform = batch["spatial_inform"].to(device)
         conditions = batch["conditions"].to(device).float()
         if weight_loss.get("gradient", False):
@@ -381,7 +423,7 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
 
         if use_amp:
             with autocast(device_type="cuda", dtype=torch.bfloat16):
-                if model_name == "PhysGTO_v2":
+                if _use_spatial:
                     predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point)
                 else:
                     predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
@@ -414,7 +456,7 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
             if ema is not None:
                 ema.update(model)
         else:
-            if model_name == "PhysGTO_v2":
+            if _use_spatial:
                 predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point)
             else:
                 predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
@@ -580,6 +622,8 @@ def get_model(args, device, cond_dim, default_dt):
         from src.physgto_attnres_multi_v2 import Model
     elif model_name == "gto_res_attnres":
         from src.physgto_res_attnres import Model
+    elif model_name == "gto_attnres_multi_v3":
+        from src.physgto_attnres_multi_v3 import Model
 
     common_kwargs = dict(
         space_size=model_cfg.get("space_size", 3),
@@ -594,12 +638,19 @@ def get_model(args, device, cond_dim, default_dt):
         dt=model_cfg.get("dt", default_dt),
     )
 
-    if model_name in ("gto_attnres_multi", "gto_attnres_multi_v2", "gto_res_attnres"):
+    if model_name in ("gto_attnres_multi", "gto_attnres_multi_v2", "gto_res_attnres", "gto_attnres_multi_v3"):
         common_kwargs["n_fields"] = model_cfg.get("n_fields", model_cfg.get("in_dim", 2))
         common_kwargs["cross_attn_heads"] = model_cfg.get("cross_attn_heads", 4)
 
     if model_name in ("gto_attnres_multi_v2", "gto_res_attnres"):
         common_kwargs["attn_res_mode"] = model_cfg.get("attn_res_mode", "block_inter")
+
+    if model_name in ("PhysGTO_v2", "gto_attnres_multi_v3"):
+        common_kwargs["spatial_dim"] = model_cfg.get("spatial_dim", 10)
+        common_kwargs["pos_x_boost"] = model_cfg.get("pos_x_boost", 2)
+
+    if model_name == "gto_attnres_multi_v3":
+        common_kwargs["n_latent"] = model_cfg.get("n_latent", 4)
 
     model = Model(**common_kwargs).to(device)
 
@@ -623,7 +674,7 @@ def get_model(args, device, cond_dim, default_dt):
 # Main training loop
 # =============================================================================
 
-def main(args, path_logs, path_nn, path_record):
+def main(args, path_logs, path_nn, path_record, config_path=""):
 
     device_str = args.device
     if "cuda" in device_str and not torch.cuda.is_available():
@@ -741,16 +792,34 @@ def main(args, path_logs, path_nn, path_record):
             use_pushforward = True
 
         # Train
-        if use_pushforward:
-            train_error = train_pushforward(
-                args, model, train_dataloader, optimizer, device, normalizer,
-                extra_steps=pf_extra, ema=ema
-            )
-        else:
-            train_error = train_v2(
-                args, model, train_dataloader, optimizer, device, normalizer,
-                ema=ema
-            )
+        try:
+            if use_pushforward:
+                train_error = train_pushforward(
+                    args, model, train_dataloader, optimizer, device, normalizer,
+                    extra_steps=pf_extra, ema=ema
+                )
+            else:
+                train_error = train_v2(
+                    args, model, train_dataloader, optimizer, device, normalizer,
+                    ema=ema
+                )
+        except torch.cuda.OutOfMemoryError as e:
+            torch.cuda.empty_cache()
+            _write_error(path_record, args.name, e,
+                         context=f"train epoch {epoch + 1}/{EPOCH} — CUDA OOM (fatal, stopping)",
+                         config_path=config_path)
+            print(f"[FATAL OOM] Epoch {epoch + 1}: CUDA out of memory. Training stopped.")
+            print(f"Error details saved to: {path_record}/{args.name}_training_log.txt")
+            print(f"Full bug report saved to: {path_record}/bug.txt")
+            writer.close()
+            return
+        except Exception as e:
+            _write_error(path_record, args.name, e,
+                         context=f"train epoch {epoch + 1}/{EPOCH}",
+                         config_path=config_path)
+            print(f"[ERROR] Epoch {epoch + 1} training failed: {e}. Skipping epoch.")
+            scheduler.step()
+            continue
 
         end_time = time.time()
 
@@ -834,12 +903,32 @@ def main(args, path_logs, path_nn, path_record):
         if (epoch + 1) % eval_every == 0 or epoch == 0 or (epoch + 1) == EPOCH:
             start_time = time.time()
 
-            # Apply EMA weights for evaluation
-            torch.cuda.empty_cache()
-            ema.apply_shadow(model)
-            test_error = validate(args, model, test_dataloader, device, normalizer, epoch + 1)
-            ema.restore(model)
-            torch.cuda.empty_cache()
+            try:
+                # Apply EMA weights for evaluation
+                torch.cuda.empty_cache()
+                ema.apply_shadow(model)
+                test_error = validate(args, model, test_dataloader, device, normalizer, epoch + 1)
+                ema.restore(model)
+                torch.cuda.empty_cache()
+            except torch.cuda.OutOfMemoryError as e:
+                ema.restore(model)
+                torch.cuda.empty_cache()
+                _write_error(path_record, args.name, e,
+                             context=f"validate epoch {epoch + 1}/{EPOCH} — CUDA OOM (fatal, stopping)",
+                             config_path=config_path)
+                print(f"[FATAL OOM] Epoch {epoch + 1} validation: CUDA out of memory. Training stopped.")
+                print(f"Error details saved to: {path_record}/{args.name}_training_log.txt")
+                print(f"Full bug report saved to: {path_record}/bug.txt")
+                writer.close()
+                return
+            except Exception as e:
+                ema.restore(model)
+                torch.cuda.empty_cache()
+                _write_error(path_record, args.name, e,
+                             context=f"validate epoch {epoch + 1}/{EPOCH}",
+                             config_path=config_path)
+                print(f"[ERROR] Epoch {epoch + 1} validation failed: {e}. Skipping validation.")
+                continue
 
             end_time = time.time()
             val_time = (end_time - start_time)
@@ -950,7 +1039,16 @@ if __name__ == "__main__":
     if args.seed is not None:
         set_seed(args.seed)
 
-    main(args, path_logs, path_nn, path_record)
-
-    with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
-        file.write(f"time is {time.asctime(time.localtime(time.time()))}\n")
+    try:
+        main(args, path_logs, path_nn, path_record, config_path=cli_args.config)
+    except Exception as e:
+        _write_error(path_record, args.name, e,
+                     context="main training loop (fatal crash)",
+                     config_path=cli_args.config)
+        print(f"[FATAL ERROR] Training crashed: {e}")
+        print(f"Error details saved to: {path_record}/{args.name}_training_log.txt")
+        print(f"Full bug report saved to: {path_record}/bug.txt")
+        raise
+    finally:
+        with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
+            file.write(f"time is {time.asctime(time.localtime(time.time()))}\n")
