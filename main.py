@@ -124,6 +124,7 @@ def get_model(args, device, cond_dim, default_dt):
             n_token=model_cfg.get("n_token", 64),
             dt=model_cfg.get("dt", default_dt),
             adaptive_cfg=adaptive_cfg,
+            fields=args.data.get("fields", []),
         ).to(device)
     else:
         if model_name == "PhysGTO":

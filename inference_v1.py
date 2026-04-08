@@ -38,6 +38,7 @@ class AeroGtoPredictor:
         print("[Init] Loading Train Dataset (for Normalizer)...")
         # 即使是 inference，通常也需要 TrainSet 的统计数据来做 Normalizer
         train_dataset = AeroGtoDataset(
+            data_cfg=data_cfg,
             file_list=data_cfg["train_list"],
             mode="train",
             fields=data_cfg.get("fields", ["T"]),
@@ -52,6 +53,7 @@ class AeroGtoPredictor:
 
         if mode == "test":
             self.dataset = AeroGtoDataset(
+                data_cfg=data_cfg,
                 file_list=self.args.data["test_list"],
                 mode="test",
                 fields=self.args.data.get("fields", ["T"]),
@@ -529,7 +531,7 @@ if __name__ == "__main__":
     MODE = "test"
     NAME = "config/aerogto_HR_easypool_v0.json"
     # === 配置区域 ===
-    CONFIG_PATH = f"config/aerogto_large_patch_version_velocity.json" 
+    CONFIG_PATH = f"config/adaptive_graph_compressed.json" 
     
     FIELD_TO_PLOT = None   # ["T", "Ux", "Uy", "Uz", "alpha.air", "alpha.titanium", "gamma_liquid"] 
     SLICE_AXIS = "z"        # 'x', 'y', 'z'

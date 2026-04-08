@@ -50,6 +50,7 @@ class AdaptiveModel(nn.Module):
         n_token: int = 128,
         dt: float = 0.05,
         adaptive_cfg: Optional[dict] = None,
+        fields: Optional[List[str]] = None,
     ):
         super().__init__()
 
@@ -68,6 +69,7 @@ class AdaptiveModel(nn.Module):
         self.dt_default = dt
         self.pos_enc_dim = pos_enc_dim
         self.adaptive_cfg = adaptive_cfg or {}
+        self.fields = fields or []
 
     # ------------------------------------------------------------------
     # Single-step forward on an *arbitrary* sub-graph
@@ -157,6 +159,7 @@ class AdaptiveModel(nn.Module):
             fullres_pos=fp,
             fullres_grid_shape=fr_shape,
             device=device,
+            fields=self.fields,
         )
 
         # --- delayed writeback config ---

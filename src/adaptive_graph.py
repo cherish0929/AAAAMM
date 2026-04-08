@@ -43,14 +43,14 @@ def compute_active_score(
     temporal_weight: float = 0.3,
     physics_weight: float = 0.2,
     gt_blend: float = 1.0,
-    physics_triggers: Optional[Dict] = None,
+    physics_triggers: Optional[List] = None,
 ) -> torch.Tensor:
     """Per-node activity score in [0, 1].
 
     Composed of three terms (all normalized to [0,1] before blending):
       a) spatial gradient   regular-grid 6-neighbor finite difference
       b) temporal change    |field_t - field_{t-1}|
-      c) physics triggers   per-channel thresholding (e.g. high T, velocity mag)
+      c) physics triggers   per-channel range thresholding
 
     Uses regular cubic grid finite-difference instead of KNN gradient,
     exploiting the structured-grid nature of LPBF data.
@@ -60,9 +60,8 @@ def compute_active_score(
         gt_field:    [N, C] ground-truth state (normalized), or None.
         prev_field:  [N, C] previous-step state (normalized).
         grid_shape:  (nx, ny, nz) of the full-resolution structured grid.
-        physics_triggers: dict mapping channel_index -> threshold, e.g.
-            {0: 0.8, 3: 0.5}.  A node scores 1 for a channel if its
-            normalized value exceeds the threshold.
+        physics_triggers: list of parsed trigger dicts, each with keys
+            'ch_idx', 'norm_min', 'norm_max' (in normalized space).
     """
     if gt_field is not None and gt_blend > 0.0:
         field = gt_blend * gt_field + (1.0 - gt_blend) * pred_field
@@ -143,14 +142,14 @@ def _grid_finite_difference_gradient(
 
 def _physics_trigger_score(
     field: torch.Tensor,
-    triggers: Optional[Dict],
+    triggers: Optional[List],
 ) -> torch.Tensor:
     """Per-node physics-based trigger score in [0, 1].
 
-    Each trigger maps a channel index to a threshold.  If the node's
-    normalized value for that channel exceeds the threshold, that
-    channel contributes 1.0; otherwise 0.0.  The final score is
-    the max across triggered channels (any-of semantics).
+    Each trigger specifies a channel index, a value range (norm_min, norm_max)
+    in normalized space, and an optional weight.  A node scores `weight` for a
+    channel if its value falls within the range; otherwise 0.0.
+    The final score is the weighted sum across all triggers, clamped to [0, 1].
 
     If no triggers are configured, returns zeros (neutral contribution).
     """
@@ -160,15 +159,24 @@ def _physics_trigger_score(
         return torch.zeros(N, device=device)
 
     score = torch.zeros(N, device=device)
-    for ch_idx, threshold in triggers.items():
-        ch_idx = int(ch_idx)
-        if ch_idx < field.shape[-1]:
-            # use abs value so both positive/negative extremes trigger
-            ch_val = field[:, ch_idx].abs()
-            ch_norm = _safe_minmax(ch_val)
-            triggered = (ch_norm >= threshold).float()
-            score = torch.max(score, triggered)
-    return score
+    for trig in triggers:
+        ch_idx = trig["ch_idx"]
+        if ch_idx >= field.shape[-1]:
+            continue
+        ch_val = field[:, ch_idx]
+        lo = trig.get("norm_min")
+        hi = trig.get("norm_max")
+        weight = trig.get("weight", 1.0)
+        if lo is not None and hi is not None:
+            triggered = ((ch_val >= lo) & (ch_val <= hi)).float()
+        elif lo is not None:
+            triggered = (ch_val >= lo).float()
+        elif hi is not None:
+            triggered = (ch_val <= hi).float()
+        else:
+            continue
+        score = score + weight * triggered
+    return score.clamp(0.0, 1.0)
 
 
 def _safe_minmax(x: torch.Tensor) -> torch.Tensor:
@@ -444,13 +452,12 @@ def _build_stencil_edges_impl(
         nb_flat = nb_z * (nx * ny) + nb_y * nx + nb_x
         nb_flat = nb_flat.clamp(0, N_full - 1)
 
-        nb_local = full_to_local[nb_flat]
+        nb_local = full_to_local[nb_flat] # [n_zone, K]
         in_selected = (nb_local >= 0) & valid
 
         if compressed:
             # --- Compressed mode: per-zone neighbor budget ---
             if zone_val == 2:  # core
-                # Keep base 6-neighbors unconditionally, sample extras up to budget
                 in_selected = _budget_sample_neighbors(
                     local_ids, sel_x, sel_y, sel_z, off_t, base6_off_t,
                     in_selected, nb_local, core_max_neighbors, nx, ny, nz,
@@ -463,7 +470,6 @@ def _build_stencil_edges_impl(
                     N_full, full_to_local, device,
                 )
             elif zone_val == 0:  # background
-                # Random drop from 6-neighbors
                 if bg_keep_ratio < 1.0 and in_selected.any():
                     drop_mask = torch.rand(in_selected.shape, device=device) > bg_keep_ratio
                     in_selected = in_selected & (~drop_mask)
@@ -531,11 +537,31 @@ def _budget_sample_neighbors(
     base6_mask = is_base6.unsqueeze(0).expand(n_zone, -1)
     extra_mask = ~base6_mask
 
-    # base-6 edges (always keep)
+    # base-6 edges (candidates)
     base_edges = in_selected & base6_mask
 
     # count base-6 per node
     base_count = base_edges.sum(dim=1)  # [n_zone]
+
+    # If base-6 edges already exceed max_neighbors, sample base-6 too
+    base_over_budget = base_count > max_neighbors
+    if base_over_budget.any():
+        rand_base = torch.rand(n_zone, K_full, device=device)
+        rand_base[~base_edges] = -1.0
+        over_ids = torch.where(base_over_budget)[0]
+        for idx in over_ids:
+            b = max_neighbors
+            row_cands = base_edges[idx]
+            cand_indices = torch.where(row_cands)[0]
+            if cand_indices.numel() > b:
+                cand_scores = rand_base[idx][cand_indices]
+                _, topk_local = cand_scores.topk(b)
+                keep_set = cand_indices[topk_local]
+                new_row = torch.zeros(K_full, dtype=torch.bool, device=device)
+                new_row[keep_set] = True
+                base_edges[idx] = new_row
+        # Recount after trimming
+        base_count = base_edges.sum(dim=1)
 
     # extra candidates
     extra_candidates = in_selected & extra_mask
@@ -642,6 +668,76 @@ def enforce_edge_budget(
     keep_idx = keep_idx.sort().values  # maintain order
 
     return edges[keep_idx]
+
+
+def enforce_per_node_degree(
+    edges: torch.Tensor,
+    zone_labels_selected: torch.Tensor,
+    core_max_degree: int = 8,
+    ring_max_degree: int = 6,
+    bg_max_degree: int = 6,
+    num_nodes: int = 0,
+) -> torch.Tensor:
+    """Enforce strict per-node degree limits by zone.
+
+    For each node whose total degree (counting both directions of each
+    canonical edge) exceeds its zone's limit, randomly drop edges until
+    the degree is within budget.  Higher-zone edges are preferentially kept.
+
+    Args:
+        edges:                [E, 2] canonical edges (src < dst).
+        zone_labels_selected: [N_sel] zone labels for the selected nodes.
+        core_max_degree:      max edges per core node.
+        ring_max_degree:      max edges per ring node.
+        bg_max_degree:        max edges per background node.
+        num_nodes:            number of selected nodes.
+
+    Returns:
+        trimmed: [E', 2] edges respecting per-node degree limits.
+    """
+    if edges.numel() == 0 or num_nodes == 0:
+        return edges
+
+    device = edges.device
+    N = num_nodes
+    E = edges.shape[0]
+
+    # Build per-node degree budget
+    max_deg = torch.full((N,), bg_max_degree, dtype=torch.long, device=device)
+    max_deg[zone_labels_selected == 1] = ring_max_degree
+    max_deg[zone_labels_selected == 2] = core_max_degree
+
+    # Compute current degree (each canonical edge contributes 1 to each endpoint)
+    degree = torch.zeros(N, dtype=torch.long, device=device)
+    degree.scatter_add_(0, edges[:, 0], torch.ones(E, dtype=torch.long, device=device))
+    degree.scatter_add_(0, edges[:, 1], torch.ones(E, dtype=torch.long, device=device))
+
+    over_budget = degree > max_deg
+    if not over_budget.any():
+        return edges
+
+    # For nodes over budget, we need to drop edges.
+    # Strategy: assign each edge a priority (higher zone = keep), break ties randomly.
+    # Then iteratively mark edges for removal starting from lowest priority.
+    src_zone = zone_labels_selected[edges[:, 0]]
+    dst_zone = zone_labels_selected[edges[:, 1]]
+    edge_importance = (src_zone + dst_zone).float() + torch.rand(E, device=device) * 0.9
+
+    # Sort edges by importance ascending (least important first for potential removal)
+    sorted_idx = edge_importance.argsort()
+
+    keep_mask = torch.ones(E, dtype=torch.bool, device=device)
+    cur_degree = degree.clone()
+
+    for ei in sorted_idx:
+        s, d = int(edges[ei, 0].item()), int(edges[ei, 1].item())
+        # Drop this edge if either endpoint is still over budget
+        if cur_degree[s] > max_deg[s] or cur_degree[d] > max_deg[d]:
+            keep_mask[ei] = False
+            cur_degree[s] -= 1
+            cur_degree[d] -= 1
+
+    return edges[keep_mask]
 
 
 # ===================================================================
@@ -803,6 +899,7 @@ class AdaptiveGraphManager:
         fullres_pos: torch.Tensor,
         fullres_grid_shape: Tuple[int, int, int],
         device: torch.device,
+        fields: Optional[List[str]] = None,
     ):
         self.cfg = cfg
         self.device = device
@@ -842,18 +939,98 @@ class AdaptiveGraphManager:
         self.compress_cfg = cfg.get("compression", {})
 
         # physics trigger config: parse from active_zone config
+        self._fields = fields or []
         self._physics_triggers = self._parse_physics_triggers()
 
-    def _parse_physics_triggers(self) -> Optional[Dict]:
+    def _parse_physics_triggers(self) -> Optional[List[Dict]]:
         """Parse physics_triggers from config.
 
-        Format in JSON: {"physics_triggers": {"0": 0.8, "1": 0.5}}
-        channel_index -> threshold.
+        New list format (supports per-field weights):
+            {"physics_triggers": {
+                "field":     ["T", "alpha.air"],
+                "threshold": [800, [0.4, 0.6]],
+                "weight":    [0.5, 1.0]
+            }}
+          - threshold: scalar → >= value; [min, max] → range trigger.
+          - weight: contribution of each trigger to the final score.
+            Scores are summed and clamped to [0, 1].
+
+        Legacy dict format (still supported, all weights default to 1.0):
+            {"physics_triggers": {"T": 800, "alpha.air": {"min": 0.4, "max": 0.6}}}
+
+        All threshold values are raw physical quantities; they are converted to
+        normalized space using field_stats (mean, std).
         """
         raw = self.az_cfg.get("physics_triggers", None)
-        if raw and isinstance(raw, dict):
-            return {int(k): float(v) for k, v in raw.items() if not k.startswith("_")}
-        return None
+        if not raw or not isinstance(raw, dict):
+            return None
+
+        fields = self._fields
+        if not fields:
+            return None
+
+        # per-field normalization stats (mean, std) — same as dataset
+        field_stats = {
+            "T":              (5.2999e+02, 4.5454e+02),
+            "Ux":             (4.0041e-05, 2.4173e-01),
+            "Uy":             (-1.6900e-05, 2.5172e-01),
+            "Uz":             (3.3602e-07, 1.1976e-01),
+            "alpha.air":      (0, 1),
+            "alpha.titanium": (0, 1),
+            "gamma_liquid":   (0, 1),
+        }
+
+        def _normalize(v, mean, std):
+            return (v - mean) / std if std != 0 else v - mean
+
+        triggers = []
+
+        # ---- new list format ----
+        if "field" in raw and "threshold" in raw:
+            field_list = raw["field"]
+            thresh_list = raw["threshold"]
+            weight_list = raw.get("weight", [1.0] * len(field_list))
+
+            for fname, thresh, w in zip(field_list, thresh_list, weight_list):
+                if fname not in fields:
+                    continue
+                ch_idx = fields.index(fname)
+                mean, std = field_stats.get(fname, (0, 1))
+
+                trig = {"ch_idx": ch_idx, "weight": float(w)}
+                if isinstance(thresh, (list, tuple)):
+                    trig["norm_min"] = _normalize(float(thresh[0]), mean, std)
+                    trig["norm_max"] = _normalize(float(thresh[1]), mean, std)
+                else:
+                    trig["norm_min"] = _normalize(float(thresh), mean, std)
+                triggers.append(trig)
+
+        # ---- legacy dict format ----
+        else:
+            for key, val in raw.items():
+                if key.startswith("_"):
+                    continue
+                if key in fields:
+                    ch_idx = fields.index(key)
+                elif key.isdigit():
+                    ch_idx = int(key)
+                else:
+                    continue
+
+                field_name = fields[ch_idx] if ch_idx < len(fields) else None
+                mean, std = field_stats.get(field_name, (0, 1)) if field_name else (0, 1)
+
+                trig = {"ch_idx": ch_idx, "weight": 1.0}
+                if isinstance(val, dict):
+                    if "min" in val:
+                        trig["norm_min"] = _normalize(float(val["min"]), mean, std)
+                    if "max" in val:
+                        trig["norm_max"] = _normalize(float(val["max"]), mean, std)
+                else:
+                    trig["norm_min"] = _normalize(float(val), mean, std)
+                triggers.append(trig)
+
+        return triggers if triggers else None
 
     # ---- refresh logic -----------------------------------------------
 
@@ -984,15 +1161,23 @@ class AdaptiveGraphManager:
                 num_nodes=selected.shape[0],
             )
 
+        # Step 6b: enforce strict per-node degree limits (compressed mode)
+        if use_compressed and all_edges.numel() > 0:
+            sel_zone = zone[selected]
+            all_edges = enforce_per_node_degree(
+                edges=all_edges,
+                zone_labels_selected=sel_zone,
+                core_max_degree=self.compress_cfg.get("core_max_neighbors", 12),
+                ring_max_degree=self.compress_cfg.get("ring_max_neighbors", 8),
+                bg_max_degree=int(6 * self.compress_cfg.get("bg_edge_keep_ratio", 0.7)),
+                num_nodes=selected.shape[0],
+            )
+
         # Step 7: remove isolated nodes (nodes with no edges)
         if all_edges.numel() > 0 and selected.shape[0] > 0:
             connected = torch.zeros(selected.shape[0], dtype=torch.bool, device=self.device)
             connected[all_edges[:, 0]] = True
             connected[all_edges[:, 1]] = True
-
-            # always keep backbone nodes even if isolated (they're the reference layer)
-            is_bb = self.backbone_mask[selected]
-            connected = connected | is_bb
 
             if not connected.all():
                 # remap
