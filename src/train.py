@@ -629,6 +629,7 @@ def validate(args, model, val_dataloader, device, normalizer, epoch):
     fields = args.data.get("fields", ["T"])
     use_amp, check_point = args.train.get("use_amp", False), args.train.get("check_point", False)
     model_name = args.model.get("name", "PhysGTO")
+    _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3")
     agg = {}
     for key in ["L2", "mean_l2", "RMSE"]:
         if key == "L2" or key == "RMSE":
@@ -656,7 +657,7 @@ def validate(args, model, val_dataloader, device, normalizer, epoch):
             node_pos = batch["node_pos"].to(device)
             edges = batch["edges"].to(device)
             time_seq = batch["time_seq"].to(device)
-            if model_name == "PhysGTO_v2":
+            if _use_spatial:
                 spatial_inform = batch["spatial_inform"].to(device)
             conditions = batch["conditions"].to(device).float()
 
@@ -671,13 +672,13 @@ def validate(args, model, val_dataloader, device, normalizer, epoch):
 
             if use_amp:
                 with autocast("cuda", dtype=torch.bfloat16):
-                    if model_name == "PhysGTO_v2":
+                    if _use_spatial:
                         predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point)
                     else:
                         predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
                     costs = get_val_loss(fields, predict_hat, state[:, 1:], normalizer, active_mask=active_mask)
             else:
-                if model_name == "PhysGTO_v2":
+                if _use_spatial:
                     predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point)
                 else:
                     predict_hat = model.autoregressive(state[:, 0], node_pos, edges, time_seq, conditions, dt, check_point)
