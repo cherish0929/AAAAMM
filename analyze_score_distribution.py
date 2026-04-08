@@ -37,6 +37,7 @@ sys.path.insert(0, str(PROJ_ROOT))
 
 from src.adaptive_graph import (
     _grid_finite_difference_gradient,
+    _log_percentile_normalize,
     _physics_trigger_score,
     _safe_minmax,
     AdaptiveGraphManager,
@@ -82,11 +83,11 @@ def decompose_score(
 
     # a) spatial gradient
     spatial_raw = _grid_finite_difference_gradient(field, grid_shape)
-    spatial_norm = _safe_minmax(spatial_raw)
+    spatial_norm = _log_percentile_normalize(spatial_raw)
 
     # b) temporal change
     temporal_raw = (field - prev_field).abs().mean(dim=-1)
-    temporal_norm = _safe_minmax(temporal_raw)
+    temporal_norm = _log_percentile_normalize(temporal_raw)
 
     # c) physics trigger
     physics = _physics_trigger_score(field, physics_triggers)

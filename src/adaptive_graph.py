@@ -80,8 +80,8 @@ def compute_active_score(
     physics_score = _physics_trigger_score(field, physics_triggers)
 
     # normalize each to [0, 1]
-    spatial_grad = _safe_minmax(spatial_grad)
-    temporal_change = _safe_minmax(temporal_change)
+    spatial_grad = _log_percentile_normalize(spatial_grad)
+    temporal_change = _log_percentile_normalize(temporal_change)
     # physics_score is already in [0, 1]
 
     score = (gradient_weight * spatial_grad
@@ -186,6 +186,29 @@ def _safe_minmax(x: torch.Tensor) -> torch.Tensor:
     if rng < 1e-12:
         return torch.zeros_like(x)
     return (x - xmin) / rng
+
+
+def _log_percentile_normalize(
+    x: torch.Tensor,
+    lo_pct: float = 0.0,
+    hi_pct: float = 98.0,
+) -> torch.Tensor:
+    """Log-transform then percentile-clip min-max normalization.
+
+    1. log1p transform to compress the long tail
+    2. Clip to [lo_percentile, hi_percentile] to remove outliers
+    3. Min-max normalize the clipped range to [0, 1]
+
+    Designed for gradient/temporal scores that are heavily right-skewed.
+    """
+    x = torch.log1p(x)  # x must be >= 0 (gradient magnitude / abs change)
+    lo = torch.quantile(x, lo_pct / 100.0)
+    hi = torch.quantile(x, hi_pct / 100.0)
+    x = x.clamp(lo, hi)
+    rng = hi - lo
+    if rng < 1e-12:
+        return torch.zeros_like(x)
+    return (x - lo) / rng
 
 
 # ===================================================================
