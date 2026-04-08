@@ -677,12 +677,16 @@ def enforce_per_node_degree(
     ring_max_degree: int = 6,
     bg_max_degree: int = 6,
     num_nodes: int = 0,
+    selected_indices: Optional[torch.Tensor] = None,
+    grid_shape: Optional[Tuple[int, int, int]] = None,
 ) -> torch.Tensor:
     """Enforce strict per-node degree limits by zone.
 
-    For each node whose total degree (counting both directions of each
-    canonical edge) exceeds its zone's limit, randomly drop edges until
-    the degree is within budget.  Higher-zone edges are preferentially kept.
+    For each node whose total degree exceeds its zone's limit, drop edges
+    with the following priority (highest kept, lowest dropped first):
+      1. base-6 (face-adjacent) edges         — highest priority
+      2. edges where the other endpoint has a higher zone value
+      3. random tiebreaker
 
     Args:
         edges:                [E, 2] canonical edges (src < dst).
@@ -691,6 +695,8 @@ def enforce_per_node_degree(
         ring_max_degree:      max edges per ring node.
         bg_max_degree:        max edges per background node.
         num_nodes:            number of selected nodes.
+        selected_indices:     [N_sel] full-grid flat indices (needed for base6 detection).
+        grid_shape:           (nx, ny, nz) of the full grid (needed for base6 detection).
 
     Returns:
         trimmed: [E', 2] edges respecting per-node degree limits.
@@ -707,7 +713,7 @@ def enforce_per_node_degree(
     max_deg[zone_labels_selected == 1] = ring_max_degree
     max_deg[zone_labels_selected == 2] = core_max_degree
 
-    # Compute current degree (each canonical edge contributes 1 to each endpoint)
+    # Compute current degree
     degree = torch.zeros(N, dtype=torch.long, device=device)
     degree.scatter_add_(0, edges[:, 0], torch.ones(E, dtype=torch.long, device=device))
     degree.scatter_add_(0, edges[:, 1], torch.ones(E, dtype=torch.long, device=device))
@@ -716,22 +722,38 @@ def enforce_per_node_degree(
     if not over_budget.any():
         return edges
 
-    # For nodes over budget, we need to drop edges.
-    # Strategy: assign each edge a priority (higher zone = keep), break ties randomly.
-    # Then iteratively mark edges for removal starting from lowest priority.
-    src_zone = zone_labels_selected[edges[:, 0]]
-    dst_zone = zone_labels_selected[edges[:, 1]]
-    edge_importance = (src_zone + dst_zone).float() + torch.rand(E, device=device) * 0.9
+    # --- Edge priority scoring ---
+    # Component 1: base-6 bonus (face-adjacent in grid = Manhattan distance 1)
+    base6_bonus = torch.zeros(E, device=device)
+    if selected_indices is not None and grid_shape is not None:
+        nx, ny, nz = grid_shape
+        src_full = selected_indices[edges[:, 0]]
+        dst_full = selected_indices[edges[:, 1]]
+        sx = src_full % nx;           dx = dst_full % nx
+        sy = (src_full // nx) % ny;   dy = (dst_full // nx) % ny
+        sz = src_full // (nx * ny);   dz = dst_full // (nx * ny)
+        manhattan = (sx - dx).abs() + (sy - dy).abs() + (sz - dz).abs()
+        base6_bonus[manhattan == 1] = 4.0  # strong bonus for face-adjacent
 
-    # Sort edges by importance ascending (least important first for potential removal)
-    sorted_idx = edge_importance.argsort()
+    # Component 2: other-endpoint zone value (higher zone neighbor = more useful)
+    src_zone = zone_labels_selected[edges[:, 0]].float()
+    dst_zone = zone_labels_selected[edges[:, 1]].float()
+    neighbor_zone_bonus = (src_zone + dst_zone)  # 0~4
+
+    # Component 3: random tiebreaker
+    rand_jitter = torch.rand(E, device=device) * 0.9
+
+    # Total priority: higher = keep
+    edge_priority = base6_bonus + neighbor_zone_bonus + rand_jitter
+
+    # Sort edges by priority ascending (drop lowest first)
+    sorted_idx = edge_priority.argsort()
 
     keep_mask = torch.ones(E, dtype=torch.bool, device=device)
     cur_degree = degree.clone()
 
     for ei in sorted_idx:
         s, d = int(edges[ei, 0].item()), int(edges[ei, 1].item())
-        # Drop this edge if either endpoint is still over budget
         if cur_degree[s] > max_deg[s] or cur_degree[d] > max_deg[d]:
             keep_mask[ei] = False
             cur_degree[s] -= 1
@@ -752,15 +774,16 @@ def build_cross_layer_edges(
     backbone_stride: Tuple[int, int, int],
     grid_shape: Tuple[int, int, int],
     full_to_local: torch.Tensor,
+    backbone_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Build cross-layer edges between fine (core/ring) nodes and their
     coarse backbone parent cells using regular-grid parent-child mapping.
 
+    Only connects fine nodes to backbone parent nodes (not fine→fine).
+
     For each fine node at (x,y,z), its parent backbone node is at
     (x // sx, y // sy, z // sz) * stride.  We connect the fine node to
     the nearest backbone node(s) using the stride relationship.
-
-    This replaces the old KNN-based cross edges.
 
     Returns:
         edges: [E, 2] in local indexing (within selected_indices).
@@ -785,7 +808,6 @@ def build_cross_layer_edges(
     fine_z = fine_full // (nx * ny)
 
     # parent backbone coordinates (nearest coarse grid node)
-    # round to nearest stride multiple
     parent_x = ((fine_x + sx // 2) // sx * sx).clamp(0, nx - 1)
     parent_y = ((fine_y + sy // 2) // sy * sy).clamp(0, ny - 1)
     parent_z = ((fine_z + sz // 2) // sz * sz).clamp(0, nz - 1)
@@ -796,8 +818,13 @@ def build_cross_layer_edges(
     parent_local = full_to_local[parent_flat]
     valid = (parent_local >= 0)
 
-    # also avoid self-loops
+    # avoid self-loops
     valid = valid & (fine_local != parent_local)
+
+    # ensure parent is actually a backbone node (not a fine node)
+    if backbone_mask is not None:
+        parent_is_bb = backbone_mask[parent_flat]
+        valid = valid & parent_is_bb
 
     if not valid.any():
         return torch.zeros((0, 2), dtype=torch.long, device=device)
@@ -1094,9 +1121,8 @@ class AdaptiveGraphManager:
             bg_backbone_keep_ratio=self.az_cfg.get("bg_backbone_keep_ratio", 1.0),
         )
 
-        # Step 4: build edges
+        # Step 4: build intra-layer stencil edges
         if use_compressed:
-            # Compressed stencil edges with per-zone neighbor budgets
             intra_edges = build_stencil_edges_compressed(
                 selected_indices=selected,
                 zone_labels=zone,
@@ -1117,7 +1143,37 @@ class AdaptiveGraphManager:
                 core_stencil=self.edge_cfg.get("core_stencil", 26),
             )
 
-        # Step 5: cross-layer edges (fine→coarse parent-child mapping)
+        all_edges = intra_edges if intra_edges.numel() > 0 else \
+            torch.zeros((0, 2), dtype=torch.long, device=self.device)
+
+        # Step 5: enforce global edge budget on intra edges (compressed mode)
+        if use_compressed and all_edges.numel() > 0:
+            sel_zone = zone[selected]
+            max_edges_ratio = self.compress_cfg.get("max_edges_ratio", 4.0)
+            all_edges = enforce_edge_budget(
+                edges=all_edges,
+                zone_labels_selected=sel_zone,
+                max_edges_ratio=max_edges_ratio,
+                num_nodes=selected.shape[0],
+            )
+
+        # Step 6: enforce strict per-node degree limits on intra edges
+        #         (base6-aware: face-adjacent edges are preferentially kept)
+        if use_compressed and all_edges.numel() > 0:
+            sel_zone = zone[selected]
+            all_edges = enforce_per_node_degree(
+                edges=all_edges,
+                zone_labels_selected=sel_zone,
+                core_max_degree=self.compress_cfg.get("core_max_neighbors", 12),
+                ring_max_degree=self.compress_cfg.get("ring_max_neighbors", 8),
+                bg_max_degree=max(1, int(6 * self.compress_cfg.get("bg_edge_keep_ratio", 0.7))),
+                num_nodes=selected.shape[0],
+                selected_indices=selected,
+                grid_shape=self.fullres_grid_shape,
+            )
+
+        # Step 7: append cross-layer edges AFTER degree truncation
+        #         (fine→backbone only, not fine→fine)
         N_full = self.n_full
         full_to_local = torch.full((N_full,), -1, dtype=torch.long, device=self.device)
         full_to_local[selected] = torch.arange(selected.shape[0], device=self.device)
@@ -1129,49 +1185,16 @@ class AdaptiveGraphManager:
             backbone_stride=self.backbone_stride,
             grid_shape=self.fullres_grid_shape,
             full_to_local=full_to_local,
+            backbone_mask=self.backbone_mask,
         )
 
-        # Combine intra + cross edges
-        edge_parts = []
-        if intra_edges.numel() > 0:
-            edge_parts.append(intra_edges)
         if cross_edges.numel() > 0:
             if use_compressed:
-                # Canonicalize cross edges too
                 cross_edges = canonicalize_and_dedup_edges(cross_edges)
-            edge_parts.append(cross_edges)
-
-        if edge_parts:
+            edge_parts = [all_edges, cross_edges] if all_edges.numel() > 0 else [cross_edges]
             all_edges = torch.cat(edge_parts, dim=0)
             if use_compressed:
-                # Final global dedup (intra already deduped, cross already deduped,
-                # but there may be overlap between them)
                 all_edges = canonicalize_and_dedup_edges(all_edges)
-        else:
-            all_edges = torch.zeros((0, 2), dtype=torch.long, device=self.device)
-
-        # Step 6: enforce global edge budget (compressed mode only)
-        if use_compressed and all_edges.numel() > 0:
-            sel_zone = zone[selected]
-            max_edges_ratio = self.compress_cfg.get("max_edges_ratio", 4.0)
-            all_edges = enforce_edge_budget(
-                edges=all_edges,
-                zone_labels_selected=sel_zone,
-                max_edges_ratio=max_edges_ratio,
-                num_nodes=selected.shape[0],
-            )
-
-        # Step 6b: enforce strict per-node degree limits (compressed mode)
-        if use_compressed and all_edges.numel() > 0:
-            sel_zone = zone[selected]
-            all_edges = enforce_per_node_degree(
-                edges=all_edges,
-                zone_labels_selected=sel_zone,
-                core_max_degree=self.compress_cfg.get("core_max_neighbors", 12),
-                ring_max_degree=self.compress_cfg.get("ring_max_neighbors", 8),
-                bg_max_degree=int(6 * self.compress_cfg.get("bg_edge_keep_ratio", 0.7)),
-                num_nodes=selected.shape[0],
-            )
 
         # Step 7: remove isolated nodes (nodes with no edges)
         if all_edges.numel() > 0 and selected.shape[0] > 0:

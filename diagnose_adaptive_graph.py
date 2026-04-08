@@ -219,7 +219,35 @@ def diagnose_single_sample(
                     core_stencil=edge_cfg.get("core_stencil", 26),
                 )
 
-        # Step 5: Cross-layer edges
+        all_edges = intra_edges if intra_edges.numel() > 0 else \
+            torch.zeros((0, 2), dtype=torch.long, device=device)
+
+        # Step 5: enforce global edge budget on intra edges (compressed mode)
+        if use_compressed and all_edges.numel() > 0:
+            sel_zone_for_budget = zone[selected]
+            max_edges_ratio = compress_cfg.get("max_edges_ratio", 4.0)
+            all_edges = enforce_edge_budget(
+                edges=all_edges,
+                zone_labels_selected=sel_zone_for_budget,
+                max_edges_ratio=max_edges_ratio,
+                num_nodes=selected.shape[0],
+            )
+
+        # Step 5b: enforce per-node degree limits on intra edges (compressed mode)
+        if use_compressed and all_edges.numel() > 0:
+            sel_zone_for_deg = zone[selected]
+            all_edges = enforce_per_node_degree(
+                edges=all_edges,
+                zone_labels_selected=sel_zone_for_deg,
+                core_max_degree=compress_cfg.get("core_max_neighbors", 12),
+                ring_max_degree=compress_cfg.get("ring_max_neighbors", 8),
+                bg_max_degree=max(1, int(6 * compress_cfg.get("bg_edge_keep_ratio", 0.7))),
+                num_nodes=selected.shape[0],
+                selected_indices=selected,
+                grid_shape=fr_shape,
+            )
+
+        # Step 6: Cross-layer edges (fine→backbone only, appended AFTER degree truncation)
         N_full_int = mgr.n_full
         full_to_local = torch.full((N_full_int,), -1, dtype=torch.long, device=device)
         full_to_local[selected] = torch.arange(selected.shape[0], device=device)
@@ -233,46 +261,16 @@ def diagnose_single_sample(
                 backbone_stride=mgr.backbone_stride,
                 grid_shape=fr_shape,
                 full_to_local=full_to_local,
+                backbone_mask=mgr.backbone_mask,
             )
 
-        # Combine edges (with compression pipeline if enabled)
-        edge_parts = []
-        if intra_edges.numel() > 0:
-            edge_parts.append(intra_edges)
         if cross_edges.numel() > 0:
             if use_compressed:
                 cross_edges = canonicalize_and_dedup_edges(cross_edges)
-            edge_parts.append(cross_edges)
-
-        if edge_parts:
+            edge_parts = [all_edges, cross_edges] if all_edges.numel() > 0 else [cross_edges]
             all_edges = torch.cat(edge_parts, dim=0)
             if use_compressed:
                 all_edges = canonicalize_and_dedup_edges(all_edges)
-        else:
-            all_edges = torch.zeros((0, 2), dtype=torch.long, device=device)
-
-        # Enforce global edge budget (compressed mode)
-        if use_compressed and all_edges.numel() > 0:
-            sel_zone_for_budget = zone[selected]
-            max_edges_ratio = compress_cfg.get("max_edges_ratio", 4.0)
-            all_edges = enforce_edge_budget(
-                edges=all_edges,
-                zone_labels_selected=sel_zone_for_budget,
-                max_edges_ratio=max_edges_ratio,
-                num_nodes=selected.shape[0],
-            )
-
-        # Enforce per-node degree limits (compressed mode)
-        if use_compressed and all_edges.numel() > 0:
-            sel_zone_for_deg = zone[selected]
-            all_edges = enforce_per_node_degree(
-                edges=all_edges,
-                zone_labels_selected=sel_zone_for_deg,
-                core_max_degree=compress_cfg.get("core_max_neighbors", 12),
-                ring_max_degree=compress_cfg.get("ring_max_neighbors", 8),
-                bg_max_degree=int(6 * compress_cfg.get("bg_edge_keep_ratio", 0.7)),
-                num_nodes=selected.shape[0],
-            )
 
         # ---- Collect statistics ----
         N_sel = selected.shape[0]
