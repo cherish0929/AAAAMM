@@ -465,6 +465,11 @@ def train_v2(args, model, train_dataloader, optim, device, normalizer, ema=None)
         pbar.set_postfix({"Loss": f"{avg_loss:.4e}"})
 
     from src.train import _REGION_PREFIXES, _REGION_MEANS
+    if agg["num"] == 0:
+        raise RuntimeError(
+            "train_v2: all batches were skipped (NaN/spike guard triggered every batch). "
+            "Loss is NaN or Inf — check for gradient explosion or bad input data."
+        )
     for key, value in agg.items():
         if key != "each_l2" and key != "num" and not key.endswith("_cnt"):
             if key not in ("active_loss", "inactive_loss") and key not in _REGION_MEANS and not any(key.startswith(p + "_") for p in _REGION_PREFIXES):

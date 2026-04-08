@@ -24,25 +24,12 @@ from src.train import validate
 # >>> 在这里填写需要评估的 config 路径 <<<
 # ============================================================
 CONFIG_LIST = [
-    "config/history/aerogto_large_patch_version_easypool.json",
-    "config/history/aerogto_large_patch_easypool_res.json",
-    "config/history/lnn_large_patch_easypool.json",
-    "config/history/config_0319/aerogto_weighted_loss.json",
-    "config/history/config_0319/gto_res_weight_loss.json",
-    "config/history/config_0320/gto_res_cut_all_weighted_use_amp_checkpoint.json",
-    "config/history/aerogto_cut_easypool_relative_scale.json",
-    "config/history/aerogto_cut_easypool_use_amp_check.json",
-    "config/history/config_0326/physgto_weight_loss_easypool_v3.json",
-    "config/history/config_attnres/gto_attnres_multi_keyhole.json",
-    "config/history/config_attnres/gto_attnres_cut_easypool.json",
-    "config/config_0401/main1_multi1_easypool.json",
-    "config/config_0402/main2_multi1_easypool.json",
-    "config/config_0403/main2_multi1_easypool_grad.json",
-    "config/config_0403/main2_multi1_easypool_air.json",
-    "config/config_0403/main2_multi1_easypool_airti.json",
-    "config/config_0403/main2_multi1_easypool_T.json"
-    "config/config_alpha_air/easypool_air_3-7_enhanced.json"
-    "config/config_alpha_air/easypool_air_3-7.json"
+    "config/easypool/GTO_easypool.json",
+    "config/easypool/GTO_easypool_stronger.json",
+    "config/easypool/GTO_attnres_easypool.json",
+    "config/easypool/GTO_attnres_easypool_stronger.json",
+    "config/easypool/cut_GTO_easypool.json",
+    "config/easypool/cut_GTO_attnres_easypool.json"
 ]
 
 
@@ -425,7 +412,7 @@ def main():
     device = torch.device(device_str)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_path = f"result/evaluate_report_{timestamp}.txt"
+    report_path = f"result_easypool/evaluate/report_{timestamp}.txt"
     logger = DualLogger(report_path)
 
     logger.log(f"{'#'*70}")
