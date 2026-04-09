@@ -106,6 +106,8 @@ def _build_model(model_cfg, cond_dim, default_dt, device):
 
     if model_name == "PhysGTO":
         from src.physgto import Model
+    elif model_name == "PhysGTO_v2":
+        from src.physgto_v2 import Model
     elif model_name == "gto_res":
         from src.physgto_res import Model
     elif model_name == "gto_lnn":
@@ -116,6 +118,8 @@ def _build_model(model_cfg, cond_dim, default_dt, device):
         from src.physgto_attnres_multi_v2 import Model
     elif model_name == "gto_res_attnres":
         from src.physgto_res_attnres import Model
+    elif model_name == "gto_attnres_multi_v3":
+        from src.physgto_attnres_multi_v3 import Model
     else:
         raise ValueError(f"Unknown model name: {model_name}")
 
@@ -132,12 +136,19 @@ def _build_model(model_cfg, cond_dim, default_dt, device):
         dt=model_cfg.get("dt", default_dt),
     )
 
-    if model_name in ("gto_attnres_multi", "gto_attnres_multi_v2", "gto_res_attnres"):
+    if model_name in ("gto_attnres_multi", "gto_attnres_multi_v2", "gto_res_attnres", "gto_attnres_multi_v3"):
         kwargs["n_fields"] = model_cfg.get("n_fields", model_cfg.get("in_dim", 2))
         kwargs["cross_attn_heads"] = model_cfg.get("cross_attn_heads", 4)
 
     if model_name in ("gto_attnres_multi_v2", "gto_res_attnres"):
         kwargs["attn_res_mode"] = model_cfg.get("attn_res_mode", "block_inter")
+
+    if model_name in ("PhysGTO_v2", "gto_attnres_multi_v3"):
+        kwargs["spatial_dim"] = model_cfg.get("spatial_dim", 10)
+        kwargs["pos_x_boost"] = model_cfg.get("pos_x_boost", 2)
+
+    if model_name == "gto_attnres_multi_v3":
+        kwargs["n_latent"] = model_cfg.get("n_latent", 4)
 
     return Model(**kwargs).to(device)
 
@@ -237,6 +248,7 @@ class AirFieldPredictor:
         metrics["per_field"] 为每个 VOF 场的详细指标。
         """
         sample = self.dataset[sample_idx]
+        model_name = self.args.model.get("name", "PhysGTO")
         use_amp = self.args.train.get("use_amp", False)
         check_point = self.args.train.get("check_point", False)
 
@@ -245,6 +257,9 @@ class AirFieldPredictor:
         edges = sample["edges"].unsqueeze(0).to(self.device)
         time_seq = sample["time_seq"].unsqueeze(0).to(self.device)
         conditions = sample["conditions"].unsqueeze(0).to(self.device).float()
+        _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3")
+        if _use_spatial:
+            spatial_inform = sample["spatial_inform"].unsqueeze(0).to(self.device)
         dt = sample["dt"]
 
         state_0 = state_seq[:, 0]
@@ -253,11 +268,19 @@ class AirFieldPredictor:
         with torch.no_grad():
             if use_amp:
                 with autocast("cuda", dtype=torch.bfloat16):
+                    if _use_spatial:
+                        pred_seq = self.model.autoregressive(
+                            state_0, node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point=check_point)
+                    else:
+                        pred_seq = self.model.autoregressive(
+                            state_0, node_pos, edges, time_seq, conditions, dt, check_point=check_point)
+            else:
+                if _use_spatial:
+                    pred_seq = self.model.autoregressive(
+                        state_0, node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point=check_point)
+                else:
                     pred_seq = self.model.autoregressive(
                         state_0, node_pos, edges, time_seq, conditions, dt, check_point=check_point)
-            else:
-                pred_seq = self.model.autoregressive(
-                    state_0, node_pos, edges, time_seq, conditions, dt, check_point=check_point)
 
             pred_real = self.normalizer.denormalize(pred_seq)
             gt_real = self.normalizer.denormalize(gt_seq)
@@ -314,25 +337,34 @@ class AirFieldPredictor:
 
         return result, metrics
 
-    def print_metrics(self, sample_idx, metrics):
-        """打印单个样本的详细指标 (支持多 VOF 场)"""
-        print(f"\n{'='*60}")
-        print(f"  Sample {sample_idx} -- Metrics Summary")
-        print(f"{'='*60}")
-        print(f"  MSE (norm):        {metrics['MSE_normalized']:.4e}")
+    def print_metrics(self, sample_idx, metrics, out_dir=None):
+        """打印单个样本的详细指标，并可选同步写入 out_dir/metrics_sample{idx}.txt"""
+        lines = []
+        lines.append(f"\n{'='*60}")
+        lines.append(f"  Sample {sample_idx} -- Metrics Summary")
+        lines.append(f"{'='*60}")
+        lines.append(f"  MSE (norm):        {metrics['MSE_normalized']:.4e}")
 
         for field_name, fm in metrics["per_field"].items():
-            print(f"\n  --- {field_name} ---")
-            print(f"  Relative L2:       {fm['relative_L2']:.4e}")
-            print(f"  RMSE:              {fm['RMSE']:.4e}")
-            print(f"  Mean IoU:          {fm['mean_IoU']:.4f}")
-            print(f"  Mean Dice:         {fm['mean_Dice']:.4f}")
-            print(f"  Mean Band MAE:     {fm['mean_band_MAE']:.4e}")
-            print(f"  Per-step L2:       {[f'{v:.4e}' for v in fm['each_step_L2']]}")
-            print(f"  Per-step IoU:      {[f'{v:.4f}' for v in fm['IoU_per_step']]}")
-            print(f"  Per-step Dice:     {[f'{v:.4f}' for v in fm['Dice_per_step']]}")
-            print(f"  Per-step BandMAE:  {[f'{v:.4e}' for v in fm['band_MAE_per_step']]}")
-        print(f"{'='*60}\n")
+            lines.append(f"\n  --- {field_name} ---")
+            lines.append(f"  Relative L2:       {fm['relative_L2']:.4e}")
+            lines.append(f"  RMSE:              {fm['RMSE']:.4e}")
+            lines.append(f"  Mean IoU:          {fm['mean_IoU']:.4f}")
+            lines.append(f"  Mean Dice:         {fm['mean_Dice']:.4f}")
+            lines.append(f"  Mean Band MAE:     {fm['mean_band_MAE']:.4e}")
+            lines.append(f"  Per-step L2:       {[f'{v:.4e}' for v in fm['each_step_L2']]}")
+            lines.append(f"  Per-step IoU:      {[f'{v:.4f}' for v in fm['IoU_per_step']]}")
+            lines.append(f"  Per-step Dice:     {[f'{v:.4f}' for v in fm['Dice_per_step']]}")
+            lines.append(f"  Per-step BandMAE:  {[f'{v:.4e}' for v in fm['band_MAE_per_step']]}")
+        lines.append(f"{'='*60}")
+
+        text = "\n".join(lines)
+        print(text)
+        if out_dir is not None:
+            txt_path = os.path.join(out_dir, f"metrics_sample{sample_idx}.txt")
+            with open(txt_path, "w") as f:
+                f.write(text + "\n")
+            print(f"[Saved] {txt_path}")
 
     # ──────────────────────────────
     #  切片辅助
@@ -613,27 +645,34 @@ class AirFieldPredictor:
     #  汇总多样本指标
     # ──────────────────────────────
 
-    def print_summary(self, all_metrics):
-        """汇总打印多个样本的平均指标 (按 VOF 场分别汇总)"""
+    def print_summary(self, all_metrics, out_dir=None):
+        """汇总打印多个样本的平均指标，并可选同步写入 out_dir/metrics_summary.txt"""
         n = len(all_metrics)
-        print(f"\n{'#'*60}")
-        print(f"  SUMMARY over {n} samples")
-        print(f"{'#'*60}")
+        lines = []
+        lines.append(f"\n{'#'*60}")
+        lines.append(f"  SUMMARY over {n} samples")
+        lines.append(f"{'#'*60}")
 
-        # 全局指标
         mse_vals = [m["MSE_normalized"] for m in all_metrics]
-        print(f"  {'MSE_normalized':20s}:  mean={np.mean(mse_vals):.4e}  std={np.std(mse_vals):.4e}")
+        lines.append(f"  {'MSE_normalized':20s}:  mean={np.mean(mse_vals):.4e}  std={np.std(mse_vals):.4e}")
 
-        # 逐 VOF 场指标
         field_names = list(all_metrics[0]["per_field"].keys())
         metric_keys = ["relative_L2", "RMSE", "mean_IoU", "mean_Dice", "mean_band_MAE"]
         for fname in field_names:
-            print(f"\n  --- {fname} ---")
+            lines.append(f"\n  --- {fname} ---")
             for k in metric_keys:
                 vals = [m["per_field"][fname][k] for m in all_metrics]
-                print(f"    {k:20s}:  mean={np.mean(vals):.4e}  std={np.std(vals):.4e}  "
-                      f"min={np.min(vals):.4e}  max={np.max(vals):.4e}")
-        print(f"{'#'*60}\n")
+                lines.append(f"    {k:20s}:  mean={np.mean(vals):.4e}  std={np.std(vals):.4e}  "
+                             f"min={np.min(vals):.4e}  max={np.max(vals):.4e}")
+        lines.append(f"{'#'*60}")
+
+        text = "\n".join(lines)
+        print(text)
+        if out_dir is not None:
+            txt_path = os.path.join(out_dir, "metrics_summary.txt")
+            with open(txt_path, "w") as f:
+                f.write(text + "\n")
+            print(f"[Saved] {txt_path}")
 
 
 # ════════════════════════════════════════════
@@ -642,47 +681,60 @@ class AirFieldPredictor:
 
 if __name__ == "__main__":
     MODE = "test"
-    CONFIG_PATH = "config/config_alpha_air/easypool_air_3-7_enhanced.json"
+    # CONFIG_PATH = "config/config_alpha_air/easypool_air_3-7_enhanced.json"
+    # CONFIG_PATH 也可以是 list，依次处理多个配置：
+    CONFIG_PATH = [
+        "config/easypool/GTO_easypool.json",
+        "config/easypool/GTO_easypool_stronger.json",
+        "config/easypool/GTO_attnres_easypool.json",
+        "config/easypool/GTO_attnres_easypool_stronger.json",
+        "config/easypool/GTO_2_easypool_stronger.json",
+        "config/easypool/GTO_attnres_3_easypool_stronger.json"
+    ]
+
     SLICE_AXIS = "z"
     SLICE_POS = None
-    NUM_SAMPLES = 3  # 随机选取的样本数
+    NUM_SAMPLES = 3  # 每个 config 随机推理的样本数
 
-    try:
-        predictor = AirFieldPredictor(CONFIG_PATH, MODE)
-        OUT_DIR = f"result_air/interface_eval/{predictor.args.name}/{MODE}"
-        os.makedirs(OUT_DIR, exist_ok=True)
-    except Exception as e:
-        print(f"Init failed: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    cfg_list = CONFIG_PATH if isinstance(CONFIG_PATH, list) else [CONFIG_PATH]
 
-    dataset_length = len(predictor.dataset)
-    print(f"Dataset size: {dataset_length}")
+    for cfg_path in cfg_list:
+        try:
+            predictor = AirFieldPredictor(cfg_path, MODE)
+            OUT_DIR = f"result_easypool/inference_air/{predictor.args.name}/{MODE}"
+            os.makedirs(OUT_DIR, exist_ok=True)
+        except Exception as e:
+            print(f"Init failed: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
 
-    sample_idxs = random.sample(range(dataset_length), min(NUM_SAMPLES, dataset_length))
-    all_metrics = []
+        dataset_length = len(predictor.dataset)
+        print(f"Dataset size: {dataset_length}")
 
-    for sample_idx in sample_idxs:
-        print(f"\n>>> Inference on sample {sample_idx} ...")
+        sample_idxs = random.sample(range(dataset_length), min(NUM_SAMPLES, dataset_length))
+        all_metrics = []
 
-        # 1. 推理 + 指标 (单次前向传播，返回所有通道)
-        result, metrics = predictor.predict_and_evaluate(sample_idx)
-        predictor.print_metrics(sample_idx, metrics)
-        all_metrics.append(metrics)
+        for sample_idx in sample_idxs:
+            print(f"\n>>> Inference on sample {sample_idx} ...")
 
-        # 2. 对每个 VOF 场分别生成 GIF
-        for field_name, field_idx in predictor.vof_fields:
-            safe_name = field_name.replace(".", "_")
-            gif_path = os.path.join(OUT_DIR, f"interface_s{sample_idx}_{safe_name}.gif")
-            predictor.generate_gif(
-                result,
-                field_name=field_name,
-                field_idx=field_idx,
-                axis=SLICE_AXIS,
-                slice_pos=SLICE_POS,
-                gif_path=gif_path
-            )
+            # 1. 推理 + 指标
+            result, metrics = predictor.predict_and_evaluate(sample_idx)
+            predictor.print_metrics(sample_idx, metrics, out_dir=OUT_DIR)
+            all_metrics.append(metrics)
 
-    # 3. 汇总
-    predictor.print_summary(all_metrics)
+            # 2. 对每个 VOF 场分别生成 GIF
+            for field_name, field_idx in predictor.vof_fields:
+                safe_name = field_name.replace(".", "_")
+                gif_path = os.path.join(OUT_DIR, f"interface_s{sample_idx}_{safe_name}.gif")
+                predictor.generate_gif(
+                    result,
+                    field_name=field_name,
+                    field_idx=field_idx,
+                    axis=SLICE_AXIS,
+                    slice_pos=SLICE_POS,
+                    gif_path=gif_path
+                )
+
+        # 3. 汇总
+        predictor.print_summary(all_metrics, out_dir=OUT_DIR)

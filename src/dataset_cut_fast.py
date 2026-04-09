@@ -230,6 +230,7 @@ class CutAeroGtoDataset(Dataset):
         mode: str = "train",
         mat_data=None,
         margin: int = 4,
+        spatial_stride=None
     ):
         super().__init__()
         data_cfg = args.data
@@ -241,7 +242,10 @@ class CutAeroGtoDataset(Dataset):
         self.horizon = data_cfg.get(f"horizon_{mode}", 1)
         self.pf_extra = data_cfg.get("horizon_pf_extra", 0) if mode == "train" else 0
         self.time_stride = data_cfg.get("time_stride", 1)
-        self.spatial_stride = _normalize_stride(data_cfg.get("spatial_stride", 1))
+        if mode == "test" and spatial_stride is not None:
+            self.spatial_stride = _normalize_stride(spatial_stride)
+        else:
+            self.spatial_stride = _normalize_stride(data_cfg.get("spatial_stride", 1))
         self.normalize = data_cfg.get("normalize", True)
         self.mat_mean_and_std = mat_data
         self.samples_per_file = data_cfg.get("samples_per_file", 32)

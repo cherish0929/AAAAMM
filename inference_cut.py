@@ -12,7 +12,7 @@ from pathlib import Path
 import h5py
 from torch.amp import GradScaler, autocast # 引入 AMP 模块
 # 引入项目模块
-from src.dataset_cut import CutAeroGtoDataset
+from src.dataset_cut_fast import CutAeroGtoDataset
 from src.utils import load_json_config, set_seed
 
 
@@ -22,6 +22,8 @@ def _build_model(model_cfg, cond_dim, default_dt, device):
 
     if model_name == "PhysGTO":
         from src.physgto import Model
+    elif model_name == "PhysGTO_v2":
+        from src.physgto_v2 import Model
     elif model_name == "gto_res":
         from src.physgto_res import Model
     elif model_name == "gto_lnn":
@@ -32,6 +34,8 @@ def _build_model(model_cfg, cond_dim, default_dt, device):
         from src.physgto_attnres_multi_v2 import Model
     elif model_name == "gto_res_attnres":
         from src.physgto_res_attnres import Model
+    elif model_name == "gto_attnres_multi_v3":
+        from src.physgto_attnres_multi_v3 import Model
     else:
         raise ValueError(f"Unknown model name: {model_name}")
 
@@ -49,12 +53,19 @@ def _build_model(model_cfg, cond_dim, default_dt, device):
     )
 
     # AttnRes 系列需要额外参数
-    if model_name in ("gto_attnres_multi", "gto_attnres_multi_v2", "gto_res_attnres"):
+    if model_name in ("gto_attnres_multi", "gto_attnres_multi_v2", "gto_res_attnres", "gto_attnres_multi_v3"):
         kwargs["n_fields"] = model_cfg.get("n_fields", model_cfg.get("in_dim", 2))
         kwargs["cross_attn_heads"] = model_cfg.get("cross_attn_heads", 4)
 
     if model_name in ("gto_attnres_multi_v2", "gto_res_attnres"):
         kwargs["attn_res_mode"] = model_cfg.get("attn_res_mode", "block_inter")
+
+    if model_name in ("PhysGTO_v2", "gto_attnres_multi_v3"):
+        kwargs["spatial_dim"] = model_cfg.get("spatial_dim", 10)
+        kwargs["pos_x_boost"] = model_cfg.get("pos_x_boost", 2)
+
+    if model_name == "gto_attnres_multi_v3":
+        kwargs["n_latent"] = model_cfg.get("n_latent", 4)
 
     return Model(**kwargs).to(device)
 
@@ -83,7 +94,7 @@ class AeroGtoPredictor:
             mode="train")
 
         if mode == "test":
-            test_dataset = CutAeroGtoDataset(
+            self.dataset = CutAeroGtoDataset(
                 args=self.args,
                 mode="test",
                 mat_data=train_dataset.mat_mean_and_std if train_dataset.normalize else None
@@ -171,30 +182,39 @@ class AeroGtoPredictor:
         执行自回归预测，并准备绘图所需的所有数据
         """
         sample = self.dataset[sample_idx]
+        model_name = self.args.model.get("name", "PhysGTO")
         use_amp, check_point = self.args.train.get("use_amp", False), self.args.train.get("check_point", False)
         # 增加 Batch 维度并移至 GPU
         state_seq = sample["state"].unsqueeze(0).to(self.device)
         node_pos = sample["node_pos"].unsqueeze(0).to(self.device)
         edges = sample["edges"].unsqueeze(0).to(self.device)
-        time_seq = sample["time_seq"].unsqueeze(0).to(self.device) 
+        time_seq = sample["time_seq"].unsqueeze(0).to(self.device)
+        _use_spatial = model_name in ("PhysGTO_v2", "gto_attnres_multi_v3")
+        if _use_spatial:
+            spatial_inform = sample["spatial_inform"].unsqueeze(0).to(self.device)
         conditions = sample["conditions"].unsqueeze(0).to(self.device).float()
-
-        # cond_idx = 50 if len(self.dataset) > 50 else 0
-        # conditions = self.dataset[cond_idx]["conditions"].unsqueeze(0).to(self.device).float()
 
         dt = sample["dt"]
 
-        state_0 = state_seq[:, 0] 
+        state_0 = state_seq[:, 0]
         gt_seq = state_seq[:, 1:]
 
         print(f"[Predict] Running autoregressive inference...")
         with torch.no_grad():
             if use_amp:
                 with autocast("cuda", dtype=torch.bfloat16):
-                    pred_seq = self.model.autoregressive(
-                        state_0, node_pos, edges, time_seq, conditions, dt, check_point=check_point)
+                    if _use_spatial:
+                        pred_seq = self.model.autoregressive(
+                            state_0, node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point=check_point)
+                    else:
+                        pred_seq = self.model.autoregressive(
+                            state_0, node_pos, edges, time_seq, conditions, dt, check_point=check_point)
             else:
-                pred_seq = self.model.autoregressive(
+                if _use_spatial:
+                    pred_seq = self.model.autoregressive(
+                        state_0, node_pos, edges, time_seq, spatial_inform, conditions, dt, check_point=check_point)
+                else:
+                    pred_seq = self.model.autoregressive(
                         state_0, node_pos, edges, time_seq, conditions, dt, check_point=check_point)
 
             pred_real = self.normalizer.denormalize(pred_seq)
@@ -563,68 +583,66 @@ class AeroGtoPredictor:
 
 if __name__ == "__main__":
     MODE = "test"
-    NAME = "config/aerogto_HR_easypool_v0.json"
     # === 配置区域 ===
-    CONFIG_PATH = f"config/aerogto_cut_easypool_relative_scale_res.json" 
-    
-    FIELD_TO_PLOT = None   # ["T", "Ux", "Uy", "Uz", "alpha.air", "alpha.titanium", "gamma_liquid"] 
+    # CONFIG_PATH = "config/easypool/cut_GTO_attnres_3_easypool.json"
+    # CONFIG_PATH 也可以是 list，依次处理多个配置：
+    CONFIG_PATH = [
+        "config/easypool/cut_GTO_easypool.json",
+        "config/easypool/cut_GTO_attnres_easypool.json",
+        "config/easypool/cut_GTO_attnres_3_easypool.json",
+    ]
+
+    FIELD_TO_PLOT = None   # None 表示所有场；或指定如 "T" / "alpha.air"
     SLICE_AXIS = "z"        # 'x', 'y', 'z'
-    SLICE_POS = None        
-    INTERFACE_FIELD = "alpha.air" # 定义用来画分界线的物理场
+    SLICE_POS = None
+    INTERFACE_FIELD = "alpha.air"
+    NUM_SAMPLES = 3  # 每个 config 随机推理的样本数
 
-    try:
-        predictor = AeroGtoPredictor(CONFIG_PATH, MODE)
-        if FIELD_TO_PLOT is None:
-            OUT_DIR = f"result/inference_results/{predictor.args.name}/{MODE}/batch"
-        else:
-            OUT_DIR = f"result/inference_results/{predictor.args.name}/{MODE}/{FIELD_TO_PLOT}"
-        os.makedirs(OUT_DIR, exist_ok=True)
-    except Exception as e:
-        print(f"初始化失败: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-    
-    # SAMPLE_IDX = random.randint(0, len(predictor.dataset)-1)    
-    print(len(predictor.dataset))
-    SAMPLE_IDX = 30
-    # print(predictor.dataset[50]["conditions"])
-    # print(predictor.dataset[55]["conditions"])
-    # exit()
+    cfg_list = CONFIG_PATH if isinstance(CONFIG_PATH, list) else [CONFIG_PATH]
 
-    # 1. 执行推理 (自动获取主物理场和边界场)
-    results = predictor.predict_rollout(sample_idx=SAMPLE_IDX, interface_field=INTERFACE_FIELD)
-    
-    # 2. 生成单帧图片 (例如第 5 步)
-    # for step in range(10):
-    #     # if step < results["pred"].shape[0]:
-    #     save_p = os.path.join(OUT_DIR, f"snapshot_sample{SAMPLE_IDX}_step{step}_{FIELD_TO_PLOT}_{SLICE_AXIS}.png")
-    #     predictor.plot_slice(results, time_step=step, field_name=FIELD_TO_PLOT, axis=SLICE_AXIS, slice_pos=SLICE_POS,
-    #                             vmin=0, vmax=4000, save_path=save_p)
+    for cfg_path in cfg_list:
+        try:
+            predictor = AeroGtoPredictor(cfg_path, MODE)
+            if FIELD_TO_PLOT is None:
+                OUT_DIR = f"result_easypool/inference_cut/{predictor.args.name}/{MODE}/batch"
+            else:
+                OUT_DIR = f"result_easypool/inference_cut/{predictor.args.name}/{MODE}/{FIELD_TO_PLOT}"
+            os.makedirs(OUT_DIR, exist_ok=True)
+        except Exception as e:
+            print(f"初始化失败: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
 
-    # 3. 生成 GIF
-    if FIELD_TO_PLOT is None:
-        for field in predictor.fields:
-            gif_path = os.path.join(OUT_DIR, f"rollout_sample{SAMPLE_IDX}_{field}.gif")
-            # if os.path.exists(gif_path):
-            #     break
-            predictor.generate_gif(
-                results, 
-                field_name=field, 
-                axis=SLICE_AXIS, 
-                slice_pos=SLICE_POS, 
-                git_path=gif_path,
-                interface=False
-            )
-    else:
-        gif_path = os.path.join(OUT_DIR, f"rollout_sample{SAMPLE_IDX}_{FIELD_TO_PLOT}.gif")
-        if os.path.exists(gif_path):
-            exit()
-        predictor.generate_gif(
-            results, 
-            field_name=FIELD_TO_PLOT, 
-            axis=SLICE_AXIS, 
-            slice_pos=SLICE_POS, 
-            git_path=gif_path,
-            interface=False
-        )
+        dataset_length = len(predictor.dataset)
+        print(f"Dataset size: {dataset_length}")
+        sample_idxs = random.sample(range(dataset_length), min(NUM_SAMPLES, dataset_length))
+
+        for sample_idx in sample_idxs:
+            # 1. 执行推理
+            results = predictor.predict_rollout(sample_idx=sample_idx, interface_field=INTERFACE_FIELD)
+
+            # 2. 生成 GIF
+            if FIELD_TO_PLOT is None:
+                for field in predictor.fields:
+                    gif_path = os.path.join(OUT_DIR, f"rollout_sample{sample_idx}_{field}.gif")
+                    predictor.generate_gif(
+                        results,
+                        field_name=field,
+                        axis=SLICE_AXIS,
+                        slice_pos=SLICE_POS,
+                        git_path=gif_path,
+                        interface=False
+                    )
+            else:
+                gif_path = os.path.join(OUT_DIR, f"rollout_sample{sample_idx}_{FIELD_TO_PLOT}.gif")
+                if os.path.exists(gif_path):
+                    continue
+                predictor.generate_gif(
+                    results,
+                    field_name=FIELD_TO_PLOT,
+                    axis=SLICE_AXIS,
+                    slice_pos=SLICE_POS,
+                    git_path=gif_path,
+                    interface=False
+                )
