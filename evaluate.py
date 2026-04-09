@@ -24,12 +24,15 @@ from src.train import validate
 # >>> 在这里填写需要评估的 config 路径 <<<
 # ============================================================
 CONFIG_LIST = [
-    "config/easypool/GTO_easypool.json",
-    "config/easypool/GTO_easypool_stronger.json",
-    "config/easypool/GTO_attnres_easypool.json",
-    "config/easypool/GTO_attnres_easypool_stronger.json",
-    "config/easypool/cut_GTO_easypool.json",
-    "config/easypool/cut_GTO_attnres_easypool.json"
+    # "config/easypool/GTO_easypool.json",
+    # "config/easypool/GTO_easypool_stronger.json",
+    # "config/easypool/GTO_attnres_easypool.json",
+    # "config/easypool/GTO_attnres_easypool_stronger.json",
+    # "config/easypool/cut_GTO_easypool.json",
+    # "config/easypool/cut_GTO_attnres_easypool.json",
+    "config/easypool/GTO_2_easypool_stronger.json",
+    "config/easypool/GTO_attnres_3_easypool_stronger.json",
+    "config/easypool/cut_GTO_attnres_3_easypool.json",
 ]
 
 
@@ -108,6 +111,8 @@ def load_model_and_checkpoint(args, device, cond_dim, default_dt):
 
     if model_name == "PhysGTO":
         from src.physgto import Model
+    elif model_name == "PhysGTO_v2":
+        from src.physgto_v2 import Model
     elif model_name == "gto_res":
         from src.physgto_res import Model
     elif model_name == "gto_lnn":
@@ -118,6 +123,8 @@ def load_model_and_checkpoint(args, device, cond_dim, default_dt):
         from src.physgto_attnres_multi_v2 import Model
     elif model_name == "gto_res_attnres":
         from src.physgto_res_attnres import Model
+    elif model_name == "gto_attnres_multi_v3":
+        from src.physgto_attnres_multi_v3 import Model
     else:
         raise ValueError(f"Unknown model name: {model_name}")
 
@@ -134,12 +141,19 @@ def load_model_and_checkpoint(args, device, cond_dim, default_dt):
         dt=model_cfg.get("dt", default_dt),
     )
 
-    if model_name in ("gto_attnres_multi", "gto_attnres_multi_v2", "gto_res_attnres"):
+    if model_name in ("gto_attnres_multi", "gto_attnres_multi_v2", "gto_res_attnres", "gto_attnres_multi_v3"):
         common_kwargs["n_fields"] = model_cfg.get("n_fields", model_cfg.get("in_dim", 2))
         common_kwargs["cross_attn_heads"] = model_cfg.get("cross_attn_heads", 4)
 
     if model_name in ("gto_attnres_multi_v2", "gto_res_attnres"):
         common_kwargs["attn_res_mode"] = model_cfg.get("attn_res_mode", "block_inter")
+
+    if model_name in ("PhysGTO_v2", "gto_attnres_multi_v3"):
+        common_kwargs["spatial_dim"] = model_cfg.get("spatial_dim", 10)
+        common_kwargs["pos_x_boost"] = model_cfg.get("pos_x_boost", 2)
+
+    if model_name == "gto_attnres_multi_v3":
+        common_kwargs["n_latent"] = model_cfg.get("n_latent", 4)
 
     model = Model(**common_kwargs).to(device)
 

@@ -784,6 +784,26 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
         file.write(f"Pushforward: enable={pf_enable}\n")
         file.write(f"grad_loss_weight: {args.train.get('grad_loss_weight', 8.0)}\n")
 
+    # ---- Early-stop on repeated NaN/skip failures ----
+    consecutive_skip_errors = 0
+    max_consecutive_skip_errors = args.train.get("max_consecutive_errors", 3)
+
+    # ---- Warn if dt is dangerously small for euler + AMP ----
+    model_cfg = args.model
+    train_cfg = args.train
+    if (model_cfg.get("name") == "PhysGTO_v2"
+            and model_cfg.get("stepper_scheme", "euler") == "euler"
+            and train_cfg.get("use_amp", False)
+            and not args.data.get("dt_scale", False)):
+        _warn_msg = (
+            "[WARNING] Potential NaN risk: PhysGTO_v2 with euler stepper + use_amp=True "
+            "but dt_scale=False. Raw physical dt (e.g. 5e-6) forces v_pred to be ~1/dt "
+            "larger, which overflows bfloat16. Consider setting dt_scale=true or use_amp=false."
+        )
+        print(_warn_msg)
+        with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
+            file.write(_warn_msg + "\n")
+
     # ==================== Training Loop ====================
     for epoch in range(start_epoch, EPOCH):
         start_time = time.time()
@@ -818,13 +838,39 @@ def main(args, path_logs, path_nn, path_record, config_path=""):
             print(f"Full bug report saved to: {path_record}/bug.txt")
             writer.close()
             return
+        except RuntimeError as e:
+            _write_error(path_record, args.name, e,
+                         context=f"train epoch {epoch + 1}/{EPOCH}",
+                         config_path=config_path)
+            print(f"[ERROR] Epoch {epoch + 1} training failed: {e}. Skipping epoch.")
+            scheduler.step()
+            # Check if this is a repeated all-batches-skipped error
+            if "all batches were skipped" in str(e):
+                consecutive_skip_errors += 1
+                if consecutive_skip_errors >= max_consecutive_skip_errors:
+                    _fatal_msg = (
+                        f"[FATAL] {consecutive_skip_errors} consecutive epochs with all batches skipped "
+                        f"(NaN/Inf). Training aborted at epoch {epoch + 1}/{EPOCH}. "
+                        f"Check for numerical instability (e.g. dt_scale, use_amp, lr)."
+                    )
+                    print(_fatal_msg)
+                    with open(f"{path_record}/{args.name}_training_log.txt", "a") as file:
+                        file.write(_fatal_msg + "\n")
+                    writer.close()
+                    return
+            else:
+                consecutive_skip_errors = 0
+            continue
         except Exception as e:
             _write_error(path_record, args.name, e,
                          context=f"train epoch {epoch + 1}/{EPOCH}",
                          config_path=config_path)
             print(f"[ERROR] Epoch {epoch + 1} training failed: {e}. Skipping epoch.")
             scheduler.step()
+            consecutive_skip_errors = 0
             continue
+
+        consecutive_skip_errors = 0
 
         end_time = time.time()
 
