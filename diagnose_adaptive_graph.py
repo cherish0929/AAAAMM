@@ -169,11 +169,12 @@ def diagnose_single_sample(
                 gt_field=gt_field,
                 prev_field=prev_state,
                 grid_shape=fr_shape,
-                gradient_weight=az_cfg.get("gradient_weight", 0.5),
-                temporal_weight=az_cfg.get("temporal_weight", 0.3),
-                physics_weight=az_cfg.get("physics_weight", 0.2),
+                fields=fields,
+                T_ref=az_cfg.get("T_ref", 600.0),
+                T_high=az_cfg.get("T_high", 1500.0),
+                interface_bonus=az_cfg.get("interface_bonus", 0.5),
+                air_discount=az_cfg.get("air_discount", 0.5),
                 gt_blend=gt_blend,
-                physics_triggers=mgr._physics_triggers,
             )
 
         # Step 2: Zone classification
@@ -562,7 +563,7 @@ def main():
     print(f"  Backbone stride: {bb_cfg.get('stride', [2,2,2])}")
     print(f"  Refresh K: {ref_cfg.get('refresh_every_K', 4)}")
     print(f"  GT blend: {ref_cfg.get('gt_blend_start', 1.0)} -> {ref_cfg.get('gt_blend_end', 0.0)} over {ref_cfg.get('gt_blend_warmup_epochs', 50)} epochs")
-    print(f"  Score weights: grad={az_cfg.get('gradient_weight', 0.5)}, temp={az_cfg.get('temporal_weight', 0.3)}, phys={az_cfg.get('physics_weight', 0.2)}")
+    print(f"  Score params: T_ref={az_cfg.get('T_ref', 600.0)}, T_high={az_cfg.get('T_high', 1500.0)}, interface_bonus={az_cfg.get('interface_bonus', 0.5)}, air_discount={az_cfg.get('air_discount', 0.5)}")
     print(f"  Thresholds: core>={az_cfg.get('core_threshold', 0.6)}, ring>={az_cfg.get('ring_threshold', 0.2)}")
     print(f"  Keep ratios: core={az_cfg.get('core_keep_ratio', 1.0)}, ring={az_cfg.get('ring_keep_ratio', 0.5)}, bg_extra={az_cfg.get('background_extra_ratio', 0.0)}")
     print(f"  Stencils: bg={edge_cfg.get('bg_stencil', 6)}, ring={edge_cfg.get('ring_stencil', 18)}, core={edge_cfg.get('core_stencil', 26)}")

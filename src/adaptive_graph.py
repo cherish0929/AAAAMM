@@ -31,184 +31,157 @@ import torch.nn.functional as F
 
 
 # ===================================================================
-#  1. Active zone scoring  (规则网格有限差分 + 时间变化 + 物理触发)
+#  1. Active zone scoring  (基于物理量的连续打分: 温度 + 界面)
 # ===================================================================
+
+# Per-field normalization stats (mean, std) — same as dataset
+_FIELD_STATS = {
+    "T":              (5.2999e+02, 4.5454e+02),
+    "Ux":             (4.0041e-05, 2.4173e-01),
+    "Uy":             (-1.6900e-05, 2.5172e-01),
+    "Uz":             (3.3602e-07, 1.1976e-01),
+    "alpha.air":      (0, 1),
+    "alpha.titanium": (0, 1),
+    "gamma_liquid":   (0, 1),
+}
+
 
 def compute_active_score(
     pred_field: torch.Tensor,
     gt_field: Optional[torch.Tensor],
     prev_field: torch.Tensor,
     grid_shape: Tuple[int, int, int],
-    gradient_weight: float = 0.5,
-    temporal_weight: float = 0.3,
-    physics_weight: float = 0.2,
+    fields: Optional[List[str]] = None,
+    field_stats: Optional[Dict] = None,
+    T_ref: float = 600.0,
+    T_high: float = 1500.0,
+    interface_bonus: float = 0.5,
+    air_discount: float = 0.5,
     gt_blend: float = 1.0,
-    physics_triggers: Optional[List] = None,
+    **kwargs,
 ) -> torch.Tensor:
-    """Per-node activity score in [0, 1].
+    """Per-node activity score in [0, 1] based on melt-pool physics.
 
-    Composed of three terms (all normalized to [0,1] before blending):
-      a) spatial gradient   regular-grid 6-neighbor finite difference
-      b) temporal change    |field_t - field_{t-1}|
-      c) physics triggers   per-channel range thresholding
+    Scoring logic:
+      1. Temperature score: smooth ramp from T_ref to T_high → [0, 1].
+      2. Interface bonus: 4*alpha*(1-alpha), peaks at alpha=0.5.
+         Multiplies score by (1 + interface_bonus) at the melt pool interface.
+      3. Air discount: pure gas (alpha >= 0.9) gets its score multiplied by
+         air_discount (< 1), reducing attention to pure gas regions.
 
-    Uses regular cubic grid finite-difference instead of KNN gradient,
-    exploiting the structured-grid nature of LPBF data.
+    Combined: T_score * (1 + interface_bonus*4*a*(1-a)) * air_multiplier
+    where air_multiplier = air_discount for alpha>=0.9, else 1.0.
+
+    Result (at high T):
+      - alpha ≈ 0.5 (interface) → highest score  (melt pool core)
+      - alpha = 0   (solid)     → base score      (hot substrate)
+      - alpha = 1   (gas)       → score * air_discount  (discounted)
+    Result (at low T):
+      - all alpha values         → ~0              (background)
+
+    Fallback: if the field set does not contain both "T" and "alpha.air",
+    uses temporal change |field_t - field_{t-1}| as a simple score.
 
     Args:
-        pred_field:  [N, C] predicted state (normalized).
-        gt_field:    [N, C] ground-truth state (normalized), or None.
-        prev_field:  [N, C] previous-step state (normalized).
-        grid_shape:  (nx, ny, nz) of the full-resolution structured grid.
-        physics_triggers: list of parsed trigger dicts, each with keys
-            'ch_idx', 'norm_min', 'norm_max' (in normalized space).
+        T_ref:           raw temperature (K) below which score ≈ 0.
+        T_high:          raw temperature (K) above which score saturates.
+        interface_bonus: score multiplier bonus for the melt pool interface.
+        air_discount:    score multiplier for pure gas regions (alpha >= 0.9).
+                         Values < 1 reduce gas attention; 0 = ignore gas entirely.
     """
     if gt_field is not None and gt_blend > 0.0:
         field = gt_blend * gt_field + (1.0 - gt_blend) * pred_field
     else:
         field = pred_field
 
-    device = field.device
+    fields = fields or []
+    stats = field_stats or _FIELD_STATS
 
-    # --- a) spatial gradient via regular-grid finite difference ---
-    spatial_grad = _grid_finite_difference_gradient(field, grid_shape)
+    has_T = "T" in fields
+    has_alpha = "alpha.air" in fields
 
-    # --- b) temporal change rate ---
-    temporal_change = (field - prev_field).abs().mean(dim=-1)
-
-    # --- c) physics-trigger score ---
-    physics_score = _physics_trigger_score(field, physics_triggers)
-
-    # normalize each to [0, 1]
-    spatial_grad = _log_percentile_normalize(spatial_grad)
-    temporal_change = _log_percentile_normalize(temporal_change)
-    # physics_score is already in [0, 1]
-
-    score = (gradient_weight * spatial_grad
-             + temporal_weight * temporal_change
-             + physics_weight * physics_score)
-    
-    return score.clamp(0.0, 1.0)
+    if has_T and has_alpha:
+        return _physics_score(field, fields, stats, T_ref, T_high, interface_bonus, air_discount)
+    else:
+        # fallback: temporal change (for non-standard field sets)
+        temporal = (field - prev_field).abs().mean(dim=-1)
+        return _safe_normalize(temporal)
 
 
-def _grid_finite_difference_gradient(
+def _physics_score(
     field: torch.Tensor,
-    grid_shape: Tuple[int, int, int],
+    fields: List[str],
+    stats: Dict,
+    T_ref: float,
+    T_high: float,
+    interface_bonus: float,
+    air_discount: float = 0.5,
 ) -> torch.Tensor:
-    """Approximate spatial gradient magnitude using 6-neighbor stencil on
-    the regular cubic grid (central differences).
+    """Physics-based score using T and alpha.air channels.
 
-    Much faster than KNN-based gradient: O(N) with no distance computation.
+    alpha.air = 0   → solid/liquid substrate (base score, no reduction)
+    alpha.air = 1   → pure gas (score multiplied by air_discount < 1)
+    alpha.air ∈ (0,1) → melt pool interface (highest score via interface_bonus)
 
-    Returns:
-        grad_mag: [N] per-node gradient magnitude.
+    Score = T_score * (1 + interface_bonus * 4*a*(1-a)) * air_multiplier
+    where air_multiplier = air_discount for pure gas (alpha >= 0.9), else 1.0
+
+    At high T:
+      alpha=0   (solid)     → T * 1.0  * 1.0           = T
+      alpha=0.5 (interface) → T * (1 + interface_bonus) * 1.0
+      alpha=1   (gas)       → T * 1.0  * air_discount   = T * air_discount
     """
-    nx, ny, nz = grid_shape
-    C = field.shape[-1]
-    # reshape to (nz, ny, nx, C) matching the flat-index layout:
-    #   flat = z * nx * ny + y * nx + x
-    vol = field.view(nz, ny, nx, C)
+    T_idx = fields.index("T")
+    alpha_idx = fields.index("alpha.air")
 
-    grad_sq = torch.zeros(nz, ny, nx, device=field.device)
+    T_norm = field[:, T_idx]
+    alpha_norm = field[:, alpha_idx]
 
-    # central differences along each axis, forward/backward at boundaries
-    # x-axis (dim=2)
-    if nx > 1:
-        dx = torch.zeros_like(vol)
-        dx[:, :, 1:-1] = (vol[:, :, 2:] - vol[:, :, :-2]) / 2.0
-        dx[:, :, 0] = vol[:, :, 1] - vol[:, :, 0]
-        dx[:, :, -1] = vol[:, :, -1] - vol[:, :, -2]
-        grad_sq += (dx ** 2).sum(dim=-1)
+    T_mean, T_std = stats.get("T", (5.2999e+02, 4.5454e+02))
+    T_ref_norm = (T_ref - T_mean) / T_std if T_std != 0 else T_ref - T_mean
+    T_high_norm = (T_high - T_mean) / T_std if T_std != 0 else T_high - T_mean
 
-    # y-axis (dim=1)
-    if ny > 1:
-        dy = torch.zeros_like(vol)
-        dy[:, 1:-1] = (vol[:, 2:] - vol[:, :-2]) / 2.0
-        dy[:, 0] = vol[:, 1] - vol[:, 0]
-        dy[:, -1] = vol[:, -1] - vol[:, -2]
-        grad_sq += (dy ** 2).sum(dim=-1)
+    # 1) Temperature score: smooth ramp [0, 1]
+    T_score = _smooth_ramp(T_norm, T_ref_norm, T_high_norm)
 
-    # z-axis (dim=0)
-    if nz > 1:
-        dz = torch.zeros_like(vol)
-        dz[1:-1] = (vol[2:] - vol[:-2]) / 2.0
-        dz[0] = vol[1] - vol[0]
-        dz[-1] = vol[-1] - vol[-2]
-        grad_sq += (dz ** 2).sum(dim=-1)
+    alpha_mean, alpha_std = stats.get("alpha.air", (0, 1))
+    alpha_raw = alpha_norm * alpha_std + alpha_mean
+    alpha_raw = alpha_raw.clamp(0.0, 1.0)
 
-    grad_mag = grad_sq.sqrt().view(-1)  # [N]
-    return grad_mag
+    # 2) Interface score: parabola peaking at alpha=0.5
+    interface_score = 4.0 * alpha_raw * (1.0 - alpha_raw)
+
+    # 3) Air discount: pure gas (alpha >= 0.9) gets multiplied by air_discount
+    is_air = (alpha_raw >= 0.9).float()
+    air_multiplier = 1.0 - (1.0 - air_discount) * is_air  # 1.0 normally, air_discount for gas
+
+    # 4) Combined
+    score = T_score * (1.0 + interface_bonus * interface_score) * air_multiplier
+
+    # return score.clamp(0.0, 1.0)
+    return score
 
 
-def _physics_trigger_score(
-    field: torch.Tensor,
-    triggers: Optional[List],
-) -> torch.Tensor:
-    """Per-node physics-based trigger score in [0, 1].
+def _smooth_ramp(x: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
+    """Smooth ramp from 0 to 1 over [lo, hi] using a sigmoid-like curve.
 
-    Each trigger specifies a channel index, a value range (norm_min, norm_max)
-    in normalized space, and an optional weight.  A node scores `weight` for a
-    channel if its value falls within the range; otherwise 0.0.
-    The final score is the weighted sum across all triggers, clamped to [0, 1].
-
-    If no triggers are configured, returns zeros (neutral contribution).
+    Below lo → ~0, above hi → ~1, smooth transition in between.
+    Uses a scaled sigmoid: sigmoid(6 * (x - mid) / (hi - lo)).
     """
-    N = field.shape[0]
-    device = field.device
-    if not triggers:
-        return torch.zeros(N, device=device)
-
-    score = torch.zeros(N, device=device)
-    for trig in triggers:
-        ch_idx = trig["ch_idx"]
-        if ch_idx >= field.shape[-1]:
-            continue
-        ch_val = field[:, ch_idx]
-        lo = trig.get("norm_min")
-        hi = trig.get("norm_max")
-        weight = trig.get("weight", 1.0)
-        if lo is not None and hi is not None:
-            triggered = ((ch_val >= lo) & (ch_val <= hi)).float()
-        elif lo is not None:
-            triggered = (ch_val >= lo).float()
-        elif hi is not None:
-            triggered = (ch_val <= hi).float()
-        else:
-            continue
-        score = score + weight * triggered
-    return score.clamp(0.0, 1.0)
+    if hi - lo < 1e-12:
+        return (x >= lo).float()
+    mid = (lo + hi) / 2.0
+    scale = 6.0 / (hi - lo)  # sigmoid reaches ~0.95 at hi, ~0.05 at lo
+    return torch.sigmoid(scale * (x - mid))
 
 
-def _safe_minmax(x: torch.Tensor) -> torch.Tensor:
+def _safe_normalize(x: torch.Tensor) -> torch.Tensor:
     """Min-max normalize to [0, 1]; returns zeros if range is negligible."""
     xmin, xmax = x.min(), x.max()
     rng = xmax - xmin
     if rng < 1e-12:
         return torch.zeros_like(x)
     return (x - xmin) / rng
-
-
-def _log_percentile_normalize(
-    x: torch.Tensor,
-    lo_pct: float = 0.0,
-    hi_pct: float = 98.0,
-) -> torch.Tensor:
-    """Log-transform then percentile-clip min-max normalization.
-
-    1. log1p transform to compress the long tail
-    2. Clip to [lo_percentile, hi_percentile] to remove outliers
-    3. Min-max normalize the clipped range to [0, 1]
-
-    Designed for gradient/temporal scores that are heavily right-skewed.
-    """
-    x = torch.log1p(x)  # x must be >= 0 (gradient magnitude / abs change)
-    lo = torch.quantile(x, lo_pct / 100.0)
-    hi = torch.quantile(x, hi_pct / 100.0)
-    x = x.clamp(lo, hi)
-    rng = hi - lo
-    if rng < 1e-12:
-        return torch.zeros_like(x)
-    return (x - lo) / rng
 
 
 # ===================================================================
@@ -990,97 +963,6 @@ class AdaptiveGraphManager:
 
         # physics trigger config: parse from active_zone config
         self._fields = fields or []
-        self._physics_triggers = self._parse_physics_triggers()
-
-    def _parse_physics_triggers(self) -> Optional[List[Dict]]:
-        """Parse physics_triggers from config.
-
-        New list format (supports per-field weights):
-            {"physics_triggers": {
-                "field":     ["T", "alpha.air"],
-                "threshold": [800, [0.4, 0.6]],
-                "weight":    [0.5, 1.0]
-            }}
-          - threshold: scalar → >= value; [min, max] → range trigger.
-          - weight: contribution of each trigger to the final score.
-            Scores are summed and clamped to [0, 1].
-
-        Legacy dict format (still supported, all weights default to 1.0):
-            {"physics_triggers": {"T": 800, "alpha.air": {"min": 0.4, "max": 0.6}}}
-
-        All threshold values are raw physical quantities; they are converted to
-        normalized space using field_stats (mean, std).
-        """
-        raw = self.az_cfg.get("physics_triggers", None)
-        if not raw or not isinstance(raw, dict):
-            return None
-
-        fields = self._fields
-        if not fields:
-            return None
-
-        # per-field normalization stats (mean, std) — same as dataset
-        field_stats = {
-            "T":              (5.2999e+02, 4.5454e+02),
-            "Ux":             (4.0041e-05, 2.4173e-01),
-            "Uy":             (-1.6900e-05, 2.5172e-01),
-            "Uz":             (3.3602e-07, 1.1976e-01),
-            "alpha.air":      (0, 1),
-            "alpha.titanium": (0, 1),
-            "gamma_liquid":   (0, 1),
-        }
-
-        def _normalize(v, mean, std):
-            return (v - mean) / std if std != 0 else v - mean
-
-        triggers = []
-
-        # ---- new list format ----
-        if "field" in raw and "threshold" in raw:
-            field_list = raw["field"]
-            thresh_list = raw["threshold"]
-            weight_list = raw.get("weight", [1.0] * len(field_list))
-
-            for fname, thresh, w in zip(field_list, thresh_list, weight_list):
-                if fname not in fields:
-                    continue
-                ch_idx = fields.index(fname)
-                mean, std = field_stats.get(fname, (0, 1))
-
-                trig = {"ch_idx": ch_idx, "weight": float(w)}
-                if isinstance(thresh, (list, tuple)):
-                    trig["norm_min"] = _normalize(float(thresh[0]), mean, std)
-                    trig["norm_max"] = _normalize(float(thresh[1]), mean, std)
-                else:
-                    trig["norm_min"] = _normalize(float(thresh), mean, std)
-                triggers.append(trig)
-
-        # ---- legacy dict format ----
-        else:
-            for key, val in raw.items():
-                if key.startswith("_"):
-                    continue
-                if key in fields:
-                    ch_idx = fields.index(key)
-                elif key.isdigit():
-                    ch_idx = int(key)
-                else:
-                    continue
-
-                field_name = fields[ch_idx] if ch_idx < len(fields) else None
-                mean, std = field_stats.get(field_name, (0, 1)) if field_name else (0, 1)
-
-                trig = {"ch_idx": ch_idx, "weight": 1.0}
-                if isinstance(val, dict):
-                    if "min" in val:
-                        trig["norm_min"] = _normalize(float(val["min"]), mean, std)
-                    if "max" in val:
-                        trig["norm_max"] = _normalize(float(val["max"]), mean, std)
-                else:
-                    trig["norm_min"] = _normalize(float(val), mean, std)
-                triggers.append(trig)
-
-        return triggers if triggers else None
 
     # ---- refresh logic -----------------------------------------------
 
@@ -1113,17 +995,18 @@ class AdaptiveGraphManager:
         gt_blend = self.get_gt_blend(epoch)
         use_compressed = self.compress_cfg.get("enabled", False)
 
-        # Step 1: compute activity score (uses regular-grid finite difference)
+        # Step 1: compute activity score (physics-based: T + alpha.air)
         score = compute_active_score(
             pred_field=pred_field,
             gt_field=gt_field,
             prev_field=prev_field,
             grid_shape=self.fullres_grid_shape,
-            gradient_weight=self.az_cfg.get("gradient_weight", 0.5),
-            temporal_weight=self.az_cfg.get("temporal_weight", 0.3),
-            physics_weight=self.az_cfg.get("physics_weight", 0.2),
+            fields=self._fields,
+            T_ref=self.az_cfg.get("T_ref", 600.0),
+            T_high=self.az_cfg.get("T_high", 1500.0),
+            interface_bonus=self.az_cfg.get("interface_bonus", 0.5),
+            air_discount=self.az_cfg.get("air_discount", 0.5),
             gt_blend=gt_blend,
-            physics_triggers=self._physics_triggers,
         )
 
         # Step 2: zone classification

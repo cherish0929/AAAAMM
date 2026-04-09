@@ -140,7 +140,9 @@ def main(
     train_list = data_cfg["train_list"][0]
     with open(train_list) as f:
         h5_paths = [line.strip() for line in f if line.strip()]
-    h5_path = random.choice(h5_paths)
+    # h5_path = random.choice(h5_paths)
+
+    h5_path = r"/home/ubuntu/MyAI/LPBF_Uncertainty/data/Easy_pool/Easy_Radius_Absorb/23_P105_R50_E75_I5.h5"
 
     # ---- pick a time step ----
     if time_idx is None:
@@ -148,6 +150,8 @@ def main(
             first_field = data_cfg["fields"][0]
             n_steps = f[f"state/{first_field}"].shape[0]
         time_idx = random.randint(20, n_steps - 1)  # skip t=0 (no prev step)
+
+    time_idx = 143
 
     print(f"Loading: {h5_path}  (time_idx={time_idx})")
 
@@ -189,11 +193,12 @@ def main(
         gt_field=None,
         prev_field=prev_norm,
         grid_shape=fr_shape,
-        gradient_weight=az_cfg.get("gradient_weight", 0.5),
-        temporal_weight=az_cfg.get("temporal_weight", 0.3),
-        physics_weight=az_cfg.get("physics_weight", 0.2),
+        fields=fields,
+        T_ref=az_cfg.get("T_ref", 600.0),
+        T_high=az_cfg.get("T_high", 1500.0),
+        interface_bonus=az_cfg.get("interface_bonus", 0.5),
+        air_discount=az_cfg.get("air_discount", 0.5),
         gt_blend=0.0,
-        physics_triggers=mgr._physics_triggers,
     )
 
     zone = classify_zones(
@@ -478,7 +483,7 @@ def main(
     score_grid = score.view(nz, ny, nx)
     score_slice = score_grid[z_layer].numpy()  # [ny, nx]
     im6 = ax6.imshow(score_slice, origin="lower", cmap="inferno", aspect="equal",
-                     vmin=0, vmax=1)
+                     vmin=0, vmax=2)
     plt.colorbar(im6, ax=ax6, fraction=0.046, pad=0.04, label="Score")
 
     # draw zone boundaries

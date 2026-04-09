@@ -2,13 +2,12 @@
 """
 analyze_score_distribution.py
 =============================
-Analyze the distribution of each scoring component used in the adaptive graph
-pipeline:  spatial_gradient, temporal_change, physics_trigger, and final score.
+Analyze the distribution of the physics-based scoring used in the adaptive
+graph pipeline:  T_score, interface_score, and final combined score.
 
 For each component, outputs:
   - Basic statistics (mean, std, min, max, median, percentiles)
   - Histogram data (bin counts across [0, 1])
-  - Skewness indicator (is the mass near 0 or near 1?)
   - ASCII histogram for quick visual inspection
 
 Optionally saves matplotlib histograms to result/ if matplotlib is available.
@@ -36,10 +35,10 @@ PROJ_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJ_ROOT))
 
 from src.adaptive_graph import (
-    _grid_finite_difference_gradient,
-    _log_percentile_normalize,
-    _physics_trigger_score,
-    _safe_minmax,
+    _FIELD_STATS,
+    _physics_score,
+    _smooth_ramp,
+    _safe_normalize,
     AdaptiveGraphManager,
     build_backbone_edges,
     build_backbone_indices,
@@ -60,51 +59,66 @@ def decompose_score(
     gt_field: Optional[torch.Tensor],
     prev_field: torch.Tensor,
     grid_shape: Tuple[int, int, int],
-    gradient_weight: float = 0.5,
-    temporal_weight: float = 0.3,
-    physics_weight: float = 0.2,
+    fields: List[str],
+    T_ref: float = 600.0,
+    T_high: float = 1500.0,
+    interface_bonus: float = 0.5,
+    air_discount: float = 0.5,
     gt_blend: float = 1.0,
-    physics_triggers=None,
 ) -> Dict[str, torch.Tensor]:
     """Compute each score component individually and return all of them.
 
     Returns dict with keys:
-        'spatial_gradient_raw'   - before minmax normalization
-        'spatial_gradient'       - after minmax normalization [0,1]
-        'temporal_change_raw'    - before minmax normalization
-        'temporal_change'        - after minmax normalization [0,1]
-        'physics_trigger'        - already in [0,1]
-        'final_score'            - weighted combination [0,1]
+        'T_score'          - temperature-based score [0,1]
+        'interface_score'  - alpha.air interface score [0,1]
+        'air_multiplier'   - 1.0 for non-gas, air_discount for pure gas
+        'final_score'      - combined score [0,1]
     """
     if gt_field is not None and gt_blend > 0.0:
         field = gt_blend * gt_field + (1.0 - gt_blend) * pred_field
     else:
         field = pred_field
 
-    # a) spatial gradient
-    spatial_raw = _grid_finite_difference_gradient(field, grid_shape)
-    spatial_norm = _log_percentile_normalize(spatial_raw)
+    stats = _FIELD_STATS
+    has_T = "T" in fields
+    has_alpha = "alpha.air" in fields
 
-    # b) temporal change
-    temporal_raw = (field - prev_field).abs().mean(dim=-1)
-    temporal_norm = _log_percentile_normalize(temporal_raw)
+    result = OrderedDict()
 
-    # c) physics trigger
-    physics = _physics_trigger_score(field, physics_triggers)
+    if has_T and has_alpha:
+        T_idx = fields.index("T")
+        alpha_idx = fields.index("alpha.air")
 
-    # final
-    final = (gradient_weight * spatial_norm
-             + temporal_weight * temporal_norm
-             + physics_weight * physics).clamp(0.0, 1.0)
+        T_norm = field[:, T_idx]
+        alpha_norm = field[:, alpha_idx]
 
-    return OrderedDict([
-        ("spatial_gradient_raw", spatial_raw),
-        ("spatial_gradient", spatial_norm),
-        ("temporal_change_raw", temporal_raw),
-        ("temporal_change", temporal_norm),
-        ("physics_trigger", physics),
-        ("final_score", final),
-    ])
+        T_mean, T_std = stats.get("T", (5.2999e+02, 4.5454e+02))
+        T_ref_norm = (T_ref - T_mean) / T_std if T_std != 0 else T_ref - T_mean
+        T_high_norm = (T_high - T_mean) / T_std if T_std != 0 else T_high - T_mean
+
+        T_score = _smooth_ramp(T_norm, T_ref_norm, T_high_norm)
+
+        alpha_mean, alpha_std = stats.get("alpha.air", (0, 1))
+        alpha_raw = alpha_norm * alpha_std + alpha_mean
+        alpha_raw = alpha_raw.clamp(0.0, 1.0)
+
+        interface_score = 4.0 * alpha_raw * (1.0 - alpha_raw)
+
+        is_air = (alpha_raw >= 0.9).float()
+        air_mult = 1.0 - (1.0 - air_discount) * is_air
+
+        final = (T_score * (1.0 + interface_bonus * interface_score) * air_mult).clamp(0.0, 1.0)
+
+        result["T_score"] = T_score
+        result["interface_score"] = interface_score
+        result["air_multiplier"] = air_mult
+        result["final_score"] = final
+    else:
+        temporal = (field - prev_field).abs().mean(dim=-1)
+        result["temporal_change"] = _safe_normalize(temporal)
+        result["final_score"] = result["temporal_change"]
+
+    return result
 
 
 # ======================================================================
@@ -253,11 +267,12 @@ def analyze_sample(
             gt_field=gt_field,
             prev_field=prev_state,
             grid_shape=fr_shape,
-            gradient_weight=az_cfg.get("gradient_weight", 0.5),
-            temporal_weight=az_cfg.get("temporal_weight", 0.3),
-            physics_weight=az_cfg.get("physics_weight", 0.2),
+            fields=fields or [],
+            T_ref=az_cfg.get("T_ref", 600.0),
+            T_high=az_cfg.get("T_high", 1500.0),
+            interface_bonus=az_cfg.get("interface_bonus", 0.5),
+            air_discount=az_cfg.get("air_discount", 0.5),
             gt_blend=gt_blend,
-            physics_triggers=mgr._physics_triggers,
         )
 
         step_result = {"timestep": t, "gt_blend": gt_blend}
@@ -326,14 +341,9 @@ def try_save_plots(all_results: list, output_dir: str):
         print("  (matplotlib not available, skipping plot generation)")
         return
 
-    # Aggregate all samples & timesteps for each component
-    component_names = [
-        "spatial_gradient_raw", "spatial_gradient",
-        "temporal_change_raw", "temporal_change",
-        "physics_trigger", "final_score",
-    ]
+    component_names = ["T_score", "interface_score", "air_multiplier", "final_score"]
 
-    # Collect stats across all refresh steps
+    # Individual plots
     for comp_name in component_names:
         all_counts = []
         all_centers = None
@@ -349,7 +359,6 @@ def try_save_plots(all_results: list, output_dir: str):
         if not all_counts or all_centers is None:
             continue
 
-        # Average counts across all steps
         avg_counts = np.mean(all_counts, axis=0)
 
         fig, ax = plt.subplots(figsize=(10, 5))
@@ -360,7 +369,6 @@ def try_save_plots(all_results: list, output_dir: str):
         ax.set_title(f"Distribution: {comp_name}", fontsize=14)
         ax.set_xlim(-0.02, 1.02)
 
-        # Add statistics text
         all_stats_vals = []
         for sample_results in all_results:
             for step in sample_results:
@@ -390,12 +398,12 @@ def try_save_plots(all_results: list, output_dir: str):
         plt.close(fig)
         print(f"  Saved: {out_path}")
 
-    # Summary subplot: all normalized components side by side
-    normalized_names = ["spatial_gradient", "temporal_change", "physics_trigger", "final_score"]
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    # Summary subplot
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     axes = axes.flatten()
+    colors = ["#4a90d9", "#e67e22", "#2ecc71", "#e74c3c"]
 
-    for i, comp_name in enumerate(normalized_names):
+    for i, comp_name in enumerate(component_names):
         ax = axes[i]
         all_counts = []
         all_centers_c = None
@@ -412,14 +420,13 @@ def try_save_plots(all_results: list, output_dir: str):
 
         avg_counts = np.mean(all_counts, axis=0)
         bar_w = all_centers_c[1] - all_centers_c[0] if len(all_centers_c) > 1 else 0.05
-        ax.bar(all_centers_c, avg_counts, width=bar_w * 0.9, alpha=0.75,
-               color=["#4a90d9", "#e67e22", "#2ecc71", "#e74c3c"][i])
+        ax.bar(all_centers_c, avg_counts, width=bar_w * 0.9, alpha=0.75, color=colors[i % len(colors)])
         ax.set_title(comp_name, fontsize=13)
         ax.set_xlim(-0.02, 1.02)
         ax.set_xlabel("Score")
         ax.set_ylabel("Avg Count")
 
-    plt.suptitle("Score Component Distributions (normalized [0,1])", fontsize=15)
+    plt.suptitle("Physics-Based Score Components", fontsize=15)
     plt.tight_layout()
     out_path = os.path.join(output_dir, "score_dist_summary.png")
     fig.savefig(out_path, dpi=150)
@@ -468,12 +475,13 @@ def main():
     print("=" * 78)
     print()
 
-    # Print scoring weights
+    # Print scoring params
     az_cfg = adaptive_cfg.get("active_zone", {})
-    print("[Scoring Weights]")
-    print(f"  gradient_weight  = {az_cfg.get('gradient_weight', 0.5)}")
-    print(f"  temporal_weight  = {az_cfg.get('temporal_weight', 0.3)}")
-    print(f"  physics_weight   = {az_cfg.get('physics_weight', 0.2)}")
+    print("[Scoring Parameters]")
+    print(f"  T_ref            = {az_cfg.get('T_ref', 600.0)}")
+    print(f"  T_high           = {az_cfg.get('T_high', 1500.0)}")
+    print(f"  interface_bonus  = {az_cfg.get('interface_bonus', 0.5)}")
+    print(f"  air_discount     = {az_cfg.get('air_discount', 0.5)}")
     print(f"  core_threshold   = {az_cfg.get('core_threshold', 0.6)}")
     print(f"  ring_threshold   = {az_cfg.get('ring_threshold', 0.2)}")
     print()
@@ -533,9 +541,7 @@ def main():
             print()
 
             for comp_name in [
-                "spatial_gradient_raw", "spatial_gradient",
-                "temporal_change_raw", "temporal_change",
-                "physics_trigger", "final_score",
+                "T_score", "solid_score", "interface_score", "final_score",
             ]:
                 if comp_name in step_data:
                     print(format_component_report(comp_name, step_data[comp_name]))
@@ -557,8 +563,7 @@ def main():
     print()
 
     component_names = [
-        "spatial_gradient", "temporal_change",
-        "physics_trigger", "final_score",
+        "T_score", "solid_score", "interface_score", "final_score",
     ]
 
     for comp_name in component_names:
