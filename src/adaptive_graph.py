@@ -520,14 +520,11 @@ def _budget_sample_neighbors(
     n_zone = local_ids.shape[0]
     K_full = full_off_t.shape[0]
 
-    # Identify which of the K_full offsets are base-6
-    # (match by offset value)
-    is_base6 = torch.zeros(K_full, dtype=torch.bool, device=device)
-    for i in range(K_full):
-        for j in range(base6_off_t.shape[0]):
-            if (full_off_t[i] == base6_off_t[j]).all():
-                is_base6[i] = True
-                break
+    # Vectorized base-6 detection: [K_full, 1, 3] == [1, 6, 3] → [K_full, 6]
+    # .all(dim=-1) → [K_full, 6] bool; .any(dim=-1) → [K_full] bool
+    is_base6 = (
+        full_off_t.unsqueeze(1) == base6_off_t.unsqueeze(0)
+    ).all(dim=-1).any(dim=-1)  # [K_full] bool
 
     # base6 mask: [n_zone, K_full]
     base6_mask = is_base6.unsqueeze(0).expand(n_zone, -1)
@@ -539,24 +536,22 @@ def _budget_sample_neighbors(
     # count base-6 per node
     base_count = base_edges.sum(dim=1)  # [n_zone]
 
-    # If base-6 edges already exceed max_neighbors, sample base-6 too
+    # If base-6 edges already exceed max_neighbors, trim via vectorized 2D topk
     base_over_budget = base_count > max_neighbors
     if base_over_budget.any():
         rand_base = torch.rand(n_zone, K_full, device=device)
         rand_base[~base_edges] = -1.0
-        over_ids = torch.where(base_over_budget)[0]
-        for idx in over_ids:
-            b = max_neighbors
-            row_cands = base_edges[idx]
-            cand_indices = torch.where(row_cands)[0]
-            if cand_indices.numel() > b:
-                cand_scores = rand_base[idx][cand_indices]
-                _, topk_local = cand_scores.topk(b)
-                keep_set = cand_indices[topk_local]
-                new_row = torch.zeros(K_full, dtype=torch.bool, device=device)
-                new_row[keep_set] = True
-                base_edges[idx] = new_row
-        # Recount after trimming
+        k_top_b = min(max_neighbors, K_full)
+        top_vals_b, top_col_idx_b = rand_base.topk(k_top_b, dim=1)  # [n_zone, k_top_b]
+        rank_pos_b = torch.arange(k_top_b, device=device).unsqueeze(0)  # [1, k_top_b]
+        # keep entry if rank < max_neighbors and was a real candidate (score > -1)
+        valid_b = (rank_pos_b < max_neighbors) & (top_vals_b > -1.0)
+        new_base = torch.zeros(n_zone, K_full, dtype=torch.bool, device=device)
+        over_mask_2d = base_over_budget.unsqueeze(1).expand(-1, k_top_b)
+        new_base.scatter_(1, top_col_idx_b, valid_b & over_mask_2d)
+        # restore rows that are NOT over-budget
+        new_base[~base_over_budget] = base_edges[~base_over_budget]
+        base_edges = new_base
         base_count = base_edges.sum(dim=1)
 
     # extra candidates
@@ -565,33 +560,27 @@ def _budget_sample_neighbors(
     # budget remaining per node
     budget = (max_neighbors - base_count).clamp(min=0)  # [n_zone]
 
-    # For each node, randomly sample from extras up to budget
+    # For each node, randomly sample from extras up to budget.
+    # Vectorized: 2D topk then mask by per-row budget — no Python loop or .item().
     extra_count = extra_candidates.sum(dim=1)  # [n_zone]
     needs_trim = extra_count > budget
 
     if needs_trim.any():
-        # Vectorized random sampling: assign random priorities, keep top-budget
         rand_scores = torch.rand(n_zone, K_full, device=device)
-        rand_scores[~extra_candidates] = -1.0  # ensure non-candidates rank lowest
+        rand_scores[~extra_candidates] = -1.0  # non-candidates rank last
 
-        # For nodes that need trimming, zero out lowest-priority extras
-        # Sort by random score per row, keep top-budget
-        trim_ids = torch.where(needs_trim)[0]
-        for idx in trim_ids:
-            b = int(budget[idx].item())
-            if b <= 0:
-                extra_candidates[idx] = False
-                continue
-            row_scores = rand_scores[idx]
-            row_cands = extra_candidates[idx]
-            cand_indices = torch.where(row_cands)[0]
-            if cand_indices.numel() > b:
-                cand_scores = row_scores[cand_indices]
-                _, topk_local = cand_scores.topk(b)
-                keep_set = cand_indices[topk_local]
-                new_row = torch.zeros(K_full, dtype=torch.bool, device=device)
-                new_row[keep_set] = True
-                extra_candidates[idx] = new_row
+        k_top = min(max_neighbors, K_full)
+        top_vals, top_col_idx = rand_scores.topk(k_top, dim=1)  # [n_zone, k_top]
+        rank_pos = torch.arange(k_top, device=device).unsqueeze(0)  # [1, k_top]
+        # entry is valid if its rank < per-row budget AND it was a genuine candidate
+        valid = (rank_pos < budget.unsqueeze(1)) & (top_vals > -1.0)
+
+        new_extra = torch.zeros(n_zone, K_full, dtype=torch.bool, device=device)
+        trim_mask_2d = needs_trim.unsqueeze(1).expand(-1, k_top)
+        new_extra.scatter_(1, top_col_idx, valid & trim_mask_2d)
+        # preserve rows that don't need trimming
+        new_extra[~needs_trim] = extra_candidates[~needs_trim]
+        extra_candidates = new_extra
 
     # Combine base + trimmed extras
     result = base_edges | extra_candidates
@@ -745,16 +734,24 @@ def enforce_per_node_degree(
     # Sort edges by priority ascending (drop lowest first)
     sorted_idx = edge_priority.argsort()
 
-    keep_mask = torch.ones(E, dtype=torch.bool, device=device)
-    cur_degree = degree.clone()
+    # Move the greedy loop to CPU numpy to eliminate 2*E GPU→CPU syncs.
+    # Semantics are identical: process edges in ascending priority order,
+    # drop an edge if either endpoint is over-budget, decrement both degrees.
+    edges_np      = edges.cpu().numpy()         # [E, 2]
+    sorted_idx_np = sorted_idx.cpu().numpy()    # [E]
+    max_deg_np    = max_deg.cpu().numpy()       # [N]
+    cur_deg_np    = degree.cpu().numpy().copy() # [N]  mutable copy
+    keep_np       = np.ones(E, dtype=np.bool_)
 
-    for ei in sorted_idx:
-        s, d = int(edges[ei, 0].item()), int(edges[ei, 1].item())
-        if cur_degree[s] > max_deg[s] or cur_degree[d] > max_deg[d]:
-            keep_mask[ei] = False
-            cur_degree[s] -= 1
-            cur_degree[d] -= 1
+    for ei in sorted_idx_np:
+        s = edges_np[ei, 0]
+        d = edges_np[ei, 1]
+        if cur_deg_np[s] > max_deg_np[s] or cur_deg_np[d] > max_deg_np[d]:
+            keep_np[ei] = False
+            cur_deg_np[s] -= 1
+            cur_deg_np[d] -= 1
 
+    keep_mask = torch.from_numpy(keep_np).to(device)
     return edges[keep_mask]
 
 
@@ -964,6 +961,11 @@ class AdaptiveGraphManager:
         # physics trigger config: parse from active_zone config
         self._fields = fields or []
 
+        # IDW interpolation cache: invalidated on every refresh call.
+        # Stores (refresh_count_key, nn_idx [N_miss, k], weights [N_miss, k]).
+        self._idw_cache: Optional[tuple] = None
+        self._refresh_count: int = 0
+
     # ---- refresh logic -----------------------------------------------
 
     def should_refresh(self, t: int) -> bool:
@@ -1125,6 +1127,10 @@ class AdaptiveGraphManager:
         self.n_selected = selected.shape[0]
         self.selected_edges = all_edges
 
+        # Invalidate IDW cache: selected nodes have changed.
+        self._refresh_count += 1
+        self._idw_cache = None
+
     # ---- graph data access -------------------------------------------
 
     def get_selected_count(self) -> int:
@@ -1213,7 +1219,12 @@ class AdaptiveGraphManager:
         C: int,
         chunk_size: int = 4096,
     ) -> torch.Tensor:
-        """IDW interpolation for missing nodes."""
+        """IDW interpolation for missing nodes.
+
+        nn_idx and weights are cached between writeback calls when the selected
+        node set has not changed (i.e. between refreshes).  The cache is
+        invalidated automatically at every refresh() call.
+        """
         power = self.wb_cfg.get("idw_power", 2.0)
         k = self.wb_cfg.get("idw_k_neighbors", 4)
 
@@ -1222,23 +1233,49 @@ class AdaptiveGraphManager:
         N_miss = missing_pos.shape[0]
         k_use = min(k, selected_pos.shape[0])
 
-        for start in range(0, N_miss, chunk_size):
-            end = min(start + chunk_size, N_miss)
-            dists = torch.cdist(
-                missing_pos[start:end].unsqueeze(0),
-                selected_pos.unsqueeze(0),
-            ).squeeze(0)
+        # Cache validity: key matches current refresh count AND shape is consistent.
+        cache_valid = (
+            self._idw_cache is not None
+            and self._idw_cache[0] == self._refresh_count
+            and self._idw_cache[1].shape[0] == N_miss
+        )
 
-            _, nn_idx = dists.topk(k_use, dim=-1, largest=False)
-            nn_dists = torch.gather(dists, 1, nn_idx)
-
-            weights = 1.0 / (nn_dists.pow(power) + 1e-10)
-            weights = weights / weights.sum(dim=-1, keepdim=True)
-
+        if cache_valid:
+            # Reuse pre-computed geometry — skip all cdist work.
+            _, nn_idx_full, weights_full = self._idw_cache
             for b in range(B):
-                neighbor_vals = subgraph_pred[b][nn_idx]
-                interp = (neighbor_vals * weights.unsqueeze(-1)).sum(dim=1)
-                full_pred[b, missing_idx[start:end]] = interp
+                neighbor_vals = subgraph_pred[b][nn_idx_full]           # [N_miss, k, C]
+                interp = (neighbor_vals * weights_full.unsqueeze(-1)).sum(dim=1)
+                full_pred[b, missing_idx] = interp
+        else:
+            # Full chunked cdist computation (same as original).
+            # Accumulate nn_idx / weights for caching.
+            all_nn_idx = torch.empty(N_miss, k_use, dtype=torch.long, device=self.device)
+            all_weights = torch.empty(N_miss, k_use, device=self.device)
+
+            for start in range(0, N_miss, chunk_size):
+                end = min(start + chunk_size, N_miss)
+                dists = torch.cdist(
+                    missing_pos[start:end].unsqueeze(0),
+                    selected_pos.unsqueeze(0),
+                ).squeeze(0)
+
+                _, nn_idx = dists.topk(k_use, dim=-1, largest=False)
+                nn_dists = torch.gather(dists, 1, nn_idx)
+
+                weights = 1.0 / (nn_dists.pow(power) + 1e-10)
+                weights = weights / weights.sum(dim=-1, keepdim=True)
+
+                all_nn_idx[start:end] = nn_idx
+                all_weights[start:end] = weights
+
+                for b in range(B):
+                    neighbor_vals = subgraph_pred[b][nn_idx]
+                    interp = (neighbor_vals * weights.unsqueeze(-1)).sum(dim=1)
+                    full_pred[b, missing_idx[start:end]] = interp
+
+            # Store cache for reuse until next refresh.
+            self._idw_cache = (self._refresh_count, all_nn_idx, all_weights)
 
         return full_pred
 
