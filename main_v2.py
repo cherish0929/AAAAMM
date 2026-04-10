@@ -27,7 +27,7 @@ from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
 
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim import AdamW
@@ -566,6 +566,11 @@ def get_dataloader(args, path_record, device_type, pf_extra_max=0):
 
     test_dataset.normalizer = train_dataset.normalizer
     test_dataset._sync_norm_cache()  # 同步 norm_mean/norm_std 缓存
+
+    # Use 1/4 of the test set to reduce evaluation time
+    subset_size = max(1, len(test_dataset) // 4)
+    indices = list(range(0, len(test_dataset), 4))[:subset_size]
+    test_dataset = Subset(test_dataset, indices)
 
     pin_memory = True if "cuda" in device_type else False
 

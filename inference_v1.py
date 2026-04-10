@@ -98,8 +98,7 @@ class AeroGtoPredictor:
             self.dataset = AeroGtoDataset(
                 args=self.args,
                 mode="test",
-                mat_data=train_dataset.mat_mean_and_std if train_dataset.normalize else None,
-                spatial_stride=[1, 1, 1]
+                mat_data=train_dataset.mat_mean_and_std if train_dataset.normalize else None
             )
 
 
@@ -597,15 +596,15 @@ if __name__ == "__main__":
     # CONFIG_PATH = "config/easypool/GTO_easypool_stronger.json"
     # CONFIG_PATH 也可以是 list，依次处理多个配置：
     CONFIG_PATH = [
-        "config/easypool/GTO_easypool.json",
-        "config/easypool/GTO_easypool_stronger.json",
-        "config/easypool/GTO_attnres_easypool.json",
-        "config/easypool/GTO_attnres_easypool_stronger.json",
-        "config/easypool/cut_GTO_easypool.json",
-        "config/easypool/cut_GTO_attnres_easypool.json",
-        "config/easypool/GTO_2_easypool_stronger.json",
-        "config/easypool/GTO_attnres_3_easypool_stronger.json",
-        "config/easypool/cut_GTO_attnres_3_easypool.json",
+        # "config/easypool/GTO_easypool.json",
+        # "config/easypool/GTO_easypool_stronger.json",
+        # "config/easypool/GTO_attnres_easypool.json",
+        # "config/easypool/GTO_attnres_easypool_stronger.json",
+        # "config/easypool/GTO_2_easypool_stronger.json",
+        # "config/easypool/GTO_attnres_3_easypool_stronger.json"
+        "config/keyhole/GTO_keyhole_stronger.json",
+        "config/keyhole/GTO_attnres_keyhole_stronger.json",
+        "config/keyhole/GTO_attnres_3_keyhole_stronger.json",
     ]
 
     FIELD_TO_PLOT = None   # None 表示所有场；或指定如 "T" / "alpha.air"
@@ -613,6 +612,7 @@ if __name__ == "__main__":
     SLICE_POS = None
     INTERFACE_FIELD = "alpha.air"
     NUM_SAMPLES = 2  # 每个 config 随机推理的样本数
+    sample_idxs = [207, 229]
 
     cfg_list = CONFIG_PATH if isinstance(CONFIG_PATH, list) else [CONFIG_PATH]
 
@@ -620,9 +620,9 @@ if __name__ == "__main__":
         try:
             predictor = AeroGtoPredictor(cfg_path, MODE)
             if FIELD_TO_PLOT is None:
-                OUT_DIR = f"result_easypool/inference_fullsize/{predictor.args.name}/{MODE}/batch"
+                OUT_DIR = f"result_keyhole/inference_standard/inference/{predictor.args.name}/{MODE}/batch"
             else:
-                OUT_DIR = f"result_easypool/inference_fullsize/{predictor.args.name}/{MODE}/{FIELD_TO_PLOT}"
+                OUT_DIR = f"result_keyhole/inference_standard/inference/{predictor.args.name}/{MODE}/{FIELD_TO_PLOT}"
             os.makedirs(OUT_DIR, exist_ok=True)
         except Exception as e:
             print(f"初始化失败: {e}")
@@ -632,7 +632,7 @@ if __name__ == "__main__":
 
         dataset_length = len(predictor.dataset)
         print(f"Dataset size: {dataset_length}")
-        sample_idxs = random.sample(range(dataset_length), min(NUM_SAMPLES, dataset_length))
+        # sample_idxs = random.sample(range(dataset_length), min(NUM_SAMPLES, dataset_length))
 
         for sample_idx in sample_idxs:
             results = predictor.predict_rollout(sample_idx=sample_idx, interface_field=INTERFACE_FIELD)

@@ -597,6 +597,7 @@ if __name__ == "__main__":
     SLICE_POS = None
     INTERFACE_FIELD = "alpha.air"
     NUM_SAMPLES = 3  # 每个 config 随机推理的样本数
+    sample_idxs = [21, 143, 150]
 
     cfg_list = CONFIG_PATH if isinstance(CONFIG_PATH, list) else [CONFIG_PATH]
 
@@ -604,9 +605,9 @@ if __name__ == "__main__":
         try:
             predictor = AeroGtoPredictor(cfg_path, MODE)
             if FIELD_TO_PLOT is None:
-                OUT_DIR = f"result_easypool/inference_cut/{predictor.args.name}/{MODE}/batch"
+                OUT_DIR = f"result_easypool/inference_standard/inference_cut/{predictor.args.name}/{MODE}/batch"
             else:
-                OUT_DIR = f"result_easypool/inference_cut/{predictor.args.name}/{MODE}/{FIELD_TO_PLOT}"
+                OUT_DIR = f"result_easypool/inference_standard/inference_cut/{predictor.args.name}/{MODE}/{FIELD_TO_PLOT}"
             os.makedirs(OUT_DIR, exist_ok=True)
         except Exception as e:
             print(f"初始化失败: {e}")
@@ -616,7 +617,7 @@ if __name__ == "__main__":
 
         dataset_length = len(predictor.dataset)
         print(f"Dataset size: {dataset_length}")
-        sample_idxs = random.sample(range(dataset_length), min(NUM_SAMPLES, dataset_length))
+        # sample_idxs = random.sample(range(dataset_length), min(NUM_SAMPLES, dataset_length))
 
         for sample_idx in sample_idxs:
             # 1. 执行推理

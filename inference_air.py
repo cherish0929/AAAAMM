@@ -17,7 +17,6 @@ inference_air.py — 针对体积分数 (VOF) 场的专用推理脚本
 
 import os
 import sys
-import random
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -27,11 +26,10 @@ from scipy.ndimage import gaussian_filter
 import imageio
 from tqdm import tqdm
 from pathlib import Path
-import h5py
 from torch.amp import autocast
 
 from src.dataset_fast import AeroGtoDataset
-from src.utils import load_json_config, set_seed
+from src.utils import load_json_config
 
 
 # ────────────────────────────────────────────
@@ -438,16 +436,24 @@ class AirFieldPredictor:
     #  核心可视化: 界面对比
     # ──────────────────────────────
 
+    def _contour_outlined(self, ax, X, Y, Z, levels, color, lw, ls='-', zorder=5):
+        """绘制带黑色描边的等值线，提升在任何背景上的可见度。"""
+        ax.contour(X, Y, Z, levels=levels,
+                   colors='black', linewidths=lw + 1.5, linestyles=ls, zorder=zorder)
+        return ax.contour(X, Y, Z, levels=levels,
+                          colors=color, linewidths=lw, linestyles=ls, zorder=zorder + 1)
+
     def plot_interface(self, result, time_step, field_name=None, field_idx=None,
                        axis="z", slice_pos=None,
                        res=320, save_path=None, return_array=False,
-                       smooth_sigma=0.5):
+                       smooth_sigma=0.5, metrics=None):
         """
         绘制 4 个子图 (针对指定的 VOF 场):
-          1. 界面对比: 差异发散色图 + GT/Pred 0.5 等值线 + 分歧区域高亮
+          1. 界面对比: 差异发散色图 (固定 ±0.1) + GT/Pred 0.5 等值线 + 分歧区域高亮
           2. GT alpha 填充 + 0.5 等值线
           3. Pred alpha 填充 + GT 0.5 等值线叠加对比
           4. 界面附近的误差热图 (仅 0.1 < alpha < 0.9 区域)
+          底部: 当前步指标 (上) + 全局均值指标 (下)
         """
         # 默认选第一个 VOF 场
         if field_name is None:
@@ -502,16 +508,47 @@ class AirFieldPredictor:
             "figure.facecolor": "white",
         })
 
-        fig, axes = plt.subplots(1, 4, figsize=(26, 6), constrained_layout=True)
+        # 构建 metrics 文本 (当前步在上，全局均值在下)
+        metrics_text_step = None
+        metrics_text_mean = None
+        if metrics is not None and field_name in metrics.get("per_field", {}):
+            fm = metrics["per_field"][field_name]
+            step_l2 = fm["each_step_L2"][time_step] if time_step < len(fm["each_step_L2"]) else float('nan')
+            step_iou = fm["IoU_per_step"][time_step] if time_step < len(fm["IoU_per_step"]) else float('nan')
+            step_dice = fm["Dice_per_step"][time_step] if time_step < len(fm["Dice_per_step"]) else float('nan')
+            step_bmae = fm["band_MAE_per_step"][time_step] if time_step < len(fm["band_MAE_per_step"]) else float('nan')
+            metrics_text_step = (
+                f"Step {time_step}   "
+                f"L2: {step_l2:.4e}    "
+                f"IoU: {step_iou:.4f}    "
+                f"Dice: {step_dice:.4f}    "
+                f"Band MAE: {step_bmae:.4e}"
+            )
+            metrics_text_mean = (
+                f"Overall   "
+                f"MSE(norm): {metrics['MSE_normalized']:.4e}    "
+                f"Rel L2: {fm['relative_L2']:.4e}    "
+                f"RMSE: {fm['RMSE']:.4e}    "
+                f"Mean IoU: {fm['mean_IoU']:.4f}    "
+                f"Mean Dice: {fm['mean_Dice']:.4f}    "
+                f"Mean Band MAE: {fm['mean_band_MAE']:.4e}"
+            )
+
+        # 使用 gridspec 布局: 上面 4 个子图, 下方留文本区域
+        has_metrics = metrics_text_step is not None
+        fig_h = 8.5 if has_metrics else 6
+        fig = plt.figure(figsize=(26, fig_h))
+        if has_metrics:
+            gs = fig.add_gridspec(2, 4, height_ratios=[6, 1.2], hspace=0.12)
+        else:
+            gs = fig.add_gridspec(1, 4)
+        axes = [fig.add_subplot(gs[0, i]) for i in range(4)]
 
         # ─── Panel 1: 界面对比图 (核心面板) ───
-        # 背景: pred - gt 差异发散色图
         diff_field = Zi_pred - Zi_gt
-        abs_diff = np.abs(diff_field)
-        diff_bound = max(np.nanpercentile(abs_diff, 97), 0.02)
-
-        axes[0].imshow(diff_field, cmap='RdBu_r', vmin=-diff_bound, vmax=diff_bound,
-                       interpolation='bicubic', **imshow_args)
+        # 固定色彩范围 ±0.1，超出部分 clamp 到边界色
+        im0 = axes[0].imshow(diff_field, cmap='RdBu_r', vmin=-0.1, vmax=0.1,
+                             interpolation='bicubic', **imshow_args)
 
         # 分歧区域高亮: GT 和 Pred 在 0.5 阈值上分类不一致的区域
         gt_above = Zi_gt >= 0.5
@@ -521,17 +558,20 @@ class AirFieldPredictor:
         axes[0].imshow(disagree_masked, cmap='Oranges', vmin=0, vmax=2,
                        alpha=0.45, interpolation='nearest', **imshow_args)
 
-        # GT 等值线 (0.5) — 蓝实线 (粗)
-        axes[0].contour(Xi, Yi, Zi_gt, levels=[0.5],
-                        colors='#1f77b4', linewidths=3.0, linestyles='-')
-        # Pred 等值线 (0.5) — 红虚线 (粗)
-        axes[0].contour(Xi, Yi, Zi_pred, levels=[0.5],
-                        colors='#d62728', linewidths=3.0, linestyles='--')
+        # GT 等值线 (0.5) — 黄色实线 (带黑色描边)
+        self._contour_outlined(axes[0], Xi, Yi, Zi_gt, [0.5],
+                               color='#FFD700', lw=1.8, ls='-')
+        # Pred 等值线 (0.5) — 品红虚线 (带黑色描边)
+        self._contour_outlined(axes[0], Xi, Yi, Zi_pred, [0.5],
+                               color='#FF00FF', lw=1.8, ls='--')
+
+        cb0 = plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.03, extend='both')
+        cb0.set_label("Pred - GT")
 
         axes[0].set_title("Interface Comparison", fontweight='bold')
         legend_lines = [
-            Line2D([0], [0], color='#1f77b4', lw=3, ls='-',  label='GT (0.5)'),
-            Line2D([0], [0], color='#d62728', lw=3, ls='--', label='Pred (0.5)'),
+            Line2D([0], [0], color='#FFD700', lw=2, ls='-',  label='GT (0.5)'),
+            Line2D([0], [0], color='#FF00FF', lw=2, ls='--', label='Pred (0.5)'),
             Line2D([0], [0], color='#e8871e', lw=6, ls='-',  alpha=0.45, label='Mismatch'),
         ]
         axes[0].legend(handles=legend_lines, loc='upper right', framealpha=0.85, fontsize=9)
@@ -539,7 +579,8 @@ class AirFieldPredictor:
         # ─── Panel 2: GT field 填充 ───
         im1 = axes[1].imshow(Zi_gt, cmap='RdYlBu_r', vmin=0, vmax=1,
                              interpolation='bicubic', **imshow_args)
-        axes[1].contour(Xi, Yi, Zi_gt, levels=[0.5], colors='white', linewidths=2.0)
+        self._contour_outlined(axes[1], Xi, Yi, Zi_gt, [0.5],
+                               color='white', lw=1.8, ls='-')
         axes[1].set_title(f"GT {field_name}")
         cb1 = plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.03)
         cb1.set_label(field_name)
@@ -547,16 +588,17 @@ class AirFieldPredictor:
         # ─── Panel 3: Pred field 填充 ───
         im2 = axes[2].imshow(Zi_pred, cmap='RdYlBu_r', vmin=0, vmax=1,
                              interpolation='bicubic', **imshow_args)
-        axes[2].contour(Xi, Yi, Zi_pred, levels=[0.5], colors='white', linewidths=2.0)
-        # 叠加 GT 0.5 contour 用于对比
-        axes[2].contour(Xi, Yi, Zi_gt, levels=[0.5], colors='#1f77b4',
-                        linewidths=1.5, linestyles='--', alpha=0.8)
+        self._contour_outlined(axes[2], Xi, Yi, Zi_pred, [0.5],
+                               color='white', lw=1.8, ls='-')
+        # 叠加 GT 0.5 contour 用于对比 (黄色虚线, 带描边)
+        self._contour_outlined(axes[2], Xi, Yi, Zi_gt, [0.5],
+                               color='#FFD700', lw=1.5, ls='--')
         axes[2].set_title(f"Pred {field_name}")
         cb2 = plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.03)
         cb2.set_label(field_name)
         legend_pred = [
-            Line2D([0], [0], color='white',   lw=2, ls='-',  label='Pred 0.5'),
-            Line2D([0], [0], color='#1f77b4', lw=1.5, ls='--', label='GT 0.5'),
+            Line2D([0], [0], color='white',   lw=1.8, ls='-',  label='Pred 0.5'),
+            Line2D([0], [0], color='#FFD700', lw=1.5, ls='--', label='GT 0.5'),
         ]
         axes[2].legend(handles=legend_pred, loc='upper right', framealpha=0.85, fontsize=9)
 
@@ -570,10 +612,10 @@ class AirFieldPredictor:
 
         im3 = axes[3].imshow(err_masked, cmap='inferno', vmin=0, vmax=err_vmax,
                              interpolation='bicubic', **imshow_args)
-        # 叠加 GT / Pred 0.5 等值线
-        axes[3].contour(Xi, Yi, Zi_gt, levels=[0.5], colors='cyan', linewidths=2.0, linestyles='-')
-        axes[3].contour(Xi, Yi, Zi_pred, levels=[0.5], colors='lime', linewidths=2.0, linestyles='--')
-        # 分歧区域边界
+        self._contour_outlined(axes[3], Xi, Yi, Zi_gt, [0.5],
+                               color='cyan', lw=1.8, ls='-')
+        self._contour_outlined(axes[3], Xi, Yi, Zi_pred, [0.5],
+                               color='lime', lw=1.8, ls='--')
         if np.any(disagree > 0.5):
             axes[3].contour(Xi, Yi, disagree, levels=[0.5], colors='yellow',
                             linewidths=1.0, linestyles=':', alpha=0.7)
@@ -581,8 +623,8 @@ class AirFieldPredictor:
         cb3 = plt.colorbar(im3, ax=axes[3], fraction=0.046, pad=0.03, extend='max')
         cb3.set_label(f"|Pred - GT| ({field_name})")
         legend_err = [
-            Line2D([0], [0], color='cyan', lw=2, ls='-',  label='GT 0.5'),
-            Line2D([0], [0], color='lime', lw=2, ls='--', label='Pred 0.5'),
+            Line2D([0], [0], color='cyan', lw=1.8, ls='-',  label='GT 0.5'),
+            Line2D([0], [0], color='lime', lw=1.8, ls='--', label='Pred 0.5'),
         ]
         axes[3].legend(handles=legend_err, loc='upper right', framealpha=0.85, fontsize=9)
 
@@ -593,6 +635,25 @@ class AirFieldPredictor:
             ax.set_aspect('equal', adjustable='box')
 
         fig.suptitle(f"{field_name} -- Step {time_step}", fontsize=14, fontweight='bold')
+
+        # ─── 底部 Metrics 文本: 当前步 (上, 大字) + 全局均值 (下, 小字) ───
+        if has_metrics:
+            ax_text = fig.add_subplot(gs[1, :])
+            ax_text.axis('off')
+            # 当前步指标 — 较大字号、加粗
+            ax_text.text(0.01, 0.95, metrics_text_step,
+                         transform=ax_text.transAxes,
+                         fontsize=12, fontfamily='monospace', fontweight='bold',
+                         verticalalignment='top',
+                         bbox=dict(boxstyle='round,pad=0.3', facecolor='#e8f0fe',
+                                   edgecolor='#4a90d9', alpha=0.92))
+            # 全局均值指标 — 稍小字号
+            ax_text.text(0.01, 0.38, metrics_text_mean,
+                         transform=ax_text.transAxes,
+                         fontsize=11, fontfamily='monospace',
+                         verticalalignment='top',
+                         bbox=dict(boxstyle='round,pad=0.3', facecolor='#f0f0f0',
+                                   edgecolor='#cccccc', alpha=0.90))
 
         if return_array:
             import io
@@ -616,7 +677,8 @@ class AirFieldPredictor:
     # ──────────────────────────────
 
     def generate_gif(self, result, field_name=None, field_idx=None,
-                     axis="z", slice_pos=None, gif_path="result/air_rollout.gif", res=280):
+                     axis="z", slice_pos=None, gif_path="result/air_rollout.gif", res=280,
+                     metrics=None):
         if field_name is None:
             field_name, field_idx = self.vof_fields[0]
         elif field_idx is None:
@@ -630,7 +692,7 @@ class AirFieldPredictor:
             img = self.plot_interface(
                 result, time_step=t, field_name=field_name, field_idx=field_idx,
                 axis=axis, slice_pos=slice_pos,
-                res=res, return_array=True
+                res=res, return_array=True, metrics=metrics
             )
             if img is not None:
                 frames.append(img)
@@ -684,24 +746,22 @@ if __name__ == "__main__":
     # CONFIG_PATH = "config/config_alpha_air/easypool_air_3-7_enhanced.json"
     # CONFIG_PATH 也可以是 list，依次处理多个配置：
     CONFIG_PATH = [
-        "config/easypool/GTO_easypool.json",
-        "config/easypool/GTO_easypool_stronger.json",
-        "config/easypool/GTO_attnres_easypool.json",
-        "config/easypool/GTO_attnres_easypool_stronger.json",
-        "config/easypool/GTO_2_easypool_stronger.json",
-        "config/easypool/GTO_attnres_3_easypool_stronger.json"
+        "config/keyhole/GTO_keyhole_stronger.json",
+        "config/keyhole/GTO_attnres_keyhole_stronger.json",
+        "config/keyhole/GTO_attnres_3_keyhole_stronger.json",
     ]
 
     SLICE_AXIS = "z"
     SLICE_POS = None
     NUM_SAMPLES = 3  # 每个 config 随机推理的样本数
+    sample_idxs = [207, 229]
 
     cfg_list = CONFIG_PATH if isinstance(CONFIG_PATH, list) else [CONFIG_PATH]
 
     for cfg_path in cfg_list:
         try:
             predictor = AirFieldPredictor(cfg_path, MODE)
-            OUT_DIR = f"result_easypool/inference_air/{predictor.args.name}/{MODE}"
+            OUT_DIR = f"result_keyhole/inference_standard/inference_air/{predictor.args.name}/{MODE}"
             os.makedirs(OUT_DIR, exist_ok=True)
         except Exception as e:
             print(f"Init failed: {e}")
@@ -712,7 +772,7 @@ if __name__ == "__main__":
         dataset_length = len(predictor.dataset)
         print(f"Dataset size: {dataset_length}")
 
-        sample_idxs = random.sample(range(dataset_length), min(NUM_SAMPLES, dataset_length))
+        # sample_idxs = random.sample(range(dataset_length), min(NUM_SAMPLES, dataset_length))
         all_metrics = []
 
         for sample_idx in sample_idxs:
@@ -733,7 +793,8 @@ if __name__ == "__main__":
                     field_idx=field_idx,
                     axis=SLICE_AXIS,
                     slice_pos=SLICE_POS,
-                    gif_path=gif_path
+                    gif_path=gif_path,
+                    metrics=metrics
                 )
 
         # 3. 汇总

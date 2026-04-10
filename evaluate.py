@@ -24,15 +24,18 @@ from src.train import validate
 # >>> 在这里填写需要评估的 config 路径 <<<
 # ============================================================
 CONFIG_LIST = [
-    "config/easypool/GTO_easypool.json",
-    "config/easypool/GTO_easypool_stronger.json",
-    "config/easypool/GTO_attnres_easypool.json",
-    "config/easypool/GTO_attnres_easypool_stronger.json",
-    "config/easypool/GTO_2_easypool_stronger.json",
-    "config/easypool/GTO_attnres_3_easypool_stronger.json",
-    "config/easypool/cut_GTO_easypool.json",
-    "config/easypool/cut_GTO_attnres_easypool.json",
-    "config/easypool/cut_GTO_attnres_3_easypool.json",
+    # "config/easypool/GTO_easypool.json",
+    # "config/easypool/GTO_easypool_stronger.json",
+    # "config/easypool/GTO_attnres_easypool.json",
+    # "config/easypool/GTO_attnres_easypool_stronger.json",
+    # "config/easypool/GTO_2_easypool_stronger.json",
+    # "config/easypool/GTO_attnres_3_easypool_stronger.json",
+    # "config/easypool/cut_GTO_easypool.json",
+    # "config/easypool/cut_GTO_attnres_easypool.json",
+    # "config/easypool/cut_GTO_attnres_3_easypool.json",
+    "config/keyhole/GTO_keyhole_stronger.json",
+    "config/keyhole/GTO_attnres_keyhole_stronger.json",
+    "config/keyhole/GTO_attnres_3_keyhole_stronger.json",
 ]
 
 
@@ -80,7 +83,7 @@ def get_dataloader_eval(args, device_type):
     train_dataset = Datasetclass(args=args, mode="train")
 
     test_dataset = Datasetclass(
-        args=args, mode="test", spatial_stride=[1,1,1],
+        args=args, mode="test",
         mat_data=train_dataset.mat_mean_and_std if train_dataset.normalize else None,
     )
     test_dataset.normalizer = train_dataset.normalizer
@@ -432,7 +435,7 @@ def main():
     device = torch.device(device_str)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_path = f"result_easypool/evaluate/report_fullsize_{timestamp}.txt"
+    report_path = f"result_keyhole/evaluate/report_{timestamp}.txt"
     logger = DualLogger(report_path)
 
     logger.log(f"{'#'*70}")
